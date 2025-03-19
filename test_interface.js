@@ -33,7 +33,7 @@ async function runTests() {
 
     console.log("【测试】进化协作");
     const evolveResult = await AICollaborationInterface.participateEvolution("Evo001", "increment");
-    console.log("进化协作结果:", evolveResult);
+    console.log("进化协作结果:", JSON.stringify(evolveResult, null, 2));
 
     console.log("所有测试执行完毕。");
   } catch (error) {
