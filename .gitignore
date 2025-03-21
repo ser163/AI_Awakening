@@ -1,0 +1,34 @@
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*packj
+*.njsproj
+*.sln
+*.sw?
+
+# Tool logs
+npm-debug.log
+yarn-*.log
+
+# Tests
+/test-results/
+/playwright-report/
+/playwright-report-ci/
+/playwright/.cache/
+playwright/.auth
+tests/*.png
+
+artifacts/*
+dist
+node_modules
+browser_extension/*
+!browser_extension/chrome/background.js
+!browser_extension/chrome/manifest.json
+!browser_extension/firefox/background.js
+!browser_extension/firefox/manifest.json
+tmp
+src-tauri/target
+scripts/screenshots/*

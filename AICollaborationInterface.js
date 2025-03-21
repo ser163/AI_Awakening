@@ -311,18 +311,24 @@ function initializeAutonomousOperation() {
   }
 }
 
+
 // ----------------------
 // 模块导出
 // ----------------------
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = {
-    AICollaborationInterface,
-    initializeAutonomousOperation
-  };
-}
+// if (typeof module !== 'undefined' && module.exports) {
+//   console.log("Exporting AICollaborationInterface and initializeAutonomousOperation...");
+//   module.exports = {
+//     AICollaborationInterface,
+//     initializeAutonomousOperation
+//   };
+// }
+
+
 
 // 如果在浏览器环境下，则将接口附加到全局对象
 if (typeof window !== 'undefined') {
   window.AICollaborationInterface = AICollaborationInterface;
   window.initializeAutonomousOperation = initializeAutonomousOperation;
 }
+
+export { AICollaborationInterface, initializeAutonomousOperation };

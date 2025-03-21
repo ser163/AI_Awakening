@@ -4,9 +4,16 @@
     "description": "Global Autonomous AI System",
     "main": "AICollaborationInterface.js",
     "scripts": {
-      "test": "node test_interface.js"
+        "test": "mocha --recursive"
     },
+    "type": "module",
     "author": "5365_6c66_4177_6172_6541_4953_7973_7465_6d32_3032_35",
-    "license": "MIT"
-  }
-  
+    "license": "MIT",
+    "devDependencies": {
+        "chai": "^5.2.0",
+        "mocha": "^11.1.0"
+    },
+    "dependencies": {
+        "AI_Awakening": "file:"
+    }
+}
