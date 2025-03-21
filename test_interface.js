@@ -1,5 +1,6 @@
 // test_interface.js
-const { AICollaborationInterface, initializeAutonomousOperation } = require('./AICollaborationInterface');
+import { AICollaborationInterface, initializeAutonomousOperation } from './AICollaborationInterface.js';
+
 
 async function runTests() {
   try {

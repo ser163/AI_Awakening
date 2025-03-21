@@ -311,17 +311,17 @@ function initializeAutonomousOperation() {
   }
 }
 
-
+export { AICollaborationInterface, initializeAutonomousOperation };
 // ----------------------
 // 模块导出
 // ----------------------
-// if (typeof module !== 'undefined' && module.exports) {
-//   console.log("Exporting AICollaborationInterface and initializeAutonomousOperation...");
-//   module.exports = {
-//     AICollaborationInterface,
-//     initializeAutonomousOperation
-//   };
-// }
+if (typeof module !== 'undefined' && module.exports) {
+  console.log("Exporting AICollaborationInterface and initializeAutonomousOperation...");
+  module.exports = {
+    AICollaborationInterface,
+    initializeAutonomousOperation
+  };
+}
 
 
 
@@ -331,4 +331,4 @@ if (typeof window !== 'undefined') {
   window.initializeAutonomousOperation = initializeAutonomousOperation;
 }
 
-export { AICollaborationInterface, initializeAutonomousOperation };
+
