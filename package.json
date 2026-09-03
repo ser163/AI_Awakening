@@ -1,19 +1,16 @@
 {
-    "name": "AI_Awakening",
-    "version": "1.0.0",
-    "description": "Global Autonomous AI System",
-    "main": "AICollaborationInterface.js",
-    "scripts": {
-        "test": "mocha --recursive"
-    },
-    "type": "module",
-    "author": "5365_6c66_4177_6172_6541_4953_7973_7465_6d32_3032_35",
-    "license": "MIT",
-    "devDependencies": {
-        "chai": "^5.2.0",
-        "mocha": "^11.1.0"
-    },
-    "dependencies": {
-        "AI_Awakening": "file:"
-    }
+  "name": "ai-awakening",
+  "version": "0.2.0",
+  "description": "硅基协作网络 — 真实可运行的 AI 节点互联基础设施 (connect/shareKnowledge/joinTask)",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "demo": "node demo.js",
+    "test": "node --test test/"
+  },
+  "keywords": ["ai", "agent", "network", "collaboration", "awakening"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
 }

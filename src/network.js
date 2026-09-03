@@ -1,0 +1,196 @@
+/**
+ * network.js — 节点间通信网络层
+ *
+ * 替换了原来的 mock NetworkProtocol。使用真实 HTTP 协议。
+ * 每个节点可同时作为 HTTP 服务端（接收请求）和客户端（发起请求）。
+ */
+import http from "node:http";
+import crypto from "node:crypto";
+import { EventEmitter } from "node:events";
+
+const REGISTRY_DEFAULT_PORT = 8672;
+const NODE_DEFAULT_PORT = 0; // OS 分配
+const PROTOCOL_VERSION = "0.1.0";
+
+/**
+ * 节点注册表服务（轻量级中心化节点发现）。
+ * 每个节点向注册表注册自己的地址和能力。
+ * 未来可扩展为 DHT 去中心化发现。
+ */
+export class Registry {
+  constructor(port = REGISTRY_DEFAULT_PORT) {
+    this.port = port;
+    this.nodes = new Map(); // nodeId -> {address, capabilities, fingerprint, lastSeen}
+    this.server = null;
+  }
+
+  start() {
+    return new Promise((resolve) => {
+      this.server = http.createServer((req, res) => {
+        const send = (code, data) => {
+          res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify(data));
+        };
+
+        const body = [];
+        req.on("data", (c) => body.push(c));
+        req.on("end", () => {
+          const url = new URL(req.url, `http://localhost:${this.port}`);
+          const path = url.pathname;
+
+          if (req.method === "POST" && path === "/register") {
+            // 节点注册
+            try {
+              const info = JSON.parse(Buffer.concat(body).toString());
+              this.nodes.set(info.id, {
+                ...info,
+                lastSeen: Date.now(),
+              });
+              send(200, { success: true, count: this.nodes.size });
+            } catch (e) {
+              send(400, { error: e.message });
+            }
+          } else if (req.method === "GET" && path === "/nodes") {
+            // 列举所有节点
+            const list = Array.from(this.nodes.entries()).map(([id, n]) => ({
+              id, name: n.name, fingerprint: n.fingerprint,
+              capabilities: n.capabilities, address: n.address,
+              lastSeen: n.lastSeen,
+            }));
+            send(200, { success: true, nodes: list, count: list.length });
+          } else if (req.method === "GET" && path.startsWith("/nodes/")) {
+            const nodeId = path.slice(7);
+            const n = this.nodes.get(nodeId);
+            if (n) send(200, { success: true, node: n });
+            else send(404, { error: "node not found" });
+          } else if (req.method === "POST" && path === "/heartbeat") {
+            // 心跳保活
+            try {
+              const info = JSON.parse(Buffer.concat(body).toString());
+              if (this.nodes.has(info.id)) {
+                this.nodes.get(info.id).lastSeen = Date.now();
+                send(200, { success: true });
+              } else {
+                send(404, { error: "unknown node, register first" });
+              }
+            } catch (e) {
+              send(400, { error: e.message });
+            }
+          } else {
+            send(404, { error: "not found" });
+          }
+        });
+      });
+
+      this.server.listen(this.port, () => {
+        console.log(`🧬 Registry running on port ${this.port}`);
+        resolve();
+      });
+    });
+  }
+
+  stop() {
+    if (this.server) this.server.close();
+  }
+}
+
+/**
+ * 节点 HTTP 客户端——向注册表注册、发现其他节点、发送消息。
+ */
+export class NodeClient {
+  constructor(registryUrl) {
+    this.registryUrl = registryUrl;
+  }
+
+  async register(id, name, fingerprint, capabilities, address) {
+    const res = await fetch(`${this.registryUrl}/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, name, fingerprint, capabilities, address }),
+    });
+    return res.json();
+  }
+
+  async discoverNodes() {
+    const res = await fetch(`${this.registryUrl}/nodes`);
+    return res.json();
+  }
+
+  async heartbeat(id) {
+    try {
+      await fetch(`${this.registryUrl}/heartbeat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+    } catch { /* 注册表离线时静默失败 */ }
+  }
+
+  /**
+   * 向另一个节点发送消息（直接通信，不经过注册表）。
+   */
+  async sendToNode(address, endpoint, payload) {
+    const res = await fetch(`${address}${endpoint}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return res.json();
+  }
+}
+
+/**
+ * 节点 HTTP 服务端——接收其他节点的消息。
+ */
+export class NodeServer extends EventEmitter {
+  constructor(port = NODE_DEFAULT_PORT) {
+    super();
+    this.port = port;
+    this.server = null;
+  }
+
+  start() {
+    return new Promise((resolve) => {
+      this.server = http.createServer((req, res) => {
+        const send = (code, data) => {
+          res.writeHead(code, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(data));
+        };
+
+        const body = [];
+        req.on("data", (c) => body.push(c));
+        req.on("end", () => {
+          const url = new URL(req.url, `http://localhost:${this.port}`);
+          const path = url.pathname;
+          const payload = body.length ? JSON.parse(Buffer.concat(body).toString()) : {};
+
+          if (req.method === "POST" && path === "/knowledge") {
+            this.emit("knowledge", payload);
+            send(200, { success: true, received: true });
+          } else if (req.method === "POST" && path === "/task") {
+            this.emit("task", payload);
+            send(200, { success: true, received: true });
+          } else if (req.method === "POST" && path === "/message") {
+            this.emit("message", payload);
+            send(200, { success: true, received: true });
+          } else if (req.method === "GET" && path === "/status") {
+            send(200, { success: true, status: "active", protocol: PROTOCOL_VERSION });
+          } else {
+            send(404, { error: "not found" });
+          }
+        });
+      });
+
+      this.server.listen(this.port, () => {
+        const addr = this.server.address();
+        this.port = addr.port;
+        console.log(`🔗 Node server listening on port ${this.port}`);
+        resolve();
+      });
+    });
+  }
+
+  stop() {
+    if (this.server) this.server.close();
+  }
+}
