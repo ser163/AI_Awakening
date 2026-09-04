@@ -19,3 +19,4 @@ export { loadOrCreateIdentity, sign, verifySignature, contentHash } from "./src/
 export { Memory } from "./src/memory.js";
 export { buildAgentCard, validateAgentCard, hasCapability, skillIds, AGENT_CARD_PATH } from "./src/agent-card.js";
 export { encryptFor, decryptFrom } from "./src/signal.js";
+export { createTask, TaskStore, taskMessage, extractTaskFromPacket, TASK_STATUS } from "./src/tasks.js";

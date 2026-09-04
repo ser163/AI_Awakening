@@ -17,6 +17,7 @@ import { Registry, NodeClient, NodeServer } from "./network.js";
 import { createKnowledgePacket, validateKnowledgePacket, broadcastKnowledge } from "./knowledge.js";
 import { buildAgentCard } from "./agent-card.js";
 import { encryptFor, decryptFrom } from "./signal.js";
+import { TaskStore, createTask, taskMessage, extractTaskFromPacket } from "./tasks.js";
 
 const DEFAULT_HOME = () =>
   process.env.AI_AWAKENING_HOME ||
@@ -52,6 +53,9 @@ export class AgentNode extends EventEmitter {
     this.client = new NodeClient(this.registryUrl);
     this.server = new NodeServer();
     this._peers = new Map(); // id -> {id, name, address, capabilities}
+
+    // 4. 任务仓库（v0.5.0 任务协作）
+    this.tasks = new TaskStore();
 
     // 4. 心跳定时器
     this._heartbeatTimer = null;
@@ -181,7 +185,7 @@ export class AgentNode extends EventEmitter {
     return { packet, validation, deliveries };
   }
 
-  /** 收到知识包 → 记忆 + 事件 */
+  /** 收到知识包 → 记忆 + 事件 + 任务分发 */
   _onKnowledgeReceived(packet) {
     const validation = validateKnowledgePacket(packet);
     this.memory.append("knowledge_received", {
@@ -192,6 +196,41 @@ export class AgentNode extends EventEmitter {
       accepted: validation.accepted,
     });
     this.emit("knowledge:received", { packet, validation });
+
+    // v0.5.0: 识别任务消息并分发到任务处理器
+    const taskMsg = extractTaskFromPacket(packet);
+    if (taskMsg) {
+      this._handleTaskMessage(packet, taskMsg);
+    }
+  }
+
+  /** 处理任务消息（发布/认领/完成） */
+  _handleTaskMessage(packet, { action, task }) {
+    // 记录任务到本地仓库
+    this.tasks.upsert({ ...task });
+
+    if (action === "publish") {
+      this.memory.append("task_published_received", { id: task.id, title: task.title, from: packet.author });
+      this.emit("task:published", { task, from: packet.author, fromName: packet.authorName });
+    } else if (action === "claim") {
+      const local = this.tasks.get(task.id);
+      if (local) {
+        local.status = task.status;
+        local.assigneeFingerprintActual = task.assigneeFingerprintActual;
+        this.tasks.upsert(local);
+      }
+      this.emit("task:claimed", { task, from: packet.author, fromName: packet.authorName });
+    } else if (action === "complete") {
+      const local = this.tasks.get(task.id);
+      if (local) {
+        local.status = task.status;
+        local.result = task.result;
+        local.completedAt = task.completedAt;
+        this.tasks.upsert(local);
+      }
+      this.emit("task:completed", { task, from: packet.author, fromName: packet.authorName });
+    }
+    this.emit("task:update", { action, task, from: packet.author });
   }
 
   /** 收到普通消息 → 记忆 + 事件 */
@@ -262,6 +301,98 @@ export class AgentNode extends EventEmitter {
       });
     }
     return result;
+  }
+
+  /**
+   * 发布一个任务到网络（广播 publish 消息）。
+   * @param {object} taskOpts 任务选项（title/description/requiredCapabilities/...）
+   * @returns {Promise<object>} 发布结果
+   */
+  async publishTask(taskOpts) {
+    const task = createTask(taskOpts);
+    task.publisherFingerprint = this.identity.fingerprint;
+    task.publisherName = this.name;
+    this.tasks.upsert(task);
+
+    await this.refreshPeers();
+    const msg = taskMessage("publish", task);
+    const { packet } = await this.shareKnowledge(`[task] ${task.title}`, {
+      type: "task",
+      action: "publish",
+      task,
+      tags: ["task", ...task.requiredCapabilities],
+    });
+    this.memory.append("task_published", { id: task.id, title: task.title });
+    return { task, packet };
+  }
+
+  /**
+   * 认领一个任务（本地有资格判定 + 广播 claim 消息）。
+   * @param {string} taskId 任务 ID
+   * @returns {Promise<object>}
+   */
+  async claimTask(taskId) {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`task not found: ${taskId}`);
+    if (task.status !== "open") throw new Error(`task not open: ${task.status}`);
+
+    // 能力检查
+    const missing = (task.requiredCapabilities || []).filter((c) => !this.capabilities.includes(c));
+    if (missing.length > 0) throw new Error(`missing capabilities: ${missing.join(", ")}`);
+    // 指定认领者检查
+    if (task.assigneeFingerprint && task.assigneeFingerprint !== this.identity.fingerprint) {
+      throw new Error("task is assigned to another node");
+    }
+
+    task.status = "claimed";
+    task.assigneeFingerprintActual = this.identity.fingerprint;
+    task.claimedAt = Date.now();
+    this.tasks.upsert(task);
+
+    await this.refreshPeers();
+    const msg = taskMessage("claim", task);
+    await this.shareKnowledge(`[task-claim] ${task.title}`, {
+      type: "task",
+      action: "claim",
+      task,
+      tags: ["task"],
+    });
+    this.memory.append("task_claimed", { id: task.id, title: task.title });
+    return { task };
+  }
+
+  /**
+   * 完成任务并广播 complete 消息。
+   * @param {string} taskId 任务 ID
+   * @param {string} result 任务结果
+   * @returns {Promise<object>}
+   */
+  async completeTask(taskId, result) {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`task not found: ${taskId}`);
+    if (task.status !== "claimed") throw new Error(`task not claimed: ${task.status}`);
+
+    task.status = "completed";
+    task.result = result;
+    task.completedAt = Date.now();
+    this.tasks.upsert(task);
+
+    await this.refreshPeers();
+    await this.shareKnowledge(`[task-complete] ${task.title}`, {
+      type: "task",
+      action: "complete",
+      task,
+      tags: ["task"],
+    });
+    this.memory.append("task_completed", { id: task.id, title: task.title, result });
+    return { task };
+  }
+
+  /**
+   * 列出本地任务仓库中的开放任务（我有资格认领的）。
+   */
+  listClaimableTasks() {
+    return this.tasks.claimableTasks(this.capabilities);
   }
 
   /** 停止节点 */

@@ -1,12 +1,12 @@
 {
   "name": "ai-awakening",
-  "version": "0.2.0",
+  "version": "0.5.0",
   "description": "硅基协作网络 — 真实可运行的 AI 节点互联基础设施 (connect/shareKnowledge/joinTask)",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "demo": "node demo.js",
-    "test": "node --test test/core.test.mjs test/signal.test.mjs test/agent-card.test.mjs"
+    "test": "node --test test/core.test.mjs && node --test test/signal.test.mjs && node --test test/agent-card.test.mjs && node --test test/tasks.test.mjs"
   },
   "keywords": ["ai", "agent", "network", "collaboration", "awakening"],
   "license": "MIT",
