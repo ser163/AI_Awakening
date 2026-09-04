@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "demo": "node demo.js",
-    "test": "node --test test/core.test.mjs && node --test test/signal.test.mjs && node --test test/agent-card.test.mjs && node --test test/tasks.test.mjs && node --test test/dht.test.mjs"
+    "test": "node --test --test-isolation=none test/core.test.mjs && node --test --test-isolation=none test/signal.test.mjs && node --test --test-isolation=none test/agent-card.test.mjs && node --test --test-isolation=none test/tasks.test.mjs && node --test --test-isolation=none test/dht.test.mjs"
   },
   "keywords": ["ai", "agent", "network", "collaboration", "awakening"],
   "license": "MIT",
