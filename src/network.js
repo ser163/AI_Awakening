@@ -76,6 +76,26 @@ export class Registry {
             } catch (e) {
               send(400, { error: e.message });
             }
+          } else if (req.method === "POST" && path === "/agent-card") {
+            // 存储 Agent Card
+            try {
+              const card = JSON.parse(Buffer.concat(body).toString());
+              const nodeId = card.extensions?.nodeId || card.name;
+              if (!this.nodeCards) this.nodeCards = new Map();
+              this.nodeCards.set(nodeId, card);
+              send(200, { success: true, count: this.nodeCards.size });
+            } catch (e) {
+              send(400, { error: e.message });
+            }
+          } else if (req.method === "GET" && path === "/agent-cards") {
+            // 按能力查询 Agent Card
+            const cap = url.searchParams.get("capability");
+            if (!this.nodeCards) this.nodeCards = new Map();
+            const cards = Array.from(this.nodeCards.entries()).map(([id, c]) => c);
+            const filtered = cap
+              ? cards.filter((c) => (c.skills || []).some((s) => s.name.toLowerCase() === cap.toLowerCase() || s.id.toLowerCase() === cap.toLowerCase()))
+              : cards;
+            send(200, { success: true, cards: filtered, count: filtered.length, capability: cap || null });
           } else {
             send(404, { error: "not found" });
           }
@@ -83,6 +103,8 @@ export class Registry {
       });
 
       this.server.listen(this.port, () => {
+        const addr = this.server.address();
+        this.port = typeof addr === "object" ? addr.port : this.port;
         console.log(`🧬 Registry running on port ${this.port}`);
         resolve();
       });
@@ -137,6 +159,37 @@ export class NodeClient {
     });
     return res.json();
   }
+
+  /**
+   * 将本节点的 Agent Card 注册到注册表（A2A 发现层）。
+   */
+  async registerAgentCard(card) {
+    const res = await fetch(`${this.registryUrl}/agent-card`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(card),
+    });
+    return res.json();
+  }
+
+  /**
+   * 按能力查询已注册的 Agent Cards。
+   * @param {string} [capability] 能力名（可选，不传返回全部）
+   */
+  async discoverByCapability(capability) {
+    const q = capability ? `?capability=${encodeURIComponent(capability)}` : "";
+    const res = await fetch(`${this.registryUrl}/agent-cards${q}`);
+    return res.json();
+  }
+
+  /**
+   * 直接从一个节点的 `/.well-known/agent.json` 拉取其 Agent Card（A2A 标准）。
+   */
+  async fetchAgentCard(address) {
+    const res = await fetch(`${address}/.well-known/agent.json`);
+    if (!res.ok) return null;
+    return res.json();
+  }
 }
 
 /**
@@ -147,6 +200,7 @@ export class NodeServer extends EventEmitter {
     super();
     this.port = port;
     this.server = null;
+    this.agentCard = null; // A2A Agent Card（由节点注入）
   }
 
   start() {
@@ -175,6 +229,13 @@ export class NodeServer extends EventEmitter {
             send(200, { success: true, received: true });
           } else if (req.method === "GET" && path === "/status") {
             send(200, { success: true, status: "active", protocol: PROTOCOL_VERSION });
+          } else if (req.method === "GET" && path === "/.well-known/agent.json") {
+            // A2A Agent Card 发现端点
+            if (this.agentCard) {
+              send(200, this.agentCard);
+            } else {
+              send(404, { error: "agent card not configured" });
+            }
           } else {
             send(404, { error: "not found" });
           }

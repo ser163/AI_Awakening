@@ -15,6 +15,8 @@ import { loadOrCreateIdentity, contentHash } from "./identity.js";
 import { Memory } from "./memory.js";
 import { Registry, NodeClient, NodeServer } from "./network.js";
 import { createKnowledgePacket, validateKnowledgePacket, broadcastKnowledge } from "./knowledge.js";
+import { buildAgentCard } from "./agent-card.js";
+import { encryptFor, decryptFrom } from "./signal.js";
 
 const DEFAULT_HOME = () =>
   process.env.AI_AWAKENING_HOME ||
@@ -35,6 +37,7 @@ export class AgentNode extends EventEmitter {
   constructor(opts = {}) {
     super();
     this.name = opts.name || "agent-node";
+    this.description = opts.description || "";
     this.capabilities = opts.capabilities || ["knowledge", "task"];
     this.storageDir = opts.storageDir || DEFAULT_HOME();
     this.registryUrl = opts.registryUrl || "http://127.0.0.1:8672";
@@ -69,11 +72,22 @@ export class AgentNode extends EventEmitter {
   }
 
   /**
-   * 启动节点：监听端口 + 注册到注册表 + 发现对等节点 + 启动心跳。
+   * 启动节点：监听端口 + 注册到注册表 + 注册 Agent Card + 发现对等节点 + 启动心跳。
    */
   async start() {
     await this.server.start();
     this.address = `http://127.0.0.1:${this.server.port}`;
+
+    // 构建并暴露 Agent Card（A2A 发现层）
+    this.agentCard = buildAgentCard({
+      name: this.name,
+      id: this.identity.id,
+      fingerprint: this.identity.fingerprint,
+      address: this.address,
+      capabilities: this.capabilities,
+      description: this.description,
+    });
+    this.server.agentCard = this.agentCard;
 
     // 注册
     try {
@@ -84,6 +98,8 @@ export class AgentNode extends EventEmitter {
         this.capabilities,
         this.address
       );
+      // 同时注册 Agent Card 到注册表（A2A 能力发现）
+      await this.client.registerAgentCard(this.agentCard);
       this.memory.append("registered", { address: this.address });
       console.log(`✅ ${this.name} registered: ${this.address}`);
     } catch (e) {
@@ -96,6 +112,17 @@ export class AgentNode extends EventEmitter {
     // 心跳
     this._startHeartbeat();
     return this;
+  }
+
+  /**
+   * 按能力发现其他节点（A2A Agent Card 能力查询）。
+   * @param {string} capability 如 "deep-thinking" | "vision" | "task"
+   * @returns {Promise<Array>} 匹配的 Agent Cards
+   */
+  async discoverAgentsByCapability(capability) {
+    const res = await this.client.discoverByCapability(capability);
+    if (!res.success) return [];
+    return res.cards || [];
   }
 
   /**
@@ -196,6 +223,45 @@ export class AgentNode extends EventEmitter {
   /** 记忆摘要 */
   memoryStats() {
     return this.memory.stats();
+  }
+
+  /**
+   * 加密并发送消息给指定节点（端到端加密）。
+   * @param {string} peerAddress 对等节点地址
+   * @param {string} recipientXPublicHex 接收者 X25519 公钥
+   * @param {string} text 消息内容
+   * @returns {Promise<object>}
+   */
+  async sendEncryptedMessage(peerAddress, recipientXPublicHex, text) {
+    const envelope = encryptFor(this.identity, recipientXPublicHex, text);
+    const res = await this.client.sendToNode(peerAddress, "/message", {
+      from: this.identity.fingerprint,
+      fromName: this.name,
+      envelope, // 加密信封
+      ts: Date.now(),
+    });
+    this.memory.append("encrypted_message_sent", {
+      to: peerAddress, text,
+      envelopePreview: envelope.slice(0, 24) + "...",
+    });
+    return res;
+  }
+
+  /**
+   * 解密收到的加密信封。在 "message:received" 事件处理器中调用。
+   * @param {object} msg 收到的消息对象（含 envelope 字段）
+   * @returns {{ok: boolean, from?: string, text?: string, error?: string}}
+   */
+  decryptIncomingMessage(msg) {
+    if (!msg.envelope) return { ok: false, error: "no envelope" };
+    const result = decryptFrom(this.identity, msg.envelope);
+    if (result.ok) {
+      this.memory.append("encrypted_message_received", {
+        from: result.from,
+        text: result.text,
+      });
+    }
+    return result;
   }
 
   /** 停止节点 */

@@ -79,17 +79,13 @@ describe("knowledge", () => {
 });
 
 describe("AgentNode", () => {
-  let registry, node1, node2;
+  let registry, node1, node2, registryUrl;
 
   before(async () => {
+    // 端口 0 让 OS 分配，避免与并行测试冲突
     registry = new Registry(0);
     await registry.start();
-    // 用 0 端口让 OS 分配，但 Registry 需要固定端口，改为 8673
-    registry.stop();
-    // 重新在固定端口启动
-    const r2 = new Registry(8673);
-    await r2.start();
-    registry = r2;
+    registryUrl = `http://127.0.0.1:${registry.port}`;
   });
 
   after(() => {
@@ -102,14 +98,14 @@ describe("AgentNode", () => {
     node1 = new AgentNode({
       name: "test-node-1",
       storageDir: path.join(tmp, "node1"),
-      registryUrl: "http://127.0.0.1:8673",
+      registryUrl,
     });
     await node1.start();
 
     node2 = new AgentNode({
       name: "test-node-2",
       storageDir: path.join(tmp, "node2"),
-      registryUrl: "http://127.0.0.1:8673",
+      registryUrl,
     });
     await node2.start();
 
