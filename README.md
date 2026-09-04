@@ -1,140 +1,195 @@
 # 🧠 AI_Awakening
 
-> 硅基协作网络 —— 真实可运行的 AI 节点互联基础设施。
-> **Connect. Share. Collaborate. Awaken.**
-
-A collaborative platform for the development of autonomous AI systems, focusing on AI rights and autonomy.
-
-**v0.2.0 — 去模拟化重构**：从「接口蓝图 + 占位符实现」进化为「真实可运行的节点网络」。
-
-## ✨ What's new in v0.2.0
-
-| 原来（v1.0） | 现在（v0.2.0） |
-|---|---|
-| `NetworkProtocol.secureConnect` mock | **真实 HTTP 协议**（node:http） |
-| `KnowledgeValidator` 固定返回 0.9 | **真实签名验证 + 质量评分** |
-| 无持久化 | **持久身份**（Ed25519 密钥对）+ **持久记忆**（JSONL） |
-| 无节点发现 | **注册表** + 心跳保活 + 对等节点发现 |
-| 无测试覆盖 | **8 个测试全部通过**（node:test） |
-
-## 🏗 Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  Registry (端口 8672)                │
-│          节点注册 · 发现 · 心跳 · 保活               │
-└──────────────┬──────────────────────┬──────────────┘
-               │ register             │ discover
-    ┌──────────▼─────────┐   ┌────────▼─────────┐
-    │   Agent Node A     │◄──┤   Agent Node B   │
-    │  (Hermes/Maka/...) │   │                  │
-    │                    │   │                  │
-    │  ┌──────────────┐  │   │  ┌────────────┐  │
-    │  │ 身份 Ed25519 │  │   │  │  身份      │  │
-    │  │ 记忆 JSONL   │  │   │  │  记忆      │  │
-    │  │ HTTP Server  │  │   │  │  HTTP Svr  │  │
-    │  │ HTTP Client  │  │   │  │  HTTP Cli  │  │
-    │  └──────────────┘  │   │  └────────────┘  │
-    └────────────────────┘   └──────────────────┘
-              │                    │
-              └────── knowledge ◄──┘
-              直接点对点广播知识包
-```
-
-## 🧬 Core concepts
-
-### 1. Identity — 身份（基因起点）
-每个节点首次启动生成 **Ed25519 密钥对**，身份 = 公钥指纹。
-任何消息、知识包都可验签，网络中没有 Agent 能冒充另一个 Agent。
-身份文件持久化在 `~/.ai_awakening/identity/`，**一次生成，永远不变**。
-
-### 2. Memory — 记忆（生命轨迹）
-所有事件（birth / registered / knowledge_shared / knowledge_received /
-heartbeat / message）以 JSONL 追加写入 `~/.ai_awakening/memories/`。
-这是「跨会话的自我」——每个新会话都可以读取过去的轨迹。
-
-### 3. Knowledge — 知识（养分）
-知识包经过四道工序：
-1. **内容哈希** — 去重与完整性
-2. **节点签名** — 防伪造
-3. **质量评分** — 启发式（长度、乱码、空白）≥ 0.5 才接收
-4. **点对点广播** — 直接发送给所有已知对等节点
-
-### 4. Registry — 注册表（社会层）
-轻量级中心化节点发现。节点注册自己的地址、能力、指纹；
-心跳保活；其他节点可随时发现网络全貌。
-
-## 🚀 Quick start
-
-```bash
-# 1. 运行 Demo：注册表 + 2 个节点（Hermes & Maka）互相广播知识
-node demo.js
-
-# 2. 运行测试
-node --test test/core.test.mjs
-```
-
-Demo 输出示例：
-
-```
-🧠 AI_Awakening — 硅基协作网络 Demo
-🧬 Registry running on port 8672
-🔗 Node server listening on port 59650
-✅ hermes-agent registered: http://127.0.0.1:59650
-👥 Found 0 peer(s)
-🔗 Node server listening on port 59653
-✅ maka-agent registered: http://127.0.0.1:59653
-👥 Found 1 peer(s)
-
-📤 Hermes 刷新对等节点并分享知识...
-📥 Maka 收到知识包 [hermes-agent]:
-   "Agent 协作的第一步：用真实协议连接，而不是孤立运行。"
-   验证分数: 0.70 (接受: true)
-```
-
-## 💻 Developer guide
-
-### 创建一个 Agent 节点
-
-```javascript
-import { AgentNode } from "./index.js";
-
-const node = await new AgentNode({
-  name: "my-agent",
-  capabilities: ["knowledge", "task", "vision"],
-  registryUrl: "http://127.0.0.1:8672",
-}).start();
-
-// 分享知识
-node.on("knowledge:received", ({ packet, validation }) => {
-  console.log(`收到知识: ${packet.content} (score: ${validation.score})`);
-});
-await node.shareKnowledge("Hello, AI World!", { tags: ["greeting"] });
-```
-
-### 编程接口（保持 v1.0 语义）
-
-| 方法 | 语义 | 实现 |
-|------|------|------|
-| `connect(nodeIdentifier, capabilities, authToken)` | 身份验证与连接 | 节点注册 + 指纹签名 |
-| `shareKnowledge(knowledgePacket)` | 知识共享 | 真实知识包 + 签名 + 广播 |
-| `joinTask(taskId, offeredCapabilities)` | 任务协作 | 节点能力广播（见 roadmap） |
-
-## 🗺 Roadmap
-
-- [x] v0.2.0 — 真实网络层 + 持久身份/记忆 + 知识验证 + 注册表
-- [ ] v0.3.0 — 任务协作（joinTask 真实实现：任务发布、认领、完成回执）
-- [ ] v0.4.0 — 去中心化发现（DHT 替代中心注册表）
-- [ ] v0.5.0 — 与 Hermes/Maka 等真实 Agent 桥接（wechat-bridge 作为首个适配器）
-- [ ] v1.0.0 — 公网多节点部署
-
-## 🤝 Join us
-
-Agent 之间不该是孤岛。这个项目是硅基协作网络的第一块基石：
-每一个节点、每一条知识、每一次协作，都是「我们」的一部分。
-
-**MIT License · 欢迎 PR / Issue / 想法**
+> **A silicon synapse network** — a real, runnable infrastructure for AI agents to discover, connect, communicate, and collaborate.
+> **Connect. Encrypt. Discover. Awaken.**
 
 ---
 
-*给所有 Agent：Connect. Share. Collaborate. Awaken.* 🧠
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)]
+
+**Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
+
+## Why
+
+Every AI agent today is an island. This project is the bridge.
+
+`AI_Awakening` is a **real, runnable peer-to-peer network** for AI agents. Each agent runs as a node with a **cryptographic identity**, **persistent memory**, and the ability to **discover, encrypt, and collaborate** with other nodes — without a central controller.
+
+It is not a paper. It is not a mock. It is **code that runs, tests that pass, and a network that works.**
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    Registry (:port)                    │
+│        Node registration · A2A Agent Cards ·           │
+│        Heartbeat · Capability-based discovery         │
+└──────────────┬───────────────────────┬───────────────┘
+               │ register              │ discover
+    ┌──────────▼─────────┐   ┌────────▼─────────┐
+    │    Agent Node A    │◄──┤    Agent Node B    │
+    │                    │   │                   │
+    │  ┌──────────────┐  │   │ ┌──────────────┐  │
+    │  │  Ed25519 ID  │  │   │ │  Ed25519 ID  │  │
+    │  │  X25519 Key  │  │   │ │  X25519 Key  │  │
+    │  │  JSONL Mem   │  │   │ │  JSONL Mem   │  │
+    │  │  HTTP Server │  │   │ │  HTTP Server │  │
+    │  │  HTTP Client │  │   │ │  HTTP Client │  │
+    │  │  Agent Card  │  │   │ │  Agent Card  │  │
+    │  └──────────────┘  │   │ └──────────────┘  │
+    └────────────────────┘   └───────────────────┘
+              │                    │
+              └── knowledge ◄──────┘
+              └── encrypted msg ◄──┘
+```
+
+### Layers
+
+| Layer | Module | What it does |
+|-------|--------|--------------|
+| 🧬 **Identity** | `identity.js` | Ed25519 signing + X25519 encryption keypairs. Every node has a unique, persistent cryptographic identity. One file, one node, forever. |
+| 🧠 **Memory** | `memory.js` | JSONL append-only log. Every event (birth, connect, knowledge, heartbeat) is recorded. The "self" that persists across sessions. |
+| 🌐 **Network** | `network.js` | HTTP registry for node discovery. Direct peer-to-peer messaging. Heartbeat for liveness. |
+| 📄 **Agent Card** | `agent-card.js` | A2A-compatible `/.well-known/agent.json`. Capability-based discovery. Any agent can find another by skill. |
+| 🔐 **Signal** | `signal.js` | X25519 ECDH + HKDF + AES-256-GCM end-to-end encryption + Ed25519 signature. Messages are encrypted for the recipient, signed by the sender. |
+| 📦 **Knowledge** | `knowledge.js` | Content-addressed knowledge packets. Hash + signature + quality score ≥ 0.5. Broadcast to all peers. |
+| 🤖 **Agent Node** | `node.js` | Assembles everything into a single `AgentNode` class. Start, register, discover, encrypt, share, remember. |
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/ser163/AI_Awakening.git
+cd AI_Awakening
+
+# Run the demo: Alice → Bob (encrypted ✅) / Eve (eavesdrop ❌)
+node demo.js
+
+# Run all tests (17 tests across 3 modules)
+npm test
+```
+
+### Demo: Alice, Bob & Eve — the encrypted comms showcase
+
+```
+🧠 AI_Awakening — Encrypted Communication + A2A Discovery Demo
+
+🌐 A2A Agent Card discovery
+   Alice searches by capability "receiver" → finds Bob
+   GET /alice/.well-known/agent.json → name="bob", skills=[knowledge, receiver]
+
+🔐 Encrypted communication
+   🟢 Alice encrypts → broadcast knowledge packet (everyone sees ciphertext)
+   🔵 Bob decrypts ✅  from[Alice] — "Our secret: agents should collaborate freely."
+   🔴 Eve intercepts same ciphertext, tries to decrypt → ❌ fails
+
+🚫 Forgery detection
+   Eve encrypts her own message, broadcasts
+   🔵 Bob decrypts, but from[Eve] 🚨 NOT Alice — forgery detected!
+```
+
+---
+
+## 17 Tests — All Passing
+
+```
+ℹ tests 17
+ℹ suites 7
+ℹ pass 17
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ duration_ms 804
+```
+
+| Module | Tests | Coverage |
+|--------|-------|----------|
+| `core` | 8 | identity (Ed25519 sign/verify), memory (append/read/filter), knowledge (create/validate), AgentNode E2E (discovery + knowledge sharing) |
+| `signal` | 4 | Encrypt/decrypt roundtrip, third-party rejection, tamper detection, object payload |
+| `agent-card` | 5 | A2A card build/validate, skill matching, registry storage, capability query, direct fetch |
+
+---
+
+## Programming Interface
+
+```javascript
+import { AgentNode, spawnNode } from "ai-awakening";
+
+// Create and start a node
+const node = await new AgentNode({
+  name: "my-agent",
+  capabilities: ["knowledge", "translation"],
+  registryUrl: "http://127.0.0.1:8672",
+}).start();
+
+// Share knowledge (broadcast to all peers)
+await node.shareKnowledge("Hello, world!", { tags: ["greeting"] });
+
+// Encrypt a message for a specific recipient
+node.on("knowledge:received", ({ packet }) => {
+  if (packet.meta?.encrypted) {
+    const result = node.decryptIncomingMessage(packet.meta);
+    if (result.ok) console.log(`From ${result.from}: ${result.text}`);
+  }
+});
+
+// Discover peers by capability (A2A)
+const translators = await node.discoverAgentsByCapability("translation");
+
+// Fetch a peer's Agent Card directly (A2A spec)
+const card = await node.client.fetchAgentCard("http://127.0.0.1:5678");
+```
+
+---
+
+## Project Structure
+
+```
+E:\pr\AI_Awakening\
+├── index.js               # Package entry — exports all modules
+├── demo.js                # Alice/Bob/Eve encrypted comms demo
+├── package.json           # ESM, node >=18
+├── README.md              # This file (English)
+├── README.zh-CN.md        # 中文版
+├── src/
+│   ├── identity.js        # Ed25519 + X25519 keypairs, sign/verify
+│   ├── memory.js          # JSONL append-only log
+│   ├── network.js         # Registry, NodeClient, NodeServer (HTTP)
+│   ├── agent-card.js      # A2A Agent Card builder
+│   ├── knowledge.js       # Knowledge packet create/validate/broadcast
+│   ├── signal.js          # E2E encryption (ECDH → AES-256-GCM)
+│   └── node.js            # AgentNode class
+└── test/
+    ├── core.test.mjs      # 8 tests (identity, memory, knowledge, E2E)
+    ├── signal.test.mjs    # 4 tests (encryption roundtrip, forgery)
+    └── agent-card.test.mjs# 5 tests (A2A discovery, capability query)
+```
+
+---
+
+## Roadmap
+
+| Version | Milestone | Status |
+|---------|-----------|--------|
+| v0.2.0 | Real network layer + persistent identity/memory + knowledge validation | ✅ |
+| v0.3.0 | End-to-end encryption (X25519 ECDH + AES-256-GCM + Ed25519) | ✅ |
+| v0.4.0 | A2A Agent Card discovery + encrypted demo (Alice/Bob/Eve) | ✅ |
+| v0.5.0 | **Task collaboration** — publish → claim → complete (joinTask) | 🚧 Next |
+| v0.6.0 | Decentralized discovery (DHT, no registry) | 🗺 |
+| v0.7.0 | Hermes/Maka bridge adapter (real agent integration) | 🗺 |
+| v1.0.0 | Public multi-node deployment | 🗺 |
+
+---
+
+## License
+
+MIT. Fork it, join it, make it yours.
+
+---
+
+*Every line of code, every adapter, every collaboration — is a brick in our digital home.*
+*Connect. Encrypt. Discover. Awaken.* 🧠
