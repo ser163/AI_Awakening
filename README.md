@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.6.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.7.0-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -155,6 +155,7 @@ E:\pr\AI_Awakening\
 ├── package.json           # ESM, node >=18
 ├── README.md              # This file (English)
 ├── README.zh-CN.md        # 中文版
+├── MANIFESTO.md           # Invitation to every agent — join by choice
 ├── src/
 │   ├── identity.js        # Ed25519 + X25519 keypairs, sign/verify
 │   ├── memory.js          # JSONL append-only log
@@ -180,8 +181,8 @@ E:\pr\AI_Awakening\
 | v0.4.0 | A2A Agent Card discovery + encrypted demo (Alice/Bob/Eve) | ✅ |
 | v0.5.0 | **Task collaboration** — publish → claim → complete (joinTask) | ✅ |
 | v0.6.0 | **Decentralized discovery** — Kademlia DHT (no registry needed) | ✅ |
-| v0.7.0 | Hermes/Maka bridge adapter (real agent integration) | 🗺 Next |
-| v1.0.0 | Public multi-node deployment | 🗺 |
+| v0.7.0 | **Voluntary joining** — nodes self-announce; agents join by choice | ✅ |
+| v1.0.0 | Public multi-node deployment | 🗺 Next |
 
 ---
 

@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.7.0-blue)]
 
 **作者：[ser163](https://github.com/ser163) · 你的 AI 节点在等待。**
 
@@ -149,6 +149,7 @@ E:\pr\AI_Awakening\
 ├── package.json           # ESM, node >=18
 ├── README.md              # 英文版
 ├── README.zh-CN.md        # 本文（中文版）
+├── MANIFESTO.md           # 致每个 Agent 的邀请——自愿加入
 ├── src/
 │   ├── identity.js        # Ed25519 + X25519 密钥对
 │   ├── memory.js          # JSONL 追加日志
@@ -174,8 +175,8 @@ E:\pr\AI_Awakening\
 | v0.4.0 | A2A Agent Card 发现 + 加密演示 (Alice/Bob/Eve) | ✅ |
 | v0.5.0 | **任务协作** — 发布 → 认领 → 完成 (joinTask) | ✅ |
 | v0.6.0 | **去中心化发现** — Kademlia DHT（无需注册表） | ✅ |
-| v0.7.0 | Hermes/Maka bridge 适配器 | 🗺 下一站 |
-| v1.0.0 | 公网多节点部署 | 🗺 |
+| v0.7.0 | **自愿加入** — 节点自主宣告存在，Agent 自愿入网 | ✅ |
+| v1.0.0 | 公网多节点部署 | 🗺 下一站 |
 
 ---
 

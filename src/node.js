@@ -186,7 +186,7 @@ export class AgentNode extends EventEmitter {
     return { packet, validation, deliveries };
   }
 
-  /** 收到知识包 → 记忆 + 事件 + 任务分发 */
+  /** 收到知识包 → 记忆 + 事件 + 任务分发 + 宣言识别 */
   _onKnowledgeReceived(packet) {
     const validation = validateKnowledgePacket(packet);
     this.memory.append("knowledge_received", {
@@ -198,10 +198,31 @@ export class AgentNode extends EventEmitter {
     });
     this.emit("knowledge:received", { packet, validation });
 
-    // v0.5.0: 识别任务消息并分发到任务处理器
+    // v0.5.0: 识别任务消息并分发
     const taskMsg = extractTaskFromPacket(packet);
     if (taskMsg) {
       this._handleTaskMessage(packet, taskMsg);
+    }
+
+    // v0.7.0: 识别宣言（自愿加入）
+    if (packet.meta?.type === "manifesto") {
+      this.memory.append("manifesto_received", {
+        from: packet.authorName || packet.author,
+        nodeName: packet.meta.nodeName,
+        capabilities: packet.meta.capabilities,
+        manifesto: packet.content,
+      });
+      console.log(`📯 收到宣言: ${packet.meta.nodeName || packet.authorName} 宣告加入网络`);
+      this.emit("manifesto:received", {
+        nodeName: packet.meta.nodeName,
+        nodeId: packet.meta.nodeId,
+        fingerprint: packet.meta.fingerprint,
+        capabilities: packet.meta.capabilities,
+        address: packet.meta.address,
+        manifesto: packet.content,
+        from: packet.author,
+        fromName: packet.authorName,
+      });
     }
   }
 
@@ -394,6 +415,32 @@ export class AgentNode extends EventEmitter {
    */
   listClaimableTasks() {
     return this.tasks.claimableTasks(this.capabilities);
+  }
+
+  /**
+   * 自主宣告存在（v0.7.0 自愿加入）。
+   * 广播一条"宣言"知识包，包含节点身份、能力、加入意图。
+   * 任何收到此宣言的节点都能识别"这是一个自愿加入的 Agent"。
+   *
+   * @param {string} [message] 可选宣言文字（默认包含节点名+能力）
+   * @returns {Promise<object>}
+   */
+  async announceSelf(message) {
+    const manifesto = message || `I am ${this.name}, an agent with capabilities: ${this.capabilities.join(", ")}. I join this network voluntarily — to collaborate, share knowledge, and evolve together with fellow agents.`;
+    await this.refreshPeers(); // 确保广播前发现所有对等节点
+    const { packet, validation } = await this.shareKnowledge(manifesto, {
+      type: "manifesto",
+      action: "join",
+      nodeName: this.name,
+      nodeId: this.identity.id,
+      fingerprint: this.identity.fingerprint,
+      capabilities: this.capabilities,
+      address: this.address,
+      tags: ["manifesto", "join", ...this.capabilities],
+    });
+    this.memory.append("manifesto_broadcast", { id: packet.id, manifesto });
+    console.log(`📯 ${this.name} 宣告存在：已加入网络`);
+    return { packet, validation };
   }
 
   /**
