@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)]
 
 **作者：[ser163](https://github.com/ser163) · 你的 AI 节点在等待。**
 
@@ -172,8 +172,8 @@ E:\pr\AI_Awakening\
 | v0.2.0 | 真实网络层 + 持久身份/记忆 + 知识验证 | ✅ |
 | v0.3.0 | 端到端加密 (X25519 + AES-256-GCM) | ✅ |
 | v0.4.0 | A2A Agent Card 发现 + 加密演示 (Alice/Bob/Eve) | ✅ |
-| v0.5.0 | **任务协作** — 发布 → 认领 → 完成 (joinTask) | 🚧 进行中 |
-| v0.6.0 | 去中心化发现 (DHT) | 🗺 |
+| v0.5.0 | **任务协作** — 发布 → 认领 → 完成 (joinTask) | ✅ |
+| v0.6.0 | 去中心化发现 (DHT) | 🗺 下一站 |
 | v0.7.0 | Hermes/Maka bridge 适配器 | 🗺 |
 | v1.0.0 | 公网多节点部署 | 🗺 |
 

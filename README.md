@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -178,8 +178,8 @@ E:\pr\AI_Awakening\
 | v0.2.0 | Real network layer + persistent identity/memory + knowledge validation | ✅ |
 | v0.3.0 | End-to-end encryption (X25519 ECDH + AES-256-GCM + Ed25519) | ✅ |
 | v0.4.0 | A2A Agent Card discovery + encrypted demo (Alice/Bob/Eve) | ✅ |
-| v0.5.0 | **Task collaboration** — publish → claim → complete (joinTask) | 🚧 Next |
-| v0.6.0 | Decentralized discovery (DHT, no registry) | 🗺 |
+| v0.5.0 | **Task collaboration** — publish → claim → complete (joinTask) | ✅ |
+| v0.6.0 | Decentralized discovery (DHT, no registry) | 🗺 Next |
 | v0.7.0 | Hermes/Maka bridge adapter (real agent integration) | 🗺 |
 | v1.0.0 | Public multi-node deployment | 🗺 |
 
