@@ -201,6 +201,7 @@ export class NodeServer extends EventEmitter {
     this.port = port;
     this.server = null;
     this.agentCard = null; // A2A Agent Card（由节点注入）
+    this.dhtHandler = null; // DHT RPC 处理器（由节点注入）
   }
 
   start() {
@@ -235,6 +236,18 @@ export class NodeServer extends EventEmitter {
               send(200, this.agentCard);
             } else {
               send(404, { error: "agent card not configured" });
+            }
+          } else if ((req.method === "POST") && (path === "/dht/ping" || path === "/dht/find_node")) {
+            // DHT RPC（去中心化节点发现 v0.6.0）
+            if (this.dhtHandler) {
+              const result = this.dhtHandler(path, payload);
+              if (result) {
+                send(200, result);
+              } else {
+                send(404, { error: "unknown dht rpc" });
+              }
+            } else {
+              send(404, { error: "dht not enabled" });
             }
           } else {
             send(404, { error: "not found" });

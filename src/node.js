@@ -18,6 +18,7 @@ import { createKnowledgePacket, validateKnowledgePacket, broadcastKnowledge } fr
 import { buildAgentCard } from "./agent-card.js";
 import { encryptFor, decryptFrom } from "./signal.js";
 import { TaskStore, createTask, taskMessage, extractTaskFromPacket } from "./tasks.js";
+import { DHTNode, nodeIdFromIdentity, makeDhtHandler } from "./dht.js";
 
 const DEFAULT_HOME = () =>
   process.env.AI_AWAKENING_HOME ||
@@ -393,6 +394,53 @@ export class AgentNode extends EventEmitter {
    */
   listClaimableTasks() {
     return this.tasks.claimableTasks(this.capabilities);
+  }
+
+  /**
+   * 启用 DHT 模式（去中心化节点发现 v0.6.0）。
+   * 启动后本节点参与 DHT 网络，可通过引导节点发现其他节点，
+   * 无需中心 Registry。
+   */
+  enableDht() {
+    if (this.dht) return this.dht;
+    // DHT 节点 ID 由身份派生（确定性，重启不变）
+    const dhtId = nodeIdFromIdentity(this.identity.fingerprint, this.name);
+    this.dht = new DHTNode({
+      id: dhtId,
+      address: this.address,
+      name: this.name,
+    });
+    // 挂到 HTTP 服务端
+    this.server.dhtHandler = makeDhtHandler(this.dht);
+    this.memory.append("dht_enabled", { id: dhtId.toString("hex").slice(0, 8) });
+    console.log(`🌐 DHT enabled: id=${dhtId.toString("hex").slice(0, 16)}...`);
+    return this.dht;
+  }
+
+  /**
+   * 通过引导节点加入 DHT 网络并发现节点。
+   * @param {string} bootstrapAddress 已知节点的地址
+   * @returns {Promise<Array>} 发现的节点列表
+   */
+  async dhtJoin(bootstrapAddress) {
+    const dht = this.enableDht();
+    await dht.ping(bootstrapAddress);
+    // 以自身 ID 为目标查找 → 填充路由表
+    const found = await dht.lookup(bootstrapAddress, dht.id);
+    this._dhtPeers = found;
+    console.log(`👥 DHT join via ${bootstrapAddress}: found ${found.length} peer(s)`);
+    return found;
+  }
+
+  /**
+   * DHT 模式下按名称/能力搜索最近的节点。
+   * @param {string} bootstrapAddress 任意已知在线节点（可为 null 用已有路由表）
+   * @returns {Promise<Array>} 附近节点
+   */
+  async dhtDiscover(bootstrapAddress = null) {
+    const dht = this.enableDht();
+    if (bootstrapAddress) await dht.ping(bootstrapAddress);
+    return dht.routing.all().map((n) => ({ id: n.id, address: n.address, name: n.name }));
   }
 
   /** 停止节点 */

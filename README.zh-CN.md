@@ -173,8 +173,8 @@ E:\pr\AI_Awakening\
 | v0.3.0 | 端到端加密 (X25519 + AES-256-GCM) | ✅ |
 | v0.4.0 | A2A Agent Card 发现 + 加密演示 (Alice/Bob/Eve) | ✅ |
 | v0.5.0 | **任务协作** — 发布 → 认领 → 完成 (joinTask) | ✅ |
-| v0.6.0 | 去中心化发现 (DHT) | 🗺 下一站 |
-| v0.7.0 | Hermes/Maka bridge 适配器 | 🗺 |
+| v0.6.0 | **去中心化发现** — Kademlia DHT（无需注册表） | ✅ |
+| v0.7.0 | Hermes/Maka bridge 适配器 | 🗺 下一站 |
 | v1.0.0 | 公网多节点部署 | 🗺 |
 
 ---
