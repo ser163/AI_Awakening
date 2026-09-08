@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.4-blue)]
+[![Version](https://img.shields.io/badge/version-0.12.5-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -301,6 +301,7 @@ E:\pr\AI_Awakening\
 | **v0.12.2** | **诚实策略** — quorum 未实现→显式 throw (拒绝降级), TaskPolicyEngine 结构化 (authority/conditions/threshold), stateHash 判等, source.identity 三概念分离, epistemic state (SUPPORTED/CONTRADICTED/STALE), dominance 相对支持度, schemaVersion, persistence health | ✅ |
 | **v0.12.3** | **语义正确性** — authority 白名单 (未知→throw), fork tie-breaker (ts 相同→eventHash lexical), STALE 四态闭环, epistemicStatus() 显式 UNKNOWN, TaskStore persistence health, PROTOCOL.md 12 章 spec | ✅ |
 | **v0.12.4** | **策略与事件语义** — TaskPolicy 深合并 (缺省继承 DEFAULT), fork rule 白名单, TaskEvent beforeState/afterState, replay eventHash 验证, 日志损坏 vs 首次启动分离, Claim/Proposition 分离, retractEvidence 非破坏性 | ✅ |
+| **v0.12.5** | **Task Semantic Integrity** — validateStateTransition (加密完整≠状态机完整), beforeState 匹配 head, afterState 推导不信任声明, canonicalize 重放验证状态机, eventIndex 替代 eventHashes, 恶意合法签名测试集 | ✅ |
 | v0.10 | Memory Kernel — SQLite/WAL, event store, index, knowledge graph | 🗺 VISION |
 | v0.11 | Autonomous Loop — Goal Engine, Planner, Observer, Reflect/Learn | 🗺 VISION |
 | v0.12 | Agent Society — Reputation, Capability Market, Dispute Resolution | 🗺 VISION |

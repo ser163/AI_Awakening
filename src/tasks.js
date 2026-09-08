@@ -219,6 +219,7 @@ export function createTask({ title, description = "", requiredCapabilities = [],
     cancelledAt: null,
     lastEventHash: null, // v0.10.0: 状态链尾，v0.11.0: 可能为分叉主链头
     eventHeight: 0,      // v0.12.4: 事件高度（替代 eventHashes 无限增长）
+    eventIndex: {},      // v0.12.5: {[eventHash]: true} —— O(1) fork 检测，JSON 可序列化
     forks: [],           // v0.11.0: 分叉列表 [{headEventHash, actor, ts, action, height}]
   };
 }
@@ -320,7 +321,7 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
   //    首见（hasLocalRecord=false）：信任由签名广播引导，跳过链校验。
   //    有本地记录：previousHash 必须匹配本地链尾，或匹配本地历史中的事件（= 合法分叉）。
   if (hasLocalRecord && event.previousHash !== (task.lastEventHash || null)) {
-    const forkParentExists = (task.eventHashes || []).includes(event.previousHash);
+    const forkParentExists = !!(task.eventIndex && task.eventIndex[event.previousHash]);
     if (!forkParentExists) {
       return { ok: false, reason: "event chain broken (previousHash mismatch)" };
     }
@@ -328,7 +329,70 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
     return { ok: true, forked: true };
   }
 
+  // v0.12.5 (审查 P0): 加密完整性 ≠ 状态机完整性。
+  // 合法私钥可签出 OPEN→COMPLETED 的非法事件——密码学全对、语义非法。
+  // 在链校验通过后，验证 beforeState/afterState 语义。
+  if (!event.beforeState || !event.afterState) {
+    return { ok: false, reason: "event missing beforeState/afterState (state transition semantics required)" };
+  }
+  if (hasLocalRecord) {
+    // 主链事件：beforeState 必须匹配本地当前状态（任务头部）
+    if (event.beforeState.status !== task.status) {
+      return { ok: false, reason: `beforeState mismatch: event=${event.beforeState.status}, local=${task.status}` };
+    }
+    if ((event.beforeState.assigneeFingerprintActual || "") !== (task.assigneeFingerprintActual || "")) {
+      return { ok: false, reason: "beforeState assignee mismatch" };
+    }
+  }
+  // 仅当 beforeState ≠ afterState（4-arg 显式转移）时验证状态机；
+  // 3-arg 兼容事件（before=after）跳过——legacy 语义不伪装成真转移。
+  if (event.beforeState.status !== event.afterState.status) {
+    const st = validateStateTransition(event);
+    if (!st.ok) return st;
+  }
+
   return { ok: true };
+}
+
+/**
+ * 验证状态转换语义（v0.12.5，审查 P0）。
+ * 不信任事件里自声明的 afterState——根据 beforeState + action 推导期望结果，
+ * 再与 afterState 比对。非法转移（如 OPEN →claim→ COMPLETED）在此被拒绝，
+ * 即使签名/eventHash 全部合法。
+ *
+ * @param {object} event 事件（需含 beforeState/afterState/action/actor）
+ * @returns {{ok: boolean, reason?: string, expected?: object}}
+ */
+export function validateStateTransition(event) {
+  const before = event.beforeState;
+  const after = event.afterState;
+  if (!before || !after) return { ok: false, reason: "event missing beforeState/afterState" };
+  const action = event.action;
+
+  // 推导合法结果：beforeStatus + action → expected afterStatus
+  let expectedStatus = null;
+  const isPublish = action === "publish";
+  const isCancel = action === "cancel";
+  const isClaim = action === "claim";
+  const isComplete = action === "complete";
+  if (isPublish && (before.status === null || before.status === undefined)) expectedStatus = TASK_STATUS.OPEN;
+  else if (isClaim && before.status === TASK_STATUS.OPEN) expectedStatus = TASK_STATUS.CLAIMED;
+  else if (isComplete && before.status === TASK_STATUS.CLAIMED) expectedStatus = TASK_STATUS.COMPLETED;
+  else if (isCancel && (before.status === TASK_STATUS.OPEN || before.status === TASK_STATUS.CLAIMED)) expectedStatus = TASK_STATUS.CANCELLED;
+  else return { ok: false, reason: `illegal state transition: ${before.status} →${action}→ ${after.status}` };
+
+  if (after.status !== expectedStatus) {
+    return { ok: false, reason: `afterState status mismatch: declared=${after.status}, expected=${expectedStatus}` };
+  }
+  // claim 的 assignee 必须是 actor 本人
+  if (isClaim && (after.assigneeFingerprintActual || "") !== event.actor) {
+    return { ok: false, reason: "afterState assignee must be the claim actor" };
+  }
+  // cancel 必须清空 assignee
+  if (isCancel && after.assigneeFingerprintActual) {
+    return { ok: false, reason: "afterState assignee must be empty after cancel" };
+  }
+  return { ok: true, expected: { status: expectedStatus } };
 }
 
 /**
@@ -471,10 +535,10 @@ export class TaskStore {
       if (!this.events.has(task.id)) this.events.set(task.id, []);
       this.events.get(task.id).push(event);
       task.lastEventHash = event.eventHash || event.eventId; // v0.10.1: 真哈希链尾
-      // v0.11.0: 跟踪所有事件哈希（用于分叉检测）
-      if (!task.eventHashes) task.eventHashes = [];
-      const h = event.eventHash || event.eventId;
-      if (!task.eventHashes.includes(h)) task.eventHashes.push(h);
+      // v0.12.5: eventIndex 对象映射（O(1) fork 检测）替代 eventHashes 数组
+      if (!task.eventIndex) task.eventIndex = {};
+      task.eventIndex[event.eventHash || event.eventId] = true;
+      task.eventHeight = (task.eventHeight || 0) + 1;
     }
     this.tasks.set(task.id, task);
     this._saveTasks();
@@ -610,9 +674,42 @@ export class TaskStore {
       cancelledAt: null,
       lastEventHash: null,
       forks: [],
-      eventHashes: [],
+      eventHashes: [],   // 兼容旧字段（保留读取，新写入走 eventIndex）
+      eventIndex: {},
     };
-    for (const ev of chain) {
+    for (let i = 0; i < chain.length; i++) {
+      const ev = chain[i];
+      // v0.12.5 (审查 P0-②): 重放时验证状态机合法性，而不只是 eventHash。
+      // 相邻事件约束：event[i].afterState === event[i+1].beforeState。
+      // 兼容 3-arg 旧事件（beforeState=afterState，legacy 模式）——跳过连续性检查。
+      if (i > 0) {
+        const prev = chain[i - 1];
+        const prevAfter = prev.afterState || prev.payload?.state || null;
+        const curBefore = ev.beforeState || ev.payload?.state || null;
+        // 仅当相邻状态的 status 不同且都非空时检查连续性（旧事件 before=after 不触发）
+        if (prevAfter && curBefore && prevAfter.status !== curBefore.status) {
+          // 允许 3-arg 兼容：beforeState === afterState 时跳过连续检查
+          const evBefore = ev.beforeState;
+          const evAfter = ev.afterState;
+          if (!evBefore || !evAfter || evBefore.status !== evAfter.status) {
+            throw new Error(`canonicalizeTask: chain state discontinuity at ${ev.eventId} (${prevAfter.status} → ${curBefore.status})`);
+          }
+        }
+      }
+      // 单事件状态转移合法性：仅当 beforeState !== afterState（4-arg 显式转移）时验证
+      if (ev.beforeState && ev.afterState && ev.action && ev.action !== "publish") {
+        if (ev.beforeState.status !== ev.afterState.status) {
+          const st = validateStateTransition(ev);
+          if (!st.ok) {
+            throw new Error(`canonicalizeTask: illegal state transition at ${ev.eventId}: ${st.reason}`);
+          }
+        }
+      }
+      // v0.12.4 (审查 P1-④): replay 阶段重新验证 eventHash 自洽——
+      // 本地 events 文件被篡改（或旧版本无新字段）时拒绝，而不是照吃。
+      if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
+        throw new Error(`canonicalizeTask: event ${ev.eventId} content tampered (eventHash mismatch)`);
+      }
       // v0.12.4: 重放优先用 afterState（执行后状态）；兼容旧事件 payload.state
       const state = ev.afterState || ev.payload?.state || {};
       reconstructed.status = state.status || ev.status || reconstructed.status;
@@ -620,7 +717,7 @@ export class TaskStore {
       if (state.result !== undefined && state.result !== null) reconstructed.result = state.result;
       reconstructed.lastEventHash = ev.eventHash || ev.eventId;
       reconstructed.eventHeight = (reconstructed.eventHeight || 0) + 1; // v0.12.4
-      if (!reconstructed.eventHashes.includes(reconstructed.lastEventHash)) reconstructed.eventHashes.push(reconstructed.lastEventHash);
+      reconstructed.eventIndex[reconstructed.lastEventHash] = true;
       if (ev.action === "claim") reconstructed.claimedAt = ev.ts;
       if (ev.action === "complete") reconstructed.completedAt = ev.ts;
       if (ev.action === "cancel") reconstructed.cancelledAt = ev.ts;

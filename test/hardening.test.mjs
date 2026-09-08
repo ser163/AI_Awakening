@@ -554,6 +554,99 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
   });
 });
 
+describe("v0.12.5: 恶意合法签名（加密完整 ≠ 状态机完整）", () => {
+  const alice = loadOrCreateIdentity(path.join(tmp, "evil_alice"), "alice");
+  const bob = loadOrCreateIdentity(path.join(tmp, "evil_bob"), "bob");
+  const store = new TrustedIdentityStore();
+  store.learn(alice.fingerprint, alice.publicKey, { source: "registry" });
+  store.learn(bob.fingerprint, bob.publicKey, { source: "registry" });
+
+  it("1. claim → afterState=completed（跳过 claimed）必须被拒", () => {
+    const before = { status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
+    const evilAfter = { status: TASK_STATUS.COMPLETED, assigneeFingerprintActual: alice.fingerprint, result: "done" };
+    const ev = createTaskEvent(alice, "claim", before, evilAfter);
+    const v = validateTaskEvent(ev, "claim", { id: ev.taskId, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+    assert.equal(v.ok, false, "OPEN→claim→COMPLETED 必须被拒（签名合法也不行）");
+  });
+
+  it("2. complete → afterState=open 必须被拒", () => {
+    const before = { status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, result: null };
+    const evilAfter = { status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
+    const ev = createTaskEvent(alice, "complete", before, evilAfter);
+    const v = validateTaskEvent(ev, "complete", { id: ev.taskId, status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+    assert.equal(v.ok, false, "complete→open 必须被拒");
+  });
+
+  it("3. cancel → afterState=claimed 必须被拒", () => {
+    const before = { status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
+    const evilAfter = { status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: bob.fingerprint, result: null };
+    const ev = createTaskEvent(alice, "cancel", before, evilAfter);
+    const v = validateTaskEvent(ev, "cancel", { id: ev.taskId, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+    assert.equal(v.ok, false, "cancel→claimed 必须被拒");
+  });
+
+  it("4. beforeState 与真实 head 不一致必须被拒", () => {
+    const task = createTask({ title: "head mismatch" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    task.lastEventHash = e1.eventHash;
+    task.status = TASK_STATUS.CLAIMED;
+    task.assigneeFingerprintActual = alice.fingerprint;
+    // 恶意声明 beforeState=open，但本地已是 claimed
+    const before = { id: task.id, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null, lastEventHash: e1.eventHash };
+    const after = { id: task.id, status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, result: null, lastEventHash: e1.eventHash };
+    const ev = createTaskEvent(alice, "claim", before, after);
+    const v = validateTaskEvent(ev, "claim", task, store, { hasLocalRecord: true });
+    assert.equal(v.ok, false, "beforeState 与本地 head 不一致必须拒绝");
+    assert.ok(v.reason.includes("beforeState mismatch"));
+  });
+
+  it("5. claim 的 afterState assignee 不是 actor 本人必须被拒", () => {
+    const before = { status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
+    // Alice 声称 claim，但 assignee 写 Bob
+    const evilAfter = { status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: bob.fingerprint, result: null };
+    const ev = createTaskEvent(alice, "claim", before, evilAfter);
+    const v = validateTaskEvent(ev, "claim", { id: ev.taskId, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+    assert.equal(v.ok, false, "claim 的 assignee 必须是 actor 本人");
+  });
+
+  it("6. canonicalizeTask 重放遇到非法转移 → throw（不污染 canonical state）", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "非法重放" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const before = { id: task.id, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null, lastEventHash: e1.eventHash };
+    const evilAfter = { id: task.id, status: TASK_STATUS.COMPLETED, assigneeFingerprintActual: alice.fingerprint, result: "x", lastEventHash: e1.eventHash };
+    // 直接在创建时提供 lastEventHash（previousHash 正确、eventHash 自洽）
+    const evilClaim = createTaskEvent(alice, "claim", before, evilAfter);
+    const local = ts.get(task.id);
+    local.forks = [{ headEventHash: evilClaim.eventHash, actor: alice.fingerprint, ts: evilClaim.ts, action: "claim" }];
+    ts.upsert(local);
+    ts.eventHistory(task.id).push(evilClaim);
+    assert.throws(
+      () => ts.canonicalizeTask(task.id),
+      /illegal state transition|state discontinuity/,
+      "重放必须拒绝非法状态转移"
+    );
+  });
+
+  it("7. eventIndex 替代 eventHashes——O(1) fork 检测", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "eventIndex" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    assert.ok(task.eventIndex, "应有 eventIndex");
+    assert.ok(task.eventIndex[e1.eventHash], "eventIndex 应索引事件哈希");
+    assert.equal(task.eventHeight, 1, "eventHeight 应计数");
+    // fork 检测走 eventIndex（previousHash 命中历史 → 合法分叉）
+    const claimEv = createTaskEvent(alice, "claim", { id: task.id, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null, lastEventHash: e1.eventHash }, { id: task.id, status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, result: null, lastEventHash: e1.eventHash });
+    const v = validateTaskEvent(claimEv, "claim", task, store, { hasLocalRecord: true });
+    assert.ok(v.ok || v.forked, "previousHash 命中 eventIndex 应视为合法（链连续或分叉）");
+  });
+});
+
 describe("v0.12.0: SelfState（自我从叙事升级为结构化状态）", () => {
   const node = new AgentNode({ name: "selfstate-node", storageDir: path.join(tmp, "selfstate") });
 
