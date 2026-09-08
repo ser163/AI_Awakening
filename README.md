@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.6-blue)]
+[![Version](https://img.shields.io/badge/version-0.12.7-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -303,6 +303,7 @@ E:\pr\AI_Awakening\
 | **v0.12.4** | **策略与事件语义** — TaskPolicy 深合并 (缺省继承 DEFAULT), fork rule 白名单, TaskEvent beforeState/afterState, replay eventHash 验证, 日志损坏 vs 首次启动分离, Claim/Proposition 分离, retractEvidence 非破坏性 | ✅ |
 | **v0.12.5** | **Task Semantic Integrity** — validateStateTransition (加密完整≠状态机完整), beforeState 匹配 head, afterState 推导不信任声明, canonicalize 重放验证状态机, eventIndex 替代 eventHashes, 恶意合法签名测试集 | ✅ |
 | **v0.12.6** | **State Transition Unification** — fork 不再免检 (forked 标记后仍验证语义), deriveNextState() 唯一状态转移来源 (live/replay 共用), canonicalize 全字段连续性 (status+assignee+result), eventIndex 元数据索引 (hash→{actor,action,ts,height}) | ✅ |
+| **v0.12.7** | **no-op 无旁路** — semanticVersion 显式版本 (v2 无条件 deriveNextState, v1 legacy), before=after 不再跳过验证, genesis 也走 deriveNextState, deriveNextState 纯函数化 (删 Date.now), no-op signed event 测试 | ✅ |
 | v0.10 | Memory Kernel — SQLite/WAL, event store, index, knowledge graph | 🗺 VISION |
 | v0.11 | Autonomous Loop — Goal Engine, Planner, Observer, Reflect/Learn | 🗺 VISION |
 | v0.12 | Agent Society — Reputation, Capability Market, Dispute Resolution | 🗺 VISION |

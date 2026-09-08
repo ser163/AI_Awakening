@@ -252,6 +252,10 @@ export function createTaskEvent(identity, action, beforeTask, afterTask = null) 
     ts: Date.now(),
     nonce: crypto.randomBytes(16).toString("hex"),
     status: task.status, // 保留旧字段（兼容旧 canonicalizeTask）
+    // v0.12.7 (审查 P0): 显式语义版本——不再用 before≠after 判断 legacy。
+    //   v2 = 4-arg 调用：beforeState/afterState 明确，无条件 deriveNextState 验证
+    //   v1 = 3-arg 兼容调用：before=after 快照，legacy 语义（仅迁移/读取）
+    semanticVersion: afterTask ? 2 : 1,
     // v0.12.4: 明确的 beforeState / afterState（含之前的 state 快照，按需迁移）
     beforeState,
     afterState,
@@ -332,16 +336,14 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
   }
 
   // v0.12.5 (审查 P0): 加密完整性 ≠ 状态机完整性。
-  // 合法私钥可签出 OPEN→COMPLETED 的非法事件——密码学全对、语义非法。
-  // 在链校验通过后，验证 beforeState/afterState 语义。
-  if (!event.beforeState || !event.afterState) {
-    return { ok: false, reason: "event missing beforeState/afterState (state transition semantics required)" };
-  }
-  if (hasLocalRecord) {
-    // 主链事件：beforeState 必须匹配本地当前状态（任务头部）
-    // fork 事件：beforeState 必须匹配父事件的 afterState（通过 eventIndex 查找父事件？）
-    // 目前只校验主链 beforeState 匹配；fork 事件跳过 beforeState 匹配（因为 fork 父不是当前 head）
-    if (!forked) {
+  // v0.12.7 (审查 P0): "before == after" 不再是跳过验证的依据——no-op 事件也必须验证。
+  //   恶意 4-arg 伪造 complete claimed→claimed（before=after）不再能绕过。
+  //   isLegacy 判定只看显式 semanticVersion（v1）或缺失 beforeState/afterState。
+  const isLegacyEvent = event.semanticVersion === 1 || !event.beforeState || !event.afterState;
+  if (!isLegacyEvent) {
+    // v2 事件（4-arg）：无条件验证状态机（含 no-op 也要经 deriveNextState）
+    if (hasLocalRecord && !forked) {
+      // 主链事件：beforeState 必须匹配本地当前状态（任务头部）
       if (event.beforeState.status !== task.status) {
         return { ok: false, reason: `beforeState mismatch: event=${event.beforeState.status}, local=${task.status}` };
       }
@@ -349,10 +351,8 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
         return { ok: false, reason: "beforeState assignee mismatch" };
       }
     }
-  }
-  // 仅当 beforeState ≠ afterState（4-arg 显式转移）时验证状态机；
-  // 3-arg 兼容事件（before=after）跳过——legacy 语义不伪装成真转移。
-  if (event.beforeState.status !== event.afterState.status) {
+    // no-op（before=after）在 deriveNextState 里没有合法转移（claim 必须 open→claimed 等），
+    // 因此会被拒绝——不存在"合法 no-op"状态转移。
     const st = validateStateTransition(event);
     if (!st.ok) return st;
   }
@@ -375,8 +375,8 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
  */
 export function deriveNextState(beforeState, action, actor, payload = null) {
   const b = beforeState || {};
-  const ts = Date.now();
   const status = b.status ?? null;
+  // deriveNextState 是纯函数（v0.12.7）——禁止 Date.now/Math.random/network/fs。same input → same output。
 
   const after = {
     status,
@@ -779,36 +779,41 @@ export class TaskStore {
           }
         }
       }
-      // 用 deriveNextState 推导期望状态（v0.12.6）
+      // 用 deriveNextState 推导期望状态（v0.12.6/v0.12.7）
       if (ev.beforeState && ev.afterState && ev.action) {
-        if (ev.beforeState.status !== ev.afterState.status || ev.beforeState.assigneeFingerprintActual !== ev.afterState.assigneeFingerprintActual) {
+        // v0.12.7: 用 semanticVersion 判断 legacy（不再用 before≠after）。
+        //   semanticVersion===2 → v2 无条件验证（含 no-op）
+        //   semanticVersion===1 → legacy 直接应用
+        //   缺失（旧磁盘事件）→ 启发式：before===after 视为 legacy
+        const noExplicitVersion = ev.semanticVersion === undefined || ev.semanticVersion === null;
+        const heuristicLegacy = noExplicitVersion && ev.beforeState.status === ev.afterState.status && ev.beforeState.assigneeFingerprintActual === ev.afterState.assigneeFingerprintActual;
+        const isLegacyEv = ev.semanticVersion === 1 || heuristicLegacy;
+        if (isLegacyEv) {
+          // 3-arg 兼容（beforeState===afterState 或 semanticVersion=1）：直接应用 afterState
+          const state = ev.afterState || ev.payload?.state || {};
           if (i === 0) {
-            // genesis 事件（publish）：直接应用 afterState，deriveNextState 需要 null 前置状态
-            const state = ev.afterState || ev.payload?.state || {};
+            currentState = { status: state.status || TASK_STATUS.OPEN, assigneeFingerprintActual: state.assigneeFingerprintActual || "", result: state.result ?? null };
+          } else {
             currentState.status = state.status || ev.status || currentState.status;
             if (state.assigneeFingerprintActual) currentState.assigneeFingerprintActual = state.assigneeFingerprintActual;
             if (state.result !== undefined && state.result !== null) currentState.result = state.result;
-          } else {
-            // 非 genesis 事件：用 deriveNextState 推导，不信任声明
-            try {
-              const expected = deriveNextState(currentState, ev.action, ev.actor, ev.payload);
-              // 验证后状态与声明的 afterState 一致
-              const after = ev.afterState;
-              if (after.status !== expected.status) throw new Error(`afterState.status mismatch: declared=${after.status}, expected=${expected.status}`);
-              if ((after.assigneeFingerprintActual || "") !== (expected.assigneeFingerprintActual || "")) throw new Error(`afterState.assignee mismatch: declared=${after.assigneeFingerprintActual || ""}, expected=${expected.assigneeFingerprintActual || ""}`);
-              if (actionHasResult(ev.action) && (after.result ?? null) !== (expected.result ?? null)) throw new Error(`afterState.result mismatch: declared=${after.result ?? null}, expected=${expected.result ?? null}`);
-              // 应用推导的状态（不是 afterState）
-              currentState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
-            } catch (err) {
-              throw new Error(`canonicalizeTask: illegal state transition at ${ev.eventId}: ${err.message}`);
-            }
           }
         } else {
-          // 3-arg 兼容（beforeState===afterState）：直接应用
-          const state = ev.afterState || ev.payload?.state || {};
-          currentState.status = state.status || ev.status || currentState.status;
-          if (state.assigneeFingerprintActual) currentState.assigneeFingerprintActual = state.assigneeFingerprintActual;
-          if (state.result !== undefined && state.result !== null) currentState.result = state.result;
+          // v2 事件（4-arg 显式转移）：用 deriveNextState 推导，不信任声明
+          // genesis（i===0）也走 deriveNextState——null→publish→open 是合法转移
+          try {
+            const beforeState = i === 0 ? { status: null, assigneeFingerprintActual: "", result: null } : currentState;
+            const expected = deriveNextState(beforeState, ev.action, ev.actor, ev.payload);
+            // 验证后状态与声明的 afterState 一致
+            const after = ev.afterState;
+            if (after.status !== expected.status) throw new Error(`afterState.status mismatch: declared=${after.status}, expected=${expected.status}`);
+            if ((after.assigneeFingerprintActual || "") !== (expected.assigneeFingerprintActual || "")) throw new Error(`afterState.assignee mismatch: declared=${after.assigneeFingerprintActual || ""}, expected=${expected.assigneeFingerprintActual || ""}`);
+            if (actionHasResult(ev.action) && (after.result ?? null) !== (expected.result ?? null)) throw new Error(`afterState.result mismatch: declared=${after.result ?? null}, expected=${expected.result ?? null}`);
+            // 应用推导的状态（不是 afterState）
+            currentState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
+          } catch (err) {
+            throw new Error(`canonicalizeTask: illegal state transition at ${ev.eventId}: ${err.message}`);
+          }
         }
       } else {
         // 极旧事件（无 beforeState/afterState）：fallback

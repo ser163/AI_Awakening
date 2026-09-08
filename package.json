@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.6",
-  "description": "硅基协作网络 — State Transition Unification (deriveNextState/validated-forks/world-belief)",
+  "version": "0.12.7",
+  "description": "硅基协作网络 — Semantic Versioning 状态机 (no-op 无旁路/semanticVersion/纯函数转移)",
   "type": "module",
   "main": "index.js",
   "scripts": {

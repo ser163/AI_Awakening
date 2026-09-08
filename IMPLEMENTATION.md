@@ -132,6 +132,7 @@ E:\pr\AI_Awakening\
 | 2026-09-08 | v0.12.4 | **策略与事件语义** | **120** | TaskPolicy 深合并 (缺省继承 DEFAULT, 禁止缺省→any), normalizePolicyEntry 三态 (缺省/null/显式), fork rule 白名单, TaskEvent beforeState/afterState (签名域+重放), replay eventHash 自洽验证, 日志损坏 vs 首次启动分离 (行级+ENOENT), Claim/Proposition 身份分离, retractEvidence 非破坏性 (status=retracted 保留历史), eventHeight 字段 |
 | 2026-09-08 | v0.12.5 | **Task Semantic Integrity** | **127** | validateStateTransition (加密完整≠状态机完整, 推导 afterState 不信任声明), beforeState 匹配本地 head, claim assignee=actor 强制, canonicalizeTask 重放验证状态机 (相邻事件连续性+单事件转移), eventIndex 对象映射替代 eventHashes 数组 (O(1) fork 检测), 恶意合法签名测试集 7 场景 |
 | 2026-09-08 | v0.12.6 | **State Transition Unification** | **128** | fork 不再免检 (forked=true 标记后继续完整语义验证), deriveNextState() 唯一状态转移来源 (live validate + replay 共用, 协议推导 expected 不信任声明), canonicalize 全字段连续性检查 (status+assignee+result 三字段), eventIndex 升级元数据索引 (hash→{eventId,parentHash,actor,action,ts,height}), fork+非法转移测试 |
+| 2026-09-08 | v0.12.7 | **no-op 无旁路** | **130** | semanticVersion 显式版本 (v2=4-arg 无条件 deriveNextState 含 no-op, v1=legacy), before=after 不再跳过验证 (修复状态机旁路), genesis 也走 deriveNextState (null→publish→open), deriveNextState 纯函数化 (删除 Date.now, 声明禁止非纯调用), no-op signed event 测试集 (claimed→complete→claimed / open→claim→open 均拒) |
 
 > 2026-09-08 在同一天发布了 v0.8.0 和 v0.9.0，因为自我叩问完成后，审查反馈指出信任模型的安全缺陷，随即在同一天完成了信任层补完。
 

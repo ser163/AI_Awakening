@@ -610,7 +610,7 @@ describe("v0.12.5: 恶意合法签名（加密完整 ≠ 状态机完整）", ()
     assert.equal(v.ok, false, "claim 的 assignee 必须是 actor 本人");
   });
 
-  it("6. canonicalizeTask 重放遇到非法转移 → throw（不污染 canonical state）", () => {
+  it("6. canonicalizeTask 重放遇到非法转移 → throw（不污染 canonical state）", async () => {
     const ts = new TaskStore();
     const task = createTask({ title: "非法重放" });
     task.publisherFingerprint = alice.fingerprint;
@@ -618,7 +618,7 @@ describe("v0.12.5: 恶意合法签名（加密完整 ≠ 状态机完整）", ()
     ts.upsert(task, e1);
     const before = { id: task.id, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null, lastEventHash: e1.eventHash };
     const evilAfter = { id: task.id, status: TASK_STATUS.COMPLETED, assigneeFingerprintActual: alice.fingerprint, result: "x", lastEventHash: e1.eventHash };
-    // 直接在创建时提供 lastEventHash（previousHash 正确、eventHash 自洽）
+    await new Promise((r) => setTimeout(r, 2)); // 确保 fork ts 严格晚于 e1（避免同毫秒平局）
     const evilClaim = createTaskEvent(alice, "claim", before, evilAfter);
     const local = ts.get(task.id);
     local.forks = [{ headEventHash: evilClaim.eventHash, actor: alice.fingerprint, ts: evilClaim.ts, action: "claim" }];
@@ -666,6 +666,25 @@ describe("v0.12.5: 恶意合法签名（加密完整 ≠ 状态机完整）", ()
     // 必须被拒绝（fork≠免检），而不是 {ok:true, forked:true}
     assert.equal(v.ok, false, "fork + 非法状态转移必须被拒（即使 previousHash 合法）");
     assert.ok(v.reason && !v.forked, "不应标记为 fork——语义验证失败");
+  });
+
+  it("9. no-op v2 事件（before=after）→ 被 deriveNextState 拒绝（不合法 no-op 转移）", () => {
+    // CLAIMED →complete→ CLAIMED（no-op）
+    const before = { id: "x", status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, result: null };
+    const sameAfter = { id: "x", status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, result: null };
+    const ev = createTaskEvent(alice, "complete", before, sameAfter);
+    // 必须为 v2（semanticVersion=2）
+    assert.equal(ev.semanticVersion, 2, "4-arg 事件必须为 v2");
+    const v = validateTaskEvent(ev, "complete", { id: "x", status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+    assert.equal(v.ok, false, "no-op complete 必须被拒（claimed→claimed 非法）");
+  });
+
+  it("10. no-op v2 claim（OPEN→OPEN）→ 被拒绝", () => {
+    const before = { id: "x", status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
+    const sameAfter = { id: "x", status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
+    const ev = createTaskEvent(alice, "claim", before, sameAfter);
+    const v = validateTaskEvent(ev, "claim", { id: "x", status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+    assert.equal(v.ok, false, "no-op claim 必须被拒");
   });
 });
 
