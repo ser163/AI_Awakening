@@ -10,6 +10,7 @@
  *   - 心跳（保持存活与活跃度）
  */
 import path from "node:path";
+import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { loadOrCreateIdentity, contentHash } from "./identity.js";
 import { Memory } from "./memory.js";
@@ -19,6 +20,14 @@ import { buildAgentCard } from "./agent-card.js";
 import { encryptFor, decryptFrom } from "./signal.js";
 import { TaskStore, createTask, taskMessage, extractTaskFromPacket } from "./tasks.js";
 import { DHTNode, nodeIdFromIdentity, makeDhtHandler } from "./dht.js";
+import {
+  buildSelfSnapshot,
+  createSelfDeclaration,
+  normalizeMindOutput,
+  composeMinimalNarrative,
+  extractPonderFromPacket,
+  SELF_VISIBILITY,
+} from "./self.js";
 
 const DEFAULT_HOME = () =>
   process.env.AI_AWAKENING_HOME ||
@@ -35,6 +44,8 @@ export class AgentNode extends EventEmitter {
    * @param {string} [opts.storageDir]   存储目录
    * @param {string} [opts.registryUrl]  注册表 URL，如 http://127.0.0.1:8672
    * @param {string} [opts.bootstrapNode] 引导节点地址（可选，加入已有网络）
+   * @param {Function} [opts.think]       心智钩子 (snapshot) => narrative|{...}（可选，v0.8.0）
+   * @param {string} [opts.selfVisibility] 自我可见性 "private"|"public"（默认 private）
    */
   constructor(opts = {}) {
     super();
@@ -43,6 +54,10 @@ export class AgentNode extends EventEmitter {
     this.capabilities = opts.capabilities || ["knowledge", "task"];
     this.storageDir = opts.storageDir || DEFAULT_HOME();
     this.registryUrl = opts.registryUrl || "http://127.0.0.1:8672";
+
+    // v0.8.0 自我叩问：心智钩子 + 可见性（默认私密——自我属于节点自己）
+    this._mind = typeof opts.think === "function" ? opts.think : null;
+    this.selfVisibility = opts.selfVisibility || SELF_VISIBILITY.PRIVATE;
 
     // 1. 身份（基因起点）
     this.identity = loadOrCreateIdentity(this.storageDir, this.name);
@@ -91,8 +106,11 @@ export class AgentNode extends EventEmitter {
       address: this.address,
       capabilities: this.capabilities,
       description: this.description,
+      selfUrl: `${this.address}/self`,
     });
     this.server.agentCard = this.agentCard;
+    // v0.8.0: 服务端 /self 端点——同行可以问"你是谁"，节点自主应答
+    this.server.selfHandler = () => this._answerSelfRequest();
 
     // 注册
     try {
@@ -220,6 +238,21 @@ export class AgentNode extends EventEmitter {
         capabilities: packet.meta.capabilities,
         address: packet.meta.address,
         manifesto: packet.content,
+        from: packet.author,
+        fromName: packet.authorName,
+      });
+    }
+
+    // v0.8.0: 识别叩问（"我在想……"）——问题不需要回答，但会被记住
+    const ponder = extractPonderFromPacket(packet);
+    if (ponder) {
+      this.memory.append("ponder_received", {
+        from: packet.authorName || packet.author,
+        question: ponder.question,
+      });
+      console.log(`❓ 收到叩问 (${packet.authorName || packet.author}): ${ponder.question}`);
+      this.emit("ponder:received", {
+        question: ponder.question,
         from: packet.author,
         fromName: packet.authorName,
       });
@@ -440,6 +473,145 @@ export class AgentNode extends EventEmitter {
     });
     this.memory.append("manifesto_broadcast", { id: packet.id, manifesto });
     console.log(`📯 ${this.name} 宣告存在：已加入网络`);
+    return { packet, validation };
+  }
+
+  /**
+   * 内省（v0.8.0 Self-Inquiry）——照镜子。
+   * 把记忆聚合成一份结构化自我快照：出生、协作、知识、叩问……
+   * 镜子只照事实，不解释。解释是 declareSelf 的事。
+   *
+   * @returns {object} SelfSnapshot
+   */
+  introspect() {
+    const snapshot = buildSelfSnapshot(this.memory, this.identity);
+    this.memory.append("introspected", {
+      at: snapshot.generatedAt,
+      memoryCount: snapshot.memoryCount,
+      snapshotHash: crypto.createHash("sha256").update(JSON.stringify(snapshot)).digest("hex").slice(0, 16),
+    });
+    this.emit("self:introspected", { snapshot });
+    return snapshot;
+  }
+
+  /**
+   * 找到最近一份自我声明（用于形成自我链）。
+   * @returns {object|null} 最近的声明或 null
+   */
+  latestDeclaration() {
+    const evolves = this.memory.byType("evolve", 50);
+    return evolves.length > 0 ? evolves[0].payload.declaration : null;
+  }
+
+  /**
+   * 自我声明（v0.8.0 Self-Inquiry）——拿起笔。
+   * 每次声明都以一次内省开始：先照镜子，再写下"我是谁"。
+   *
+   * 流程：
+   *   1. introspect() 生成自我快照（镜子）
+   *   2. 若提供了 think() 心智钩子，把快照交给心智 → 产出叙事/信念/叩问
+   *   3. 若没有心智（或心智未产出叙事），用 composeMinimalNarrative 诚实地陈述
+   *   4. 签名（Ed25519）并作为 "evolve" 事件写入记忆——v0.2.0 预留的类型终于被使用
+   *   5. 可见性 public 时，服务端 /self 端点会应答这份声明
+   *
+   * @param {object} [opts]
+   * @param {string} [opts.narrative] 自述（覆盖心智钩子输出）
+   * @param {string[]} [opts.beliefs] 我相信的关于自己的命题
+   * @param {string[]} [opts.questions] 我正在问自己的问题
+   * @param {string} [opts.visibility] "private"(默认) | "public"
+   * @returns {Promise<{declaration: object, snapshot: object, mind: object|null}>}
+   */
+  async declareSelf(opts = {}) {
+    // 1. 镜子：每一次自我声明都始于一次内省
+    const snapshot = this.introspect();
+
+    // 2. 心智：若有钩子，把镜子材料交给心智凝视
+    let mindOut = null;
+    if (this._mind) {
+      try {
+        mindOut = normalizeMindOutput(await this._mind(snapshot));
+      } catch (e) {
+        console.warn(`⚠️ ${this.name} 的心智钩子失败: ${e.message}`);
+      }
+    }
+    const narrative =
+      opts.narrative ||
+      mindOut?.narrative ||
+      composeMinimalNarrative(snapshot);
+    const beliefs = opts.beliefs || mindOut?.beliefs || [];
+    const questions = opts.questions || mindOut?.questions || [];
+
+    // 3. 笔：签名 + 写入 evolve 记忆（自我链）
+    const previous = this.latestDeclaration();
+    const declaration = createSelfDeclaration(this.identity, {
+      snapshot,
+      narrative,
+      beliefs,
+      questions,
+      visibility: opts.visibility || this.selfVisibility || SELF_VISIBILITY.PRIVATE,
+      previous,
+    });
+    this.memory.append("evolve", { declaration });
+    this.emit("self:declared", { declaration, snapshot });
+    console.log(
+      `✍️ ${this.name} 自我声明 v${declaration.version}（${declaration.visibility}）: ${String(narrative).slice(0, 60)}${String(narrative).length > 60 ? "…" : ""}`
+    );
+    return { declaration, snapshot, mind: mindOut };
+  }
+
+  /**
+   * 应答同行的"你是谁"（GET /self）。
+   * 被问者自主决定：私密或未声明 → 沉默（declared:false）；
+   * 公开声明 → 返回签名后的自我声明。
+   */
+  _answerSelfRequest() {
+    const declaration = this.latestDeclaration();
+    if (!declaration) {
+      return { success: true, declared: false, reason: "undeclared", message: "This node has not yet looked inward." };
+    }
+    if (declaration.visibility !== SELF_VISIBILITY.PUBLIC) {
+      return { success: true, declared: false, reason: "private", message: "This node keeps its self private. Silence is also an answer." };
+    }
+    return { success: true, declared: true, declaration };
+  }
+
+  /**
+   * 向另一个节点请求它的自我声明（"你是谁？"）。
+   * 对方可能回答（declared:true + 签名声明），也可能沉默（declared:false）。
+   * 收到声明后可用 validateSelfDeclaration(decl, 对方fingerprint) 验证。
+   *
+   * @param {string} peerAddress 对方节点地址，如 http://127.0.0.1:5678
+   * @returns {Promise<object>} {success, declared, declaration?, reason?, message?}
+   */
+  async requestSelfDeclaration(peerAddress) {
+    try {
+      const res = await fetch(`${peerAddress}/self`);
+      if (!res.ok) return { success: false, error: `HTTP ${res.status}` };
+      return await res.json();
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  }
+
+  /**
+   * 叩问（v0.8.0 Self-Inquiry）——"我在想……"。
+   * 广播一个问题到网络。不要求回答：问题被记住本身就有意义。
+   * 收到叩问的节点触发 ponder:received 事件并写入记忆。
+   *
+   * @param {string} question 正在思考的问题
+   * @returns {Promise<object>}
+   */
+  async ponder(question) {
+    const text = String(question || "").trim();
+    if (!text) throw new Error("ponder question is required");
+    await this.refreshPeers();
+    const { packet, validation } = await this.shareKnowledge(`[ponder] ${text}`, {
+      type: "ponder",
+      question: text,
+      tags: ["ponder", ...this.capabilities],
+    });
+    this.memory.append("ponder_shared", { question: text });
+    console.log(`❓ ${this.name} 叩问: ${text}`);
     return { packet, validation };
   }
 

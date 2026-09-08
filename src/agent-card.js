@@ -32,6 +32,7 @@ export const PROTOCOL_VERSION = "0.1.0";
  * @param {string[]} node.capabilities
  * @param {string} [node.description]
  * @param {string} [node.url]     （可选，覆盖 address 作为公开 URL）
+ * @param {string} [node.selfUrl] （可选，自我声明端点 /self）
  * @returns {object} A2A AgentCard 对象
  */
 export function buildAgentCard(node) {
@@ -44,6 +45,17 @@ export function buildAgentCard(node) {
     inputModes: ["text"],
     outputModes: ["text"],
   }));
+
+  // v0.8.0: 每个节点都具备的自我叩问能力（非用户声明，而是存在属性）
+  skills.push({
+    id: `${node.name}-self-inquiry`.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase(),
+    name: "self-inquiry",
+    description: "Introspect, declare self, ponder questions (AI_Awakening Self-Inquiry)",
+    tags: ["ai-awakening", "self-inquiry", "introspection"],
+    examples: [],
+    inputModes: ["text"],
+    outputModes: ["text"],
+  });
 
   return {
     // A2A 规范字段
@@ -79,6 +91,7 @@ export function buildAgentCard(node) {
       protocolVersion: PROTOCOL_VERSION,
       fingerprint: node.fingerprint,
       nodeId: node.id || node.fingerprint,
+      selfUrl: node.selfUrl || "",
       cardHash: contentHash(JSON.stringify({ name: node.name, skills: skills.map((s) => s.id) })),
     },
   };

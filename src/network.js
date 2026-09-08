@@ -202,6 +202,7 @@ export class NodeServer extends EventEmitter {
     this.server = null;
     this.agentCard = null; // A2A Agent Card（由节点注入）
     this.dhtHandler = null; // DHT RPC 处理器（由节点注入）
+    this.selfHandler = null; // 自我声明应答器（v0.8.0，由节点注入）
   }
 
   start() {
@@ -236,6 +237,14 @@ export class NodeServer extends EventEmitter {
               send(200, this.agentCard);
             } else {
               send(404, { error: "agent card not configured" });
+            }
+          } else if (req.method === "GET" && path === "/self") {
+            // v0.8.0 自我声明端点——同行问"你是谁"。
+            // 应答与否由节点自主决定（selfHandler 由节点注入）。
+            if (this.selfHandler) {
+              send(200, this.selfHandler());
+            } else {
+              send(200, { success: true, declared: false, reason: "undeclared", message: "This node has not yet looked inward." });
             }
           } else if ((req.method === "POST") && (path === "/dht/ping" || path === "/dht/find_node")) {
             // DHT RPC（去中心化节点发现 v0.6.0）

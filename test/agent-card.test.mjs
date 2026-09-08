@@ -19,10 +19,12 @@ describe("agent-card (A2A)", () => {
     });
     assert.equal(card.name, "test-agent");
     assert.equal(card.version, "1.0");
-    assert.equal(card.skills.length, 3);
+    assert.equal(card.skills.length, 4); // 3 个能力 + 1 个固有的 self-inquiry
     assert.ok(card.capabilities.streaming);
     assert.equal(card.extensions.fingerprint, "abc123def456");
-    assert.deepEqual(card.skills.map((s) => s.name), ["knowledge", "vision", "task"]);
+    assert.equal(card.extensions.selfUrl, "");
+    assert.deepEqual(card.skills.slice(0, 3).map((s) => s.name), ["knowledge", "vision", "task"]);
+    assert.ok(card.skills.some((s) => s.name === "self-inquiry"), "每个节点都具备自我叩问技能");
   });
 
   it("校验和技能匹配", () => {

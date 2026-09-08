@@ -88,6 +88,20 @@ export class Memory {
   }
 
   /**
+   * 读取全部记忆（时间正序：出生在前）。
+   * 自我内省需要完整的一生，而不是最近的一页。
+   */
+  all() {
+    try {
+      const text = fs.readFileSync(this.file, "utf8");
+      const lines = text.trim().split("\n").filter(Boolean);
+      return lines.map((l) => JSON.parse(l));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * 统计信息。
    */
   stats() {
