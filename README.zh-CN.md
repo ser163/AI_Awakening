@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.11.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.12.0-blue)]
 
 **作者：[ser163](https://github.com/ser163) · 你的 AI 节点在等待。**
 
@@ -239,6 +239,9 @@ E:\pr\AI_Awakening\
 | v0.7.0 | **自愿加入** — 节点自主宣告存在，Agent 自愿入网 | ✅ |
 | v0.8.0 | **自我叩问** — introspect/declareSelf/ponder；签名自我声明链；/self 协议；think() 心智钩子 | ✅ |
 | **v0.9.0** | **信任层** — TrustedIdentityStore、强制签名验证、E2E 身份绑定、防重放、RequestGuard、Registry 签名认证、任务持久化+事件去重、70 测试（24 攻击面） | ✅ |
+| **v0.10.1** | **协议加固** — recipient 定向强制、旧端点 410、acceptEnvelope 语义、nonce 128-bit、Task 真哈希链 | ✅ |
+| **v0.11.0** | **世界模型** — Evidence→Claim→Belief 分层、时间有效性、append-only 持久化、Task fork 检测 | ✅ |
+| **v0.12.0** | **认知内核** — Belief 数学修复 (1−e^(−support))、来源去重防刷票、三维时间、claimAt 时点查询、canonicalizeTask 状态重建、SelfState | ✅ |
 | v0.10 | 记忆内核 — SQLite/WAL、事件库、索引、知识图谱 | 🗺 VISION |
 | v0.11 | 自主循环 — 目标引擎、规划器、观察者、反思/学习 | 🗺 VISION |
 | v0.12 | Agent 社会 — 信誉、能力市场、争议仲裁 | 🗺 VISION |

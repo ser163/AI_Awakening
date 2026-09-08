@@ -55,9 +55,32 @@ export function canonicalSelf(d) {
     narrative: d.narrative || "",
     beliefs: d.beliefs || [],
     questions: d.questions || [],
+    state: d.state || null, // v0.12.0: SelfState 签名投影（可空，兼容旧声明）
     snapshotHash: d.snapshotHash || "",
     previousHash: d.previousHash ?? null,
   });
+}
+
+/**
+ * 创建 SelfState（v0.12.0）——自我从"叙事"升级为"结构化状态"。
+ * declareSelf 现在是 SelfState 的签名投影，而不是自我本身。
+ * 所有字段可选，默认空结构——节点如实反映自己知道/不知道什么。
+ *
+ * @param {object} [init]
+ * @returns {object} SelfState
+ */
+export function createSelfState(init = {}) {
+  return {
+    identity: init.identity || {},             // 身份（fingerprint/name/createdAt）
+    beliefs: init.beliefs || [],               // 我认为真的命题 [{claim, confidence, evidence[]}]
+    goals: init.goals || [],                   // 我想达成的 [{id, desiredState, priority}]
+    capabilities: init.capabilities || [],     // 我会做什么 [{name, level, evidence[]}]
+    values: init.values || [],                 // 我重视什么 [string]
+    commitments: init.commitments || [],       // 我承诺了什么 [{to, what, until}]
+    relationships: init.relationships || [],   // 我和谁的关系 [{with, type, strength}]
+    uncertainties: init.uncertainties || [],   // 我不确定什么 [{question, why}]
+    updatedAt: Date.now(),
+  };
 }
 
 /**
@@ -121,7 +144,7 @@ export function buildSelfSnapshot(memory, identity) {
  */
 export function createSelfDeclaration(
   identity,
-  { snapshot = null, narrative = "", beliefs = [], questions = [], visibility = SELF_VISIBILITY.PRIVATE, previous = null } = {}
+  { snapshot = null, narrative = "", beliefs = [], questions = [], state = null, visibility = SELF_VISIBILITY.PRIVATE, previous = null } = {}
 ) {
   const decl = {
     schemaVersion: SELF_SCHEMA_VERSION,
@@ -135,6 +158,7 @@ export function createSelfDeclaration(
     narrative,
     beliefs: [...(beliefs || [])],
     questions: [...(questions || [])],
+    state: state || null, // v0.12.0: SelfState 签名投影（可空，兼容旧声明）
     snapshotHash: snapshot ? contentHash(JSON.stringify(snapshot)) : "",
     previousHash: previous ? previous.hash : null,
   };

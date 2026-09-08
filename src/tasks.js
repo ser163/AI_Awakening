@@ -124,7 +124,14 @@ export function createTaskEvent(identity, action, task) {
     ts: Date.now(),
     nonce: crypto.randomBytes(8).toString("hex"),
     status: task.status,
-    payload: null,
+    // v0.12.0: 状态快照并入 payload —— 被签名覆盖（防篡改），fork 重建时可恢复状态
+    payload: {
+      state: {
+        status: task.status,
+        assigneeFingerprintActual: task.assigneeFingerprintActual || "",
+        result: task.result ?? null,
+      },
+    },
   };
   // v0.10.1: eventHash = SHA-256(canonicalizeEvent) 防篡改；签名覆盖 canonical
   event.signature = sign(identity, canonicalizeEvent(event));
@@ -325,22 +332,102 @@ export class TaskStore {
   }
 
   /**
-   * 确定性分叉解决（v0.11.0）。
-   * 规则：publisher 的 fork 优先；若 publisher 无 fork，选事件高度更高者。
-   * 不改变当前状态——只返回应该 follow 的 fork head。
+   * 确定性分叉解决（v0.11.0/v0.12.0）。
+   * 候选 = 当前主链头 + 全部 fork 头；按规则选胜者：
+   *   publisher 的事件 > 非 publisher；同角色时 ts 最新。
+   * 若主链头胜出 → 返回 null（当前即 canonical，无需切换）。
    * @param {string} taskId
-   * @returns {object|null} 应接受的 fork head
+   * @returns {object|null} 应接受的 fork head（null = 主链获胜，无需重建）
    */
   resolveFork(taskId) {
     const task = this.tasks.get(taskId);
     if (!task || !task.forks || task.forks.length === 0) return null;
-    // 按权重排序：publisher 的事件 > 非 publisher 的
-    task.forks.sort((a, b) => {
+
+    // 主链头候选：从事件日志查 lastEventHash 对应事件的 actor/ts
+    const events = this.events.get(taskId) || [];
+    const headEvent = events.find((ev) => (ev.eventHash || ev.eventId) === task.lastEventHash) || null;
+    const candidates = [
+      ...(task.forks || []),
+      ...(headEvent ? [{
+        headEventHash: headEvent.eventHash || headEvent.eventId,
+        actor: headEvent.actor || task.publisherFingerprint || "",
+        ts: headEvent.ts || 0,
+        action: headEvent.action || "",
+        isMainChain: true,
+      }] : []),
+    ];
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => {
       const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
       const bIsPub = b.actor === task.publisherFingerprint ? 1 : 0;
       if (aIsPub !== bIsPub) return bIsPub - aIsPub;
-      return b.ts - a.ts; // 同为 publisher 或同为非 publisher：最新优先
+      return b.ts - a.ts;
     });
-    return task.forks[0];
+    const winner = candidates[0];
+    // 主链胜出 → 无需切换
+    if (!winner || winner.isMainChain) return null;
+    return winner;
+  }
+
+  /**
+   * 从 fork 重建任务状态（v0.12.0）。
+   * 步骤：resolveFork → 沿获胜分支从 genesis 重放事件 → 重建 status/assignee/result/lastEventHash。
+   * 不修改当前任务——返回新状态对象。
+   * @param {string} taskId
+   * @returns {object|null} 重建后的任务状态，或 null（无 fork 或无变化）
+   */
+  canonicalizeTask(taskId) {
+    const task = this.tasks.get(taskId);
+    if (!task) return null;
+
+    const winner = this.resolveFork(taskId);
+    if (!winner) return null; // 无 fork 或主链即 canonical
+
+    const events = this.events.get(taskId) || [];
+    if (events.length === 0) return null;
+
+    // 构建 eventHash → event 映射
+    const byHash = {};
+    for (const ev of events) {
+      const h = ev.eventHash || ev.eventId;
+      byHash[h] = ev;
+    }
+
+    // 从 winner 的 headEventHash 沿 previousHash 向 genesis 回溯，收集链
+    const chain = [];
+    let cur = winner.headEventHash;
+    while (cur && byHash[cur]) {
+      chain.unshift(byHash[cur]); // 逆序（genesis 在前）
+      const ev = byHash[cur];
+      cur = ev.previousHash || null;
+    }
+    if (chain.length === 0) return null;
+
+    // 从 genesis 向前重放，用 payload.state 重建状态
+    // 兼容无 payload.state 的旧事件（fallback 到 event.status）
+    const reconstructed = {
+      ...task,
+      status: TASK_STATUS.OPEN,
+      assigneeFingerprintActual: "",
+      result: null,
+      claimedAt: null,
+      completedAt: null,
+      cancelledAt: null,
+      lastEventHash: null,
+      forks: [],
+      eventHashes: [],
+    };
+    for (const ev of chain) {
+      const state = ev.payload?.state || {};
+      reconstructed.status = state.status || ev.status || reconstructed.status;
+      if (state.assigneeFingerprintActual) reconstructed.assigneeFingerprintActual = state.assigneeFingerprintActual;
+      if (state.result !== undefined && state.result !== null) reconstructed.result = state.result;
+      reconstructed.lastEventHash = ev.eventHash || ev.eventId;
+      if (!reconstructed.eventHashes.includes(reconstructed.lastEventHash)) reconstructed.eventHashes.push(reconstructed.lastEventHash);
+      if (ev.action === "claim") reconstructed.claimedAt = ev.ts;
+      if (ev.action === "complete") reconstructed.completedAt = ev.ts;
+      if (ev.action === "cancel") reconstructed.cancelledAt = ev.ts;
+    }
+    return reconstructed;
   }
 }

@@ -650,6 +650,7 @@ export class AgentNode extends EventEmitter {
       composeMinimalNarrative(snapshot);
     const beliefs = opts.beliefs || mindOut?.beliefs || [];
     const questions = opts.questions || mindOut?.questions || [];
+    const state = opts.state || null; // v0.12.0: SelfState 结构化状态
 
     // 3. 笔：签名 + 写入 evolve 记忆（自我链）
     const previous = this.latestDeclaration();
@@ -658,6 +659,7 @@ export class AgentNode extends EventEmitter {
       narrative,
       beliefs,
       questions,
+      state,
       visibility: opts.visibility || this.selfVisibility || SELF_VISIBILITY.PRIVATE,
       previous,
     });

@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.11.0",
-  "description": "硅基协作网络 — World Model 世界模型与 Agent OS 内核 (world/evidence/belief/envelope/tasks/dht/self)",
+  "version": "0.12.0",
+  "description": "硅基协作网络 — Cognitive Kernel 认知内核 (belief/world-model/self-state/envelope/tasks)",
   "type": "module",
   "main": "index.js",
   "scripts": {

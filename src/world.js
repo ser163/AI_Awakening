@@ -174,8 +174,9 @@ export class WorldModel {
    * @param {string} [ev.source.id] 来源 ID（如 fingerprint）
    * @param {string} [ev.source.kind] 陈述类型（assertion/observation/relay/measurement）
    * @param {string} [ev.source.eventId] 关联的事件（记忆/任务/网络事件）
-   * @param {number} [ev.observedAt] 观察时间
-   * @param {number} [ev.validUntil] 该证据的有效截止（时间有效性）
+   * @param {number} [ev.observedAt] 观察时间（该证据何时被采集）
+   * @param {number} [ev.validFrom] 有效起始（该主张何时开始成立）
+   * @param {number} [ev.validUntil] 有效截止（该主张何时失效）
    * @returns {object} claim
    */
   ingestEvidence(ev) {
@@ -202,13 +203,14 @@ export class WorldModel {
       object: ev.object,
       source,
       observedAt,
+      validFrom: ev.validFrom || null,   // v0.12.0: 时间三维分开
       validUntil: ev.validUntil || null,
       ts: Date.now(),
     });
 
     // 更新内存
     this._addEvidenceToClaim(
-      { claimId, evidenceId, subject: ev.subject, predicate: ev.predicate, object: ev.object, source, observedAt, validUntil: ev.validUntil || null },
+      { claimId, evidenceId, subject: ev.subject, predicate: ev.predicate, object: ev.object, source, observedAt, validFrom: ev.validFrom || null, validUntil: ev.validUntil || null },
       Date.now()
     );
     this._pushEvent({ kind: "evidence_ingested", claimId, subject: ev.subject, predicate: ev.predicate, object: ev.object, ts: Date.now() });
@@ -225,6 +227,7 @@ export class WorldModel {
       object: rec.object,
       source: rec.source || { type: "unknown", id: "", kind: SOURCE_KINDS.ASSERTION },
       observedAt: rec.observedAt || now,
+      validFrom: rec.validFrom || null,   // v0.12.0: 三维时间
       validUntil: rec.validUntil || null,
     };
     if (existing) {
@@ -233,12 +236,54 @@ export class WorldModel {
     } else {
       this.claims.set(claimId, {
         id: claimId,
+        // v0.12.0: Claim 一等公民字段
+        claimId,                                  // 可追踪标识（= id，供引用/撤销/修订）
         subject: rec.subject,
         predicate: rec.predicate,
         object: rec.object,
+        createdAt: now,                           // 主张首次成立时间（区别于证据时间）
         evidence: [evidenceItem],
       });
     }
+  }
+
+  /**
+   * 时点世界状态查询（v0.12.0）——Claim 时间语义的真正落点。
+   * 返回某 SPO 在给定时间点"成立"的证据切片，而非"最新 KV"。
+   * 例：Alice located_at 在 2026-06-01 的时点上返回 Beijing 证据，
+   *     2026-08-20 的时点上返回 Shanghai 证据——各自可追踪、不互相覆盖。
+   *
+   * @param {string} subject
+   * @param {string} predicate
+   * @param {number} [atMs] 查询时点（默认 now）
+   * @returns {object|null} { subject, predicate, object, claimId, activeEvidence[] } 或 null
+   */
+  claimAt(subject, predicate, atMs = Date.now()) {
+    const candidates = [];
+    for (const c of this.claims.values()) {
+      if (c.subject !== subject || c.predicate !== predicate) continue;
+      const active = c.evidence.filter((ev) => {
+        const from = ev.validFrom || ev.observedAt || 0;
+        const until = ev.validUntil || Infinity;
+        return from <= atMs && atMs <= until;
+      });
+      if (active.length > 0) {
+        candidates.push({ claim: c, active });
+      }
+    }
+    if (candidates.length === 0) return null;
+    // 取该时点证据最充分的 claim（同 SPO 可能因时间窗不同而有多个）
+    candidates.sort((a, b) => b.active.length - a.active.length);
+    const { claim, active } = candidates[0];
+    return {
+      subject,
+      predicate,
+      object: claim.object,
+      claimId: claim.claimId || claim.id,
+      createdAt: claim.createdAt,
+      atMs,
+      activeEvidence: active,
+    };
   }
 
   /**
@@ -261,8 +306,13 @@ export class WorldModel {
   }
 
   /**
-   * 推导信念（v0.11.0 核心 API）——从 claims 的证据聚合成一个信念。
-   * 输入是证据，输出是"我认为它有多可信"。
+   * 推导信念（v0.11.1 核心 API）——从 claims 的证据聚合成一个信念。
+   *
+   * 审查指出的数学 bug 修复：
+   *   Σw/Σw ≡ 1  →  support = Σ(权重 × 新鲜度)，belief = 1 - exp(-support)
+   *   同源重复证据不叠加（防刷票）
+   *   矛盾真正影响 belief（不是只记录）
+   *   新鲜度衰减（7 天半衰期）
    *
    * @param {string} subject
    * @param {string} predicate
@@ -275,8 +325,12 @@ export class WorldModel {
     for (const c of this.claims.values()) {
       if (c.subject !== subject || c.predicate !== predicate) continue;
       if (object !== null && c.object !== object) continue;
-      // 时间有效性：只统计未过期的证据
-      const validEvidence = c.evidence.filter((ev) => !ev.validUntil || ev.validUntil > now);
+      // 时间有效性：未生效（validFrom 未到）或已过期（validUntil 已过）的证据排除
+      const validEvidence = c.evidence.filter((ev) => {
+        if (ev.validFrom && now < ev.validFrom) return false; // 还未成立
+        if (ev.validUntil && now > ev.validUntil) return false; // 已失效
+        return true;
+      });
       if (validEvidence.length === 0) continue;
       relevant.push({ claim: c, validEvidence });
     }
@@ -284,33 +338,44 @@ export class WorldModel {
 
     // 对每个 claim 计算证据加权支持度
     const scored = relevant.map(({ claim, validEvidence }) => {
-      let total = 0;
-      let weightSum = 0;
-      let contradictions = 0;
+      // 来源去重：同一 source.id 的重复证据不叠加（防刷票）
+      const seenSources = new Set();
+      let support = 0;
+      let relayCount = 0;
       for (const ev of validEvidence) {
+        const srcKey = ev.source?.id || ev.source?.type || ev.evidenceId;
+        if (seenSources.has(srcKey)) continue; // 同源重复证据只计一次
+        seenSources.add(srcKey);
+
         const w = sourceWeight(ev.source);
-        total += w;
-        weightSum += w * 1; // 每条未过期证据都是对该 claim 的支持
-        if (ev.source.kind === SOURCE_KINDS.RELAY) contradictions += 0.5; // 转述打折
+        // 新鲜度衰减：越旧的证据贡献越低（半衰期 7 天）
+        const ageMs = now - (ev.observedAt || ev.ts || now);
+        const ageDays = Math.max(0, ageMs) / (24 * 3600 * 1000);
+        const freshness = Math.exp(-ageDays / 7);
+
+        support += w * freshness;
+        if (ev.source.kind === SOURCE_KINDS.RELAY) relayCount++;
       }
-      // 可信度：来源数量 + 质量（转述多则低）
-      const reliability = weightSum / Math.max(1, total);
-      const freshness = 1; // validUntil 已过滤，此处简化
-      return { claim, reliability, evidenceCount: validEvidence.length };
+      const belief = 1 - Math.exp(-support);
+      return { claim, belief, evidenceCount: seenSources.size, relayCount };
     });
 
-    // 若同一主谓下有多个互相矛盾的 object，标记矛盾并选支持度最高者
+    // 选 belief 最高的 claim
     let best = scored[0];
     for (const s of scored) {
-      if (s.reliability > best.reliability) best = s;
+      if (s.belief > best.belief) best = s;
     }
     const conflicting = scored.filter((s) => s.claim.id !== best.claim.id);
+
+    // 矛盾惩罚：有矛盾时降低 belief。每条矛盾 claim 降低 50% 的差距
+    const conflictPenalty = conflicting.length > 0 ? 0.5 * (1 - 1 / (conflicting.length + 1)) : 0;
+    const finalBelief = Math.round(best.belief * (1 - conflictPenalty) * 100) / 100;
 
     return {
       subject,
       predicate,
       object: best.claim.object,
-      belief: Math.round(best.reliability * 100) / 100,
+      belief: finalBelief,
       evidenceCount: best.evidenceCount,
       totalClaims: scored.length,
       conflicts: conflicting.length,

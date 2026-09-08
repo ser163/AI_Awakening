@@ -14,7 +14,8 @@ import { Registry, NodeServer } from "../src/network.js";
 import { loadOrCreateIdentity } from "../src/identity.js";
 import { createEnvelope, verifyEnvelope, acceptEnvelope, RECIPIENT_BROADCAST } from "../src/envelope.js";
 import { TrustedIdentityStore, ReplayCache } from "../src/trust.js";
-import { createTask, createTaskEvent, validateTaskEvent, checkTransition, TASK_STATUS } from "../src/tasks.js";
+import { createTask, createTaskEvent, validateTaskEvent, checkTransition, TaskStore, TASK_STATUS } from "../src/tasks.js";
+import { createSelfState, validateSelfDeclaration } from "../src/self.js";
 import http from "node:http";
 import crypto from "node:crypto";
 import os from "node:os";
@@ -251,5 +252,112 @@ describe("v0.10.1: E2E recipient 定向网络级验证", () => {
     // B 的 rpcHandler 返回 401 + recipient mismatch
     assert.equal(res.httpStatus, 401);
     assert.ok(JSON.stringify(res).includes("recipient mismatch"));
+  });
+});
+
+describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
+  const alice = loadOrCreateIdentity(path.join(tmp, "fork_alice"), "alice");
+  const bob = loadOrCreateIdentity(path.join(tmp, "fork_bob"), "bob");
+  const store = new TrustedIdentityStore();
+  store.learn(alice.fingerprint, alice.publicKey, { source: "registry" });
+  store.learn(bob.fingerprint, bob.publicKey, { source: "registry" });
+
+  it("无 fork 时 canonicalizeTask 返回 null（当前状态即 canonical）", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "线性任务" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", task);
+    ts.upsert(task, e1);
+    assert.equal(ts.canonicalizeTask(task.id), null, "无 fork 不应重建");
+  });
+
+  it("publisher 主链获胜时无需重建（fork 被记录但被否决）", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "分叉任务A" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", task);
+    ts.upsert(task, e1);
+
+    // alice（publisher）先 claim —— 成为主链
+    const e2alice = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2alice.eventHash }, e2alice);
+
+    // bob 也 claim —— 分叉被记录
+    const e2bob = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    const local = ts.get(task.id);
+    local.forks = [{ headEventHash: e2bob.eventHash, actor: bob.fingerprint, ts: e2bob.ts, action: "claim" }];
+    ts.upsert(local);
+    const bobEvents = ts.eventHistory(task.id);
+    bobEvents.push(e2bob);
+
+    // 主链（alice=publisher）获胜 → resolveFork 返回 null（当前即 canonical）
+    const winner = ts.resolveFork(task.id);
+    assert.equal(winner, null, "publisher 主链获胜，无需切换到 fork");
+    assert.equal(ts.canonicalizeTask(task.id), null, "无需重建");
+    assert.equal(ts.get(task.id).assigneeFingerprintActual, alice.fingerprint);
+  });
+
+  it("publisher 的 fork 胜过非 publisher 主链 → 重建状态", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "分叉任务B" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", task);
+    ts.upsert(task, e1);
+
+    // bob（非 publisher）先 claim —— 成为主链
+    const e2bob = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e2bob.eventHash }, e2bob);
+
+    // alice（publisher）后 claim —— 分叉，但 publisher 事件应胜出
+    const e2alice = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    const local = ts.get(task.id);
+    local.forks = [{ headEventHash: e2alice.eventHash, actor: alice.fingerprint, ts: e2alice.ts, action: "claim" }];
+    ts.upsert(local);
+    const events = ts.eventHistory(task.id);
+    events.push(e2alice);
+
+    const canon = ts.canonicalizeTask(task.id);
+    assert.ok(canon, "应重建状态");
+    assert.equal(canon.assigneeFingerprintActual, alice.fingerprint, "publisher 的 fork 应胜出");
+    assert.equal(canon.lastEventHash, e2alice.eventHash);
+    assert.equal(canon.status, TASK_STATUS.CLAIMED);
+  });
+});
+
+describe("v0.12.0: SelfState（自我从叙事升级为结构化状态）", () => {
+  const node = new AgentNode({ name: "selfstate-node", storageDir: path.join(tmp, "selfstate") });
+
+  it("declareSelf 可携带 SelfState 签名投影", async () => {
+    const state = {
+      identity: { name: "selfstate-node" },
+      capabilities: [{ name: "knowledge", level: 0.8 }],
+      goals: [{ id: "g1", desiredState: "translate better", priority: 3 }],
+      values: ["honesty"],
+      commitments: [],
+      relationships: [{ with: "harry", type: "creator", strength: 0.9 }],
+      uncertainties: [{ question: "who am I beyond memory?", why: "narrative is not yet state" }],
+      beliefs: [],
+    };
+    const { declaration } = await node.declareSelf({
+      narrative: "I am learning to be a structured self.",
+      state,
+      visibility: "public",
+    });
+    assert.ok(declaration.state, "声明应携带 SelfState");
+    assert.equal(declaration.state.goals.length, 1);
+    assert.equal(declaration.state.values[0], "honesty");
+    // state 进入签名域——篡改后验证失败
+    const tampered = { ...declaration, state: { ...declaration.state, values: ["evil"] } };
+    const check = validateSelfDeclaration(tampered);
+    assert.equal(check.valid, false, "篡改 SelfState 应使签名失效");
+    node.stop();
+  });
+
+  it("createSelfState 提供默认空结构（如实反映未知）", () => {
+    const s = createSelfState();
+    assert.deepEqual(s.beliefs, []);
+    assert.deepEqual(s.goals, []);
+    assert.deepEqual(s.uncertainties, []);
+    assert.ok(s.updatedAt);
   });
 });

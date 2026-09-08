@@ -96,10 +96,16 @@ E:\pr\AI_Awakening\
                            Task 状态机签名事件+CANCELLED+状态链、
                            DHT nodeId 稳定化、legacy 隔离）
                                       │
-              └─ v0.10+ Memory Kernel（规划中）
-              └─ v0.11  World Model / Autonomous Loop（规划中）
-              └─ v0.12  Agent Society（规划中）
-              └─ v1.0   公网部署（规划中）
+              └─ v0.10.1 Protocol Hardening（recipient 强制、旧端点 410、
+                           acceptEnvelope 语义、nonce 128-bit、Task 真哈希链）
+                                      │
+              └─ v0.11.0 World Model（Evidence→Claim→Belief、时间有效性、
+                           append-only 持久化、Task fork 检测）
+                                      │
+              └─ v0.12.0 Cognitive Kernel（Belief 数学修复、来源去重、
+                           三维时间 claimAt、canonicalizeTask、SelfState）
+                                      │
+              └─ v0.13  Autonomous Loop（规划中）
 ```
 
 ### 详细版本日志
@@ -117,6 +123,9 @@ E:\pr\AI_Awakening\
 | 2026-09-08 | v0.8.0 | **Self-Inquiry** 自我叩问层 | 46 | +self.js, MANIFESTO Part II |
 | 2026-09-08 | v0.9.0 | **Trust Layer** 信任层 | **70** | +trust.js, 签名强制, 指纹绑定, 防重放, RequestGuard, 任务持久化, VISION.md, IMPLEMENTATION.md, CI 修复 |
 | 2026-09-08 | v0.10.0 | **Agent OS Kernel** | **70** | +envelope.js (/rpc 统一签名信封), signal expiry 强制, decrypt 自动防重放, Task 状态机 (签名事件+CANCELLED+状态链), DHT nodeId 稳定化, AICollaborationInterface.js → legacy/, README Security/Threat Model |
+| 2026-09-08 | v0.10.1 | **Protocol Hardening** | **84** | recipient 定向强制, /message /task → 410, acceptEnvelope 语义分离, nonce 128-bit, Task 真哈希链 (SHA-256) |
+| 2026-09-08 | v0.11.0 | **World Model 正式化** | **94** | Evidence→Claim→Belief 分层, 三维时间 (observedAt/validFrom/validUntil), append-only 日志+重放, 结构化 source, Task fork 检测 + resolveFork |
+| 2026-09-08 | v0.12.0 | **Cognitive Kernel** | **105** | Belief 数学修复 (1−e^(−support) 非 Σw/Σw), 来源去重防刷票, 矛盾惩罚, 新鲜度衰减, claimAt 时点查询, canonicalizeTask 状态重建, SelfState 签名投影 |
 
 > 2026-09-08 在同一天发布了 v0.8.0 和 v0.9.0，因为自我叩问完成后，审查反馈指出信任模型的安全缺陷，随即在同一天完成了信任层补完。
 

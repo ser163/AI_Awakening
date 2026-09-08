@@ -126,6 +126,76 @@ describe("world: Evidence → Claim → Belief 分层", () => {
     assert.equal(bs.length, 2);
     assert.ok(bs[0].belief > bs[1].belief, "应按信念降序");
   });
+
+  it("单一 relay 来源信念低（旧公式 Σw/Σw≡1 的伪绿测试）", () => {
+    const w = new WorldModel();
+    w.ingestEvidence({
+      subject: "agent:rumor", predicate: "trustworthy", object: "true",
+      source: { type: SOURCE_TYPES.AGENT, id: "fp-stranger", kind: SOURCE_KINDS.RELAY }, // 转述权重 0.3
+    });
+    const b = w.deriveBelief("agent:rumor", "trustworthy");
+    assert.ok(b, "应推导出信念");
+    assert.ok(b.belief < 0.4, `单一转述不应有高信念（实际 ${b.belief}，旧版会≈1）`);
+    assert.ok(b.belief > 0.1, `转述至少应有一点支持（实际 ${b.belief}）`);
+  });
+
+  it("单条高可信证据中等信念；多条独立证据才高（1-exp(-support) 数学）", () => {
+    const w = new WorldModel();
+    w.ingestEvidence({
+      subject: "agent:sensor1", predicate: "healthy", object: "true",
+      source: { type: SOURCE_TYPES.SENSOR, id: "sensor-a", kind: SOURCE_KINDS.MEASUREMENT }, // 权重≈1.0
+    });
+    const one = w.deriveBelief("agent:sensor1", "healthy");
+    // 1 - exp(-1.0) ≈ 0.63 —— 单条强证据不会冲到 100%
+    assert.ok(one.belief > 0.5 && one.belief < 0.75, `单条强证据应为中等信念（实际 ${one.belief}）`);
+
+    const w2 = new WorldModel();
+    for (let i = 0; i < 4; i++) {
+      w2.ingestEvidence({
+        subject: "agent:multi", predicate: "healthy", object: "true",
+        source: { type: SOURCE_TYPES.SENSOR, id: `sensor-${i}`, kind: SOURCE_KINDS.MEASUREMENT },
+      });
+    }
+    const multi = w2.deriveBelief("agent:multi", "healthy");
+    // 4 × 1.0 → 1 - exp(-4) ≈ 0.98
+    assert.ok(multi.belief > 0.9, `多条独立证据应有高信念（实际 ${multi.belief}）`);
+    assert.ok(multi.belief < 1, `信念不应恰好 1.0`);
+  });
+
+  it("同源刷票不叠加（100 条同来源证据 ≈ 1 条）", () => {
+    const w = new WorldModel();
+    for (let i = 0; i < 100; i++) {
+      w.ingestEvidence({
+        subject: "agent:spam", predicate: "reliable", object: "true",
+        source: { type: SOURCE_TYPES.AGENT, id: "fp-x", kind: SOURCE_KINDS.ASSERTION }, // 同一 source.id
+      });
+    }
+    const b = w.deriveBelief("agent:spam", "reliable");
+    assert.equal(b.evidenceCount, 1, "同源 100 条证据只应算 1 个独立来源");
+    assert.ok(b.belief < 0.6, `单个来源刷票不应堆出高信念（实际 ${b.belief}）`);
+  });
+
+  it("矛盾真正影响 belief（有矛盾 < 无矛盾）", () => {
+    const wNoConflict = new WorldModel();
+    wNoConflict.ingestEvidence({
+      subject: "agent:calm", predicate: "reliable", object: "true",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+    });
+    const noConflict = wNoConflict.deriveBelief("agent:calm", "reliable");
+
+    const wConflict = new WorldModel();
+    wConflict.ingestEvidence({
+      subject: "agent:storm", predicate: "reliable", object: "true",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+    });
+    wConflict.ingestEvidence({
+      subject: "agent:storm", predicate: "reliable", object: "false",
+      source: { type: SOURCE_TYPES.AGENT, id: "fp-stranger", kind: SOURCE_KINDS.ASSERTION },
+    });
+    const conflict = wConflict.deriveBelief("agent:storm", "reliable");
+    assert.equal(conflict.conflicts, 1);
+    assert.ok(conflict.belief < noConflict.belief, `矛盾应降低信念（${conflict.belief} < ${noConflict.belief}）`);
+  });
 });
 
 describe("world: 时间有效性", () => {
@@ -148,6 +218,58 @@ describe("world: 时间有效性", () => {
     const b = w.deriveBelief("agent:old", "active");
     assert.ok(b);
     assert.equal(b.evidenceCount, 1, "过期证据应被排除");
+  });
+
+  it("claimAt 时点查询：同一 SPO 不同时间窗的主张可分离追溯", () => {
+    const w = new WorldModel();
+    const june = Date.parse("2026-06-01T00:00:00Z");
+    const aug = Date.parse("2026-08-20T00:00:00Z");
+    // 两个时间窗不重叠的主张（同一 SPO）
+    w.ingestEvidence({
+      subject: "agent:alice", predicate: "located_at", object: "Beijing",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+      observedAt: june, validFrom: june, validUntil: aug - 1,
+    });
+    w.ingestEvidence({
+      subject: "agent:alice", predicate: "located_at", object: "Shanghai",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+      observedAt: aug, validFrom: aug, validUntil: null,
+    });
+    // 6 月时点 → Beijing
+    const inJune = w.claimAt("agent:alice", "located_at", june + 1000);
+    assert.ok(inJune);
+    assert.equal(inJune.object, "Beijing");
+    // 8 月时点 → Shanghai
+    const inAug = w.claimAt("agent:alice", "located_at", aug + 1000);
+    assert.ok(inAug);
+    assert.equal(inAug.object, "Shanghai");
+    // claim 有 createdAt 且可追踪
+    assert.ok(inJune.claimId);
+    assert.ok(inJune.createdAt);
+    // 无效时点 → null
+    assert.equal(w.claimAt("agent:alice", "located_at", june - 1000), null);
+  });
+  it("validFrom 未到的证据不参与推导（v0.12.0 三维时间）", () => {
+    const w = new WorldModel();
+    const future = Date.now() + 3600_000;
+    // 还没成立的主张（validFrom 在未来）
+    w.ingestEvidence({
+      subject: "agent:fut", predicate: "located_at", object: "Tokyo",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+      validFrom: future, validUntil: future + 3600_000,
+    });
+    assert.equal(w.deriveBelief("agent:fut", "located_at"), null, "未生效证据不应产生信念");
+
+    // 带 validFrom 的过去主张 + 有效期
+    const past = Date.now() - 1000;
+    w.ingestEvidence({
+      subject: "agent:fut", predicate: "was_at", object: "Osaka",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+      validFrom: past - 1000, validUntil: past + 3600_000,
+    });
+    const b = w.deriveBelief("agent:fut", "was_at");
+    assert.ok(b);
+    assert.equal(b.object, "Osaka");
   });
 });
 
