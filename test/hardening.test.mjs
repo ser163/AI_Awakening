@@ -14,7 +14,7 @@ import { Registry, NodeServer } from "../src/network.js";
 import { loadOrCreateIdentity } from "../src/identity.js";
 import { createEnvelope, verifyEnvelope, acceptEnvelope, RECIPIENT_BROADCAST } from "../src/envelope.js";
 import { TrustedIdentityStore, ReplayCache } from "../src/trust.js";
-import { createTask, createTaskEvent, validateTaskEvent, checkTransition, TaskStore, TASK_STATUS } from "../src/tasks.js";
+import { createTask, createTaskEvent, validateTaskEvent, checkTransition, TaskStore, TASK_STATUS, TASK_POLICIES } from "../src/tasks.js";
 import { createSelfState, validateSelfDeclaration } from "../src/self.js";
 import http from "node:http";
 import crypto from "node:crypto";
@@ -321,6 +321,78 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     assert.equal(canon.assigneeFingerprintActual, alice.fingerprint, "publisher 的 fork 应胜出");
     assert.equal(canon.lastEventHash, e2alice.eventHash);
     assert.equal(canon.status, TASK_STATUS.CLAIMED);
+  });
+
+  it("v0.12.1: applyCanonicalState 真正写回 canonical 状态", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "分叉任务C" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", task);
+    ts.upsert(task, e1);
+
+    // bob（非 publisher）先 claim —— 成为主链
+    const e2bob = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e2bob.eventHash }, e2bob);
+
+    // alice（publisher）后 claim —— 分叉，publisher 事件胜出
+    const e2alice = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    const local = ts.get(task.id);
+    local.forks = [{ headEventHash: e2alice.eventHash, actor: alice.fingerprint, ts: e2alice.ts, action: "claim" }];
+    ts.upsert(local);
+    const events = ts.eventHistory(task.id);
+    events.push(e2alice);
+
+    // applyCanonicalState 后，任务对象本身应被写回为 alice 的 claim
+    const applied = ts.applyCanonicalState(task.id);
+    assert.ok(applied, "应应用 canonical 状态");
+    assert.equal(ts.get(task.id).assigneeFingerprintActual, alice.fingerprint, "存储中的任务应被写回");
+    assert.equal(ts.get(task.id).lastEventHash, e2alice.eventHash);
+    assert.equal(ts.get(task.id).status, TASK_STATUS.CLAIMED);
+    // 再次调用应无变化（幂等）
+    assert.equal(ts.applyCanonicalState(task.id), null, "已 canonical 时不应重复写");
+  });
+
+  it("v0.12.1: TaskPolicy 可配置——fork 规则不再写死 publisher", () => {
+    const ts = new TaskStore();
+    // COLLABORATIVE 策略：fork = newest（无 publisher 特权）
+    const task = createTask({ title: "协作任务", policy: TASK_POLICIES.COLLABORATIVE });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", task);
+    ts.upsert(task, e1);
+
+    // alice 先 claim（成为主链），bob 后 claim（分叉）
+    const e2alice = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2alice.eventHash }, e2alice);
+    const e2bob = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    const local = ts.get(task.id);
+    local.forks = [{ headEventHash: e2bob.eventHash, actor: bob.fingerprint, ts: e2bob.ts + 500, action: "claim" }]; // bob 更新
+    ts.upsert(local);
+    const events = ts.eventHistory(task.id);
+    events.push(e2bob);
+
+    // COLLABORATIVE（newest）→ bob 的 fork 胜出（bob.ts + 500 更新）
+    const canon = ts.canonicalizeTask(task.id);
+    assert.ok(canon);
+    assert.equal(canon.assigneeFingerprintActual, bob.fingerprint, "newest 规则下较新的 fork 应胜出");
+  });
+
+  it("v0.12.1: TaskPolicy——cancel 授权可放宽到任何可信节点", () => {
+    const task = createTask({ title: "宽松取消", policy: { ...TASK_POLICIES.DEFAULT, cancel: "any" } });
+    task.publisherFingerprint = alice.fingerprint;
+    // publisher 之外的人（bob）在 cancel=any 策略下可以取消
+    const r = checkTransition(task, "cancel", bob.fingerprint);
+    assert.equal(r.ok, true, "cancel=any 时非 publisher 应可取消");
+    // 默认策略下 bob 不能取消
+    const task2 = createTask({ title: "严格取消" });
+    task2.publisherFingerprint = alice.fingerprint;
+    const r2 = checkTransition(task2, "cancel", bob.fingerprint);
+    assert.equal(r2.ok, false, "默认策略下非 publisher 不可取消");
+  });
+
+  it("v0.12.1: TaskEvent nonce 统一为 16 bytes（128-bit）", () => {
+    const task = createTask({ title: "nonce 检查" });
+    const ev = createTaskEvent(alice, "publish", task);
+    assert.equal(ev.nonce.length, 32, "16 bytes = 32 hex chars");
   });
 });
 

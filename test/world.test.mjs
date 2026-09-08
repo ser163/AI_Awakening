@@ -249,6 +249,37 @@ describe("world: 时间有效性", () => {
     // 无效时点 → null
     assert.equal(w.claimAt("agent:alice", "located_at", june - 1000), null);
   });
+
+  it("claimAt 按信念选冠军，不再按证据数量（sensor×2.0 应赢 relay×0.6 刷量）", () => {
+    const w = new WorldModel();
+    const now = Date.now();
+    // Claim A：sensor×1 —— 强来源，support=1.0 → belief≈0.63
+    w.ingestEvidence({
+      subject: "agent:who", predicate: "status", object: "A",
+      source: { type: SOURCE_TYPES.SENSOR, id: "sensor-1", kind: SOURCE_KINDS.MEASUREMENT },
+      observedAt: now, validFrom: now, validUntil: null,
+    });
+    // Claim B：relay×2 —— 2 个弱来源，support=0.6 → belief≈0.45
+    // 旧 claimAt（按证据数）→ B 赢（2>1）；新 claimAt（按信念）→ A 赢（0.63>0.45）
+    for (let i = 0; i < 2; i++) {
+      w.ingestEvidence({
+        subject: "agent:who", predicate: "status", object: "B",
+        source: { type: SOURCE_TYPES.AGENT, id: `relay-agent-${i}`, kind: SOURCE_KINDS.RELAY },
+        observedAt: now, validFrom: now, validUntil: null,
+      });
+    }
+    const winner = w.claimAt("agent:who", "status", now + 1000);
+    assert.ok(winner);
+    assert.equal(winner.object, "A", "sensor×1（强, belief≈0.63）应赢 relay×2（弱, belief≈0.45）");
+    assert.ok(winner.belief > 0.5, "冠军应带信念分");
+    // 与 deriveBelief 结论一致（无语义分裂）
+    const d = w.deriveBelief("agent:who", "status", null, now + 1000);
+    assert.equal(d.object, "A", "deriveBelief 与 claimAt 必须同冠军");
+    // deriveBeliefAt 是 deriveBelief 的历史时点别名
+    const dAt = w.deriveBeliefAt("agent:who", "status", now + 1000);
+    assert.equal(dAt.object, "A");
+    assert.equal(dAt.belief, d.belief);
+  });
   it("validFrom 未到的证据不参与推导（v0.12.0 三维时间）", () => {
     const w = new WorldModel();
     const future = Date.now() + 3600_000;

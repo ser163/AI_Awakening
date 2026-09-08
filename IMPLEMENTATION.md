@@ -126,6 +126,7 @@ E:\pr\AI_Awakening\
 | 2026-09-08 | v0.10.1 | **Protocol Hardening** | **84** | recipient 定向强制, /message /task → 410, acceptEnvelope 语义分离, nonce 128-bit, Task 真哈希链 (SHA-256) |
 | 2026-09-08 | v0.11.0 | **World Model 正式化** | **94** | Evidence→Claim→Belief 分层, 三维时间 (observedAt/validFrom/validUntil), append-only 日志+重放, 结构化 source, Task fork 检测 + resolveFork |
 | 2026-09-08 | v0.12.0 | **Cognitive Kernel** | **105** | Belief 数学修复 (1−e^(−support) 非 Σw/Σw), 来源去重防刷票, 矛盾惩罚, 新鲜度衰减, claimAt 时点查询, canonicalizeTask 状态重建, SelfState 签名投影 |
+| 2026-09-08 | v0.12.1 | **语义统一** | **110** | claimAt 按信念选冠军 (非证据数), deriveBeliefAt 历史时点, _scoreEvidence 统一评分, applyCanonicalState 写回, TaskPolicy 可配置 (fork/cancel/complete/verify), event nonce 128-bit, 术语声明 (belief=support score 非概率) |
 
 > 2026-09-08 在同一天发布了 v0.8.0 和 v0.9.0，因为自我叩问完成后，审查反馈指出信任模型的安全缺陷，随即在同一天完成了信任层补完。
 

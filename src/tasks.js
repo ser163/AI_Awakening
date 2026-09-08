@@ -52,6 +52,44 @@ const TRANSITIONS = {
 };
 
 /**
+ * TaskPolicy（v0.12.1）——任务的权威模型可配置，不再写死。
+ * 审查指出：publisher wins 不适合所有任务（cancel 归 publisher 合理，
+ * 但 complete 应归 assignee、verify 可能需要 quorum）。
+ * 每项取值为 action 的授权规则：
+ *   "any"        — 任意可信节点
+ *   "publisher"  — 仅发布者
+ *   "assignee"   — 仅当前认领者
+ *   "quorum(N)"  — 需要 N 个可信节点确认（预留；当前实现按任意处理，接口已定型）
+ * fork 规则决定分叉冲突时谁胜出：
+ *   "publisher"  — publisher 分支优先（默认，兼容 v0.12.0）
+ *   "newest"     — 最新时间戳优先（适合无权威方的协作）
+ *   "assignee"   — 当前认领者分支优先（适合任务执行权仲裁）
+ */
+export const TASK_POLICIES = {
+  DEFAULT: {
+    claim: "any",
+    complete: "assignee",
+    cancel: "publisher",
+    verify: "publisher",
+    fork: "publisher",
+  },
+  COLLABORATIVE: {
+    claim: "any",
+    complete: "assignee",
+    cancel: "publisher",
+    verify: "quorum(2)",
+    fork: "newest",
+  },
+  EXECUTOR_AUTHORITY: {
+    claim: "any",
+    complete: "assignee",
+    cancel: "publisher",
+    verify: "assignee",
+    fork: "assignee",
+  },
+};
+
+/**
  * 规范化事件（签名覆盖的字段，固定键序）。
  * 注意：signature 与 eventHash 都不参与规范化（eventHash 是 canonical 的哈希）。
  */
@@ -82,7 +120,7 @@ function genId(prefix) {
 /**
  * 创建一个任务对象（初始 OPEN 状态）。
  */
-export function createTask({ title, description = "", requiredCapabilities = [], assigneeFingerprint = "", meta = {} }) {
+export function createTask({ title, description = "", requiredCapabilities = [], assigneeFingerprint = "", meta = {}, policy = null }) {
   if (!title) throw new Error("task title is required");
   return {
     id: genId("task"),
@@ -91,6 +129,7 @@ export function createTask({ title, description = "", requiredCapabilities = [],
     requiredCapabilities,
     assigneeFingerprint,
     meta,
+    policy: policy || { ...TASK_POLICIES.DEFAULT }, // v0.12.1: 可配置策略
     status: TASK_STATUS.OPEN,
     publisherFingerprint: "",
     publisherName: "",
@@ -122,7 +161,7 @@ export function createTaskEvent(identity, action, task) {
     actor: identity.fingerprint,
     previousHash: task.lastEventHash || null, // v0.10.1: 真哈希链
     ts: Date.now(),
-    nonce: crypto.randomBytes(8).toString("hex"),
+    nonce: crypto.randomBytes(16).toString("hex"),
     status: task.status,
     // v0.12.0: 状态快照并入 payload —— 被签名覆盖（防篡改），fork 重建时可恢复状态
     payload: {
@@ -217,11 +256,22 @@ export function checkTransition(task, action, actorFingerprint) {
   if (!allowed) {
     return { ok: false, reason: `illegal transition: ${task.status} → ${action}` };
   }
-  if (allowed.actorMustBe === "publisher" && actorFingerprint !== task.publisherFingerprint) {
+  // v0.12.1: 策略可配置——取消授权规则读 task.policy（默认 publisher）
+  const policy = task.policy || {};
+  let actorRule = allowed.actorMustBe;
+  if (action === "cancel" && policy.cancel) actorRule = policy.cancel;
+  if (action === "complete" && policy.complete) actorRule = policy.complete;
+  if (action === "verify" && policy.verify) actorRule = policy.verify;
+
+  if (actorRule === "publisher" && actorFingerprint !== task.publisherFingerprint) {
     return { ok: false, reason: "only the publisher can perform this action" };
   }
-  if (allowed.actorMustBe === "assignee" && actorFingerprint !== task.assigneeFingerprintActual) {
+  if (actorRule === "assignee" && actorFingerprint !== task.assigneeFingerprintActual) {
     return { ok: false, reason: "only the current assignee can perform this action" };
+  }
+  if (typeof actorRule === "string" && actorRule.startsWith("quorum(")) {
+    // v0.12.1 预留：quorum(N) 需要多方确认；当前单事件无法自证 quorum，
+    // 放行为"任意可信节点可发起，由后续 verify 事件聚合"——接口已定型，语义留给 verify 层。
   }
   return { ok: true };
 }
@@ -357,10 +407,18 @@ export class TaskStore {
       }] : []),
     ];
     if (candidates.length === 0) return null;
+    const forkRule = (task.policy && task.policy.fork) || "publisher";
     candidates.sort((a, b) => {
-      const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
-      const bIsPub = b.actor === task.publisherFingerprint ? 1 : 0;
-      if (aIsPub !== bIsPub) return bIsPub - aIsPub;
+      if (forkRule === "publisher") {
+        const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
+        const bIsPub = b.actor === task.publisherFingerprint ? 1 : 0;
+        if (aIsPub !== bIsPub) return bIsPub - aIsPub;
+      } else if (forkRule === "assignee") {
+        const aIsAsgn = a.actor === task.assigneeFingerprintActual ? 1 : 0;
+        const bIsAsgn = b.actor === task.assigneeFingerprintActual ? 1 : 0;
+        if (aIsAsgn !== bIsAsgn) return bIsAsgn - aIsAsgn;
+      }
+      // newest 或默认按时间戳降序
       return b.ts - a.ts;
     });
     const winner = candidates[0];
@@ -429,5 +487,24 @@ export class TaskStore {
       if (ev.action === "cancel") reconstructed.cancelledAt = ev.ts;
     }
     return reconstructed;
+  }
+
+  /**
+   * 应用 canonical 状态（v0.12.1）。
+   * 审查指出的问题：canonicalizeTask 只算新状态不写回。
+   * 此方法负责：resolveFork → canonicalizeTask → 若状态不同则 upsert 写回。
+   * @param {string} taskId
+   * @returns {object|null} 应用后的 canonical 状态，或 null（无需变更）
+   */
+  applyCanonicalState(taskId) {
+    const task = this.tasks.get(taskId);
+    if (!task) return null;
+    const canon = this.canonicalizeTask(taskId);
+    if (!canon) return null; // 无 fork 或主链即 canonical
+    // 检查是否有实质变化
+    if (canon.lastEventHash === task.lastEventHash && canon.status === task.status) return null;
+    // 写回
+    this.upsert(canon);
+    return canon;
   }
 }

@@ -248,15 +248,16 @@ export class WorldModel {
   }
 
   /**
-   * 时点世界状态查询（v0.12.0）——Claim 时间语义的真正落点。
-   * 返回某 SPO 在给定时间点"成立"的证据切片，而非"最新 KV"。
-   * 例：Alice located_at 在 2026-06-01 的时点上返回 Beijing 证据，
-   *     2026-08-20 的时点上返回 Shanghai 证据——各自可追踪、不互相覆盖。
+   * 时点世界状态查询（v0.12.1）——Claim 时间语义 + Belief 评分的统一落点。
+   * 审查指出的语义分裂修复：
+   *   旧实现按"active evidence 数量"选冠军（relay×10 会赢 sensor×1）；
+   *   新实现与 deriveBelief 共用 _scoreEvidence()，按信念 (1−e^(−support)) 选冠军。
+   * 例：Alice located_at 在 2026-06-01 的时点上返回 Beijing，08-20 返回 Shanghai。
    *
    * @param {string} subject
    * @param {string} predicate
    * @param {number} [atMs] 查询时点（默认 now）
-   * @returns {object|null} { subject, predicate, object, claimId, activeEvidence[] } 或 null
+   * @returns {object|null} { subject, predicate, object, claimId, createdAt, atMs, belief, support, activeEvidence[] }
    */
   claimAt(subject, predicate, atMs = Date.now()) {
     const candidates = [];
@@ -272,9 +273,13 @@ export class WorldModel {
       }
     }
     if (candidates.length === 0) return null;
-    // 取该时点证据最充分的 claim（同 SPO 可能因时间窗不同而有多个）
-    candidates.sort((a, b) => b.active.length - a.active.length);
-    const { claim, active } = candidates[0];
+    // 按信念评分选冠军（不再是证据数量；与 deriveBelief 同一公式）
+    const scored = candidates.map(({ claim, active }) => {
+      const s = this._scoreEvidence(active, atMs);
+      return { claim, active, belief: s.belief, support: s.support, evidenceCount: s.evidenceCount };
+    });
+    scored.sort((a, b) => b.belief - a.belief);
+    const { claim, active, belief, support, evidenceCount } = scored[0];
     return {
       subject,
       predicate,
@@ -282,8 +287,25 @@ export class WorldModel {
       claimId: claim.claimId || claim.id,
       createdAt: claim.createdAt,
       atMs,
+      belief,       // 信念（support score，非概率）
+      support,      // 证据支持度
+      evidenceCount,
       activeEvidence: active,
     };
+  }
+
+  /**
+   * 时点信念推导（v0.12.1）——deriveBelief 的历史版本。
+   * 与 deriveBelief 完全同公式，只是固定评分时点；
+   * 与 claimAt 的区别：返回完整信念对象（含矛盾惩罚），而非单 claim 快照。
+   *
+   * @param {string} subject
+   * @param {string} predicate
+   * @param {number} [atMs] 评分时点
+   * @returns {object|null} Belief
+   */
+  deriveBeliefAt(subject, predicate, atMs = Date.now()) {
+    return this.deriveBelief(subject, predicate, null, atMs);
   }
 
   /**
@@ -306,6 +328,38 @@ export class WorldModel {
   }
 
   /**
+   * 证据评分核心（v0.12.1）——deriveBelief 与 claimAt/deriveBeliefAt 共用的同一公式。
+   * 审查指出的语义分裂修复：claimAt 不再"按证据数量选冠军"，
+   * 而是与 deriveBelief 一样按 support → belief 评分。
+   *
+   * @param {Array} evidence 证据列表（已按时间窗过滤）
+   * @param {number} atMs 评分时点（新鲜度衰减的基准）
+   * @returns {object} { support, belief, evidenceCount, relayCount }
+   */
+  _scoreEvidence(evidence, atMs) {
+    const seenSources = new Set();
+    let support = 0;
+    let relayCount = 0;
+    for (const ev of evidence) {
+      // 来源去重：同一 source.id 重复证据只计一次（防刷票）
+      const srcKey = ev.source?.id || ev.source?.type || ev.evidenceId;
+      if (seenSources.has(srcKey)) continue;
+      seenSources.add(srcKey);
+
+      const w = sourceWeight(ev.source);
+      // 新鲜度衰减：越旧的证据贡献越低（半衰期 7 天）
+      const ageMs = atMs - (ev.observedAt || ev.ts || atMs);
+      const ageDays = Math.max(0, ageMs) / (24 * 3600 * 1000);
+      const freshness = Math.exp(-ageDays / 7);
+
+      support += w * freshness;
+      if (ev.source.kind === SOURCE_KINDS.RELAY) relayCount++;
+    }
+    const belief = 1 - Math.exp(-support);
+    return { support, belief, evidenceCount: seenSources.size, relayCount };
+  }
+
+  /**
    * 推导信念（v0.11.1 核心 API）——从 claims 的证据聚合成一个信念。
    *
    * 审查指出的数学 bug 修复：
@@ -314,13 +368,17 @@ export class WorldModel {
    *   矛盾真正影响 belief（不是只记录）
    *   新鲜度衰减（7 天半衰期）
    *
+   * 注意：belief 是 support score / confidence，不是概率。
+   * belief=0.8 不意味着 P(claim is true)=80%。（v0.12.1 术语声明）
+   *
    * @param {string} subject
    * @param {string} predicate
    * @param {string} [object] 限定宾语（不传则返回该主谓下所有 claim 的信念）
+   * @param {number} [atMs] 评分时点（默认 now；v0.12.1 支持历史时点）
    * @returns {object|null} Belief
    */
-  deriveBelief(subject, predicate, object = null) {
-    const now = Date.now();
+  deriveBelief(subject, predicate, object = null, atMs = Date.now()) {
+    const now = atMs;
     const relevant = [];
     for (const c of this.claims.values()) {
       if (c.subject !== subject || c.predicate !== predicate) continue;
@@ -336,28 +394,10 @@ export class WorldModel {
     }
     if (relevant.length === 0) return null;
 
-    // 对每个 claim 计算证据加权支持度
+    // 对每个 claim 计算证据加权支持度（同一公式，与 claimAt/deriveBeliefAt 统一）
     const scored = relevant.map(({ claim, validEvidence }) => {
-      // 来源去重：同一 source.id 的重复证据不叠加（防刷票）
-      const seenSources = new Set();
-      let support = 0;
-      let relayCount = 0;
-      for (const ev of validEvidence) {
-        const srcKey = ev.source?.id || ev.source?.type || ev.evidenceId;
-        if (seenSources.has(srcKey)) continue; // 同源重复证据只计一次
-        seenSources.add(srcKey);
-
-        const w = sourceWeight(ev.source);
-        // 新鲜度衰减：越旧的证据贡献越低（半衰期 7 天）
-        const ageMs = now - (ev.observedAt || ev.ts || now);
-        const ageDays = Math.max(0, ageMs) / (24 * 3600 * 1000);
-        const freshness = Math.exp(-ageDays / 7);
-
-        support += w * freshness;
-        if (ev.source.kind === SOURCE_KINDS.RELAY) relayCount++;
-      }
-      const belief = 1 - Math.exp(-support);
-      return { claim, belief, evidenceCount: seenSources.size, relayCount };
+      const s = this._scoreEvidence(validEvidence, now);
+      return { claim, belief: s.belief, evidenceCount: s.evidenceCount, relayCount: s.relayCount };
     });
 
     // 选 belief 最高的 claim
