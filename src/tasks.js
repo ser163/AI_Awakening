@@ -53,6 +53,7 @@ const TRANSITIONS = {
 
 /**
  * 规范化事件（签名覆盖的字段，固定键序）。
+ * 注意：signature 与 eventHash 都不参与规范化（eventHash 是 canonical 的哈希）。
  */
 function canonicalizeEvent(ev) {
   return JSON.stringify({
@@ -66,6 +67,11 @@ function canonicalizeEvent(ev) {
     status: ev.status,
     payload: ev.payload || null,
   });
+}
+
+/** 计算事件的防篡改哈希（v0.10.1: 真哈希，不再是 eventId） */
+function hashEvent(ev) {
+  return crypto.createHash("sha256").update(canonicalizeEvent(ev)).digest("hex");
 }
 
 /** 生成唯一 ID */
@@ -113,13 +119,15 @@ export function createTaskEvent(identity, action, task) {
     taskId: task.id,
     action,
     actor: identity.fingerprint,
-    previousHash: task.lastEventHash || null,
+    previousHash: task.lastEventHash || null, // v0.10.1: 真哈希链
     ts: Date.now(),
     nonce: crypto.randomBytes(8).toString("hex"),
     status: task.status,
     payload: null,
   };
+  // v0.10.1: eventHash = SHA-256(canonicalizeEvent) 防篡改；签名覆盖 canonical
   event.signature = sign(identity, canonicalizeEvent(event));
+  event.eventHash = hashEvent(event); // 真哈希，不再是 eventId
   return event;
 }
 
@@ -169,7 +177,12 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
     return { ok: false, reason: "invalid event signature" };
   }
 
-  // 3. 状态链连续（仅本地有记录时校验；首见靠签名广播引导信任）
+  // v0.10.1: eventHash 自洽（历史事件被修改 → hash 不匹配 → 断链）
+  if (event.eventHash && event.eventHash !== hashEvent(event)) {
+    return { ok: false, reason: "eventHash mismatch (event content tampered)" };
+  }
+
+  // 3. 状态链连续（真哈希链；仅本地有记录时校验；首见靠签名广播引导信任）
   if (hasLocalRecord && event.previousHash !== (task.lastEventHash || null)) {
     return { ok: false, reason: "event chain broken (previousHash mismatch)" };
   }
@@ -265,7 +278,7 @@ export class TaskStore {
       this._appendEvent(event);
       if (!this.events.has(task.id)) this.events.set(task.id, []);
       this.events.get(task.id).push(event);
-      task.lastEventHash = event.eventId; // 简化链：事件链尾 = 最后事件 ID
+      task.lastEventHash = event.eventHash || event.eventId; // v0.10.1: 真哈希链尾
     }
     this.tasks.set(task.id, task);
     this._saveTasks();

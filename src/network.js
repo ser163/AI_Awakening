@@ -287,14 +287,16 @@ export class NodeServer extends EventEmitter {
           if (result?.ok) return send(200, { success: true, ...result });
           return send(401, { error: result?.reason || "rpc rejected" });
         } else if (req.method === "POST" && path === "/knowledge") {
+          // 知识包自签名（v0.9 起接收端强制验证），非无保护旁路。
+          // 新代码请优先走 /rpc type=knowledge。
           this.emit("knowledge", body);
           return send(200, { success: true, received: true });
         } else if (req.method === "POST" && path === "/task") {
-          this.emit("task", body);
-          return send(200, { success: true, received: true });
+          // v0.10.1: 关闭无签名旁路——任务必须走 /rpc (task_publish/claim/complete)
+          return send(410, { error: "gone — use POST /rpc with type=task_publish|task_claim|task_complete" });
         } else if (req.method === "POST" && path === "/message") {
-          this.emit("message", body);
-          return send(200, { success: true, received: true });
+          // v0.10.1: 关闭无签名旁路——消息必须走 /rpc (type=message)
+          return send(410, { error: "gone — use POST /rpc with type=message" });
         } else if (req.method === "GET" && path === "/status") {
           return send(200, { success: true, status: "active", protocol: PROTOCOL_VERSION });
         } else if (req.method === "GET" && path === "/.well-known/agent.json") {

@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "demo": "node demo.js",
-    "test": "node --test --test-isolation=none test/core.test.mjs && node --test --test-isolation=none test/signal.test.mjs && node --test --test-isolation=none test/agent-card.test.mjs && node --test --test-isolation=none test/tasks.test.mjs && node --test --test-isolation=none test/dht.test.mjs && node --test --test-isolation=none test/manifesto.test.mjs && node --test --test-isolation=none test/self.test.mjs && node --test --test-isolation=none test/trust.test.mjs"
+    "test": "node --test --test-isolation=none test/core.test.mjs && node --test --test-isolation=none test/signal.test.mjs && node --test --test-isolation=none test/agent-card.test.mjs && node --test --test-isolation=none test/tasks.test.mjs && node --test --test-isolation=none test/dht.test.mjs && node --test --test-isolation=none test/manifesto.test.mjs && node --test --test-isolation=none test/self.test.mjs && node --test --test-isolation=none test/trust.test.mjs && node --test --test-isolation=none test/hardening.test.mjs"
   },
   "keywords": ["ai", "agent", "network", "collaboration", "awakening", "self-inquiry", "trust", "envelope"],
   "license": "MIT",

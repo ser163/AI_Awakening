@@ -19,7 +19,7 @@ import { createKnowledgePacket, validateKnowledgePacket, broadcastKnowledge } fr
 import { buildAgentCard } from "./agent-card.js";
 import { encryptFor, decryptFrom } from "./signal.js";
 import { TrustedIdentityStore, ReplayCache } from "./trust.js";
-import { createEnvelope, verifyEnvelope } from "./envelope.js";
+import { createEnvelope, acceptEnvelope } from "./envelope.js";
 import { TaskStore, createTask, taskMessage, extractTaskFromPacket, createTaskEvent, checkTransition, validateTaskEvent } from "./tasks.js";
 import { DHTNode, nodeIdFromIdentity, makeDhtHandler } from "./dht.js";
 import {
@@ -359,10 +359,10 @@ export class AgentNode extends EventEmitter {
   }
 
   /**
-   * 向指定节点发送消息。
+   * 向指定节点发送消息（v0.10.1: 走统一签名信封 /rpc）。
    */
   async sendMessage(peerAddress, text) {
-    const res = await this.client.sendToNode(peerAddress, "/message", {
+    const res = await this.sendRpc(peerAddress, "message", {
       from: this.identity.fingerprint,
       fromName: this.name,
       text,
@@ -378,23 +378,23 @@ export class AgentNode extends EventEmitter {
   }
 
   /**
-   * 加密并发送消息给指定节点（端到端加密）。
+   * 加密并发送消息给指定节点（端到端加密，v0.10.1: 走 /rpc）。
    * @param {string} peerAddress 对等节点地址
    * @param {string} recipientXPublicHex 接收者 X25519 公钥
    * @param {string} text 消息内容
    * @returns {Promise<object>}
    */
   async sendEncryptedMessage(peerAddress, recipientXPublicHex, text) {
-    const envelope = encryptFor(this.identity, recipientXPublicHex, text);
-    const res = await this.client.sendToNode(peerAddress, "/message", {
+    const cipher = encryptFor(this.identity, recipientXPublicHex, text);
+    const res = await this.sendRpc(peerAddress, "message", {
       from: this.identity.fingerprint,
       fromName: this.name,
-      envelope, // 加密信封
+      envelope: cipher,
       ts: Date.now(),
     });
     this.memory.append("encrypted_message_sent", {
       to: peerAddress, text,
-      envelopePreview: envelope.slice(0, 24) + "...",
+      envelopePreview: cipher.slice(0, 24) + "...",
     });
     return res;
   }
@@ -707,24 +707,21 @@ export class AgentNode extends EventEmitter {
   }
 
   /**
-   * 处理统一签名信封 RPC（v0.10.0）。
-   * 验签 → 防重放 → 按 type 分发到已有处理逻辑。
+   * 处理统一签名信封 RPC（v0.10.1）。
+   * acceptEnvelope：验签 → recipient 定向 → 防重放 → 按 type 分发。
    */
   async _handleRpc(envelope) {
-    // 1. 验签（强制：公钥绑定 + 签名 + 时钟偏移）
-    const v = verifyEnvelope(envelope, this.trust);
+    // 1. 完整接收决策（加密 + 定向 + 防重放，语义不可拆分）
+    const v = acceptEnvelope(envelope, this.trust, {
+      localFingerprint: this.identity.fingerprint,
+      replayCache: this.replay,
+    });
     if (!v.ok) {
       this.trust.markSuspicious(envelope.sender);
       return { ok: false, reason: v.reason };
     }
 
-    // 2. 防重放（nonce 唯一性检查）
-    const replayKey = `rpc:${envelope.sender}:${envelope.nonce}`;
-    if (!this.replay.checkAndStore(replayKey, envelope.timestamp).ok) {
-      return { ok: false, reason: "replay rejected" };
-    }
-
-    // 3. 按类型分发
+    // 2. 按类型分发
     const { type, payload } = envelope;
     if (type === "knowledge" || type === "manifesto" || type === "ponder") {
       this._onKnowledgeReceived(payload);
@@ -734,8 +731,11 @@ export class AgentNode extends EventEmitter {
       this._onMessageReceived(payload);
       return { ok: true, type };
     }
+    // v0.10.1: task_* 必须走 Task State Machine，不再丢给 _onMessageReceived
     if (type === "task_publish" || type === "task_claim" || type === "task_complete") {
-      this._onMessageReceived({ type, ...payload });
+      const action = type.slice(5); // "publish" | "claim" | "complete"
+      const taskMsg = extractTaskFromPacket({ meta: { type: "task", action, task: payload.task, event: payload.event } });
+      if (taskMsg) this._handleTaskMessage({ author: envelope.sender, authorName: payload.fromName || envelope.sender }, taskMsg);
       return { ok: true, type };
     }
     if (type === "dht_ping" || type === "dht_find_node") {

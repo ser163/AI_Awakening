@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.10.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.10.1-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
