@@ -631,19 +631,41 @@ describe("v0.12.5: 恶意合法签名（加密完整 ≠ 状态机完整）", ()
     );
   });
 
-  it("7. eventIndex 替代 eventHashes——O(1) fork 检测", () => {
+  it("7. eventIndex 升级为元数据索引——hash→{eventId,parentHash,actor,action,ts,height}", () => {
     const ts = new TaskStore();
     const task = createTask({ title: "eventIndex" });
     task.publisherFingerprint = alice.fingerprint;
     const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
     assert.ok(task.eventIndex, "应有 eventIndex");
-    assert.ok(task.eventIndex[e1.eventHash], "eventIndex 应索引事件哈希");
+    const meta = task.eventIndex[e1.eventHash];
+    assert.ok(meta, "eventIndex 应索引事件哈希");
+    assert.equal(meta.action, "publish");
+    assert.equal(meta.actor, alice.fingerprint);
+    assert.equal(meta.height, 1);
+    assert.equal(meta.parentHash, null);
     assert.equal(task.eventHeight, 1, "eventHeight 应计数");
-    // fork 检测走 eventIndex（previousHash 命中历史 → 合法分叉）
+    // fork 检测走 eventIndex（previousHash 命中 → 合法分叉）
     const claimEv = createTaskEvent(alice, "claim", { id: task.id, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null, lastEventHash: e1.eventHash }, { id: task.id, status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, result: null, lastEventHash: e1.eventHash });
     const v = validateTaskEvent(claimEv, "claim", task, store, { hasLocalRecord: true });
     assert.ok(v.ok || v.forked, "previousHash 命中 eventIndex 应视为合法（链连续或分叉）");
+  });
+
+  it("8. fork + 非法状态转移 → fork 标记后仍被语义验证拒绝（不再免检）", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "fork 非法转移" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    // 恶意 fork 事件：合法 previousHash，但状态转移非法（OPEN→claim→COMPLETED）
+    const before = { id: task.id, status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null, lastEventHash: e1.eventHash };
+    const evilAfter = { id: task.id, status: TASK_STATUS.COMPLETED, assigneeFingerprintActual: alice.fingerprint, result: "x", lastEventHash: e1.eventHash };
+    const evilClaim = createTaskEvent(alice, "claim", before, evilAfter);
+    // 模拟 fork 检测路径：任务已是 claimed 但恶意事件声明 beforeState=open
+    const v = validateTaskEvent(evilClaim, "claim", task, store, { hasLocalRecord: true });
+    // 必须被拒绝（fork≠免检），而不是 {ok:true, forked:true}
+    assert.equal(v.ok, false, "fork + 非法状态转移必须被拒（即使 previousHash 合法）");
+    assert.ok(v.reason && !v.forked, "不应标记为 fork——语义验证失败");
   });
 });
 

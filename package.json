@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.5",
-  "description": "硅基协作网络 — Task Semantic Integrity (task-state-machine/validated-transitions/world-belief)",
+  "version": "0.12.6",
+  "description": "硅基协作网络 — State Transition Unification (deriveNextState/validated-forks/world-belief)",
   "type": "module",
   "main": "index.js",
   "scripts": {

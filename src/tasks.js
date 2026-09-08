@@ -219,7 +219,7 @@ export function createTask({ title, description = "", requiredCapabilities = [],
     cancelledAt: null,
     lastEventHash: null, // v0.10.0: 状态链尾，v0.11.0: 可能为分叉主链头
     eventHeight: 0,      // v0.12.4: 事件高度（替代 eventHashes 无限增长）
-    eventIndex: {},      // v0.12.5: {[eventHash]: true} —— O(1) fork 检测，JSON 可序列化
+    eventIndex: {},      // v0.12.6: {[eventHash]: {eventId,parentHash,actor,action,ts,height}}——元数据索引
     forks: [],           // v0.11.0: 分叉列表 [{headEventHash, actor, ts, action, height}]
   };
 }
@@ -320,13 +320,15 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
   // 3. 状态链连续（真哈希链）
   //    首见（hasLocalRecord=false）：信任由签名广播引导，跳过链校验。
   //    有本地记录：previousHash 必须匹配本地链尾，或匹配本地历史中的事件（= 合法分叉）。
+  // v0.12.6 (审查 P0): Fork 是链关系，不是免检通行证。标记 forked 后继续语义验证。
+  let forked = false;
   if (hasLocalRecord && event.previousHash !== (task.lastEventHash || null)) {
     const forkParentExists = !!(task.eventIndex && task.eventIndex[event.previousHash]);
     if (!forkParentExists) {
       return { ok: false, reason: "event chain broken (previousHash mismatch)" };
     }
-    // 合法分叉：签名有效 + 父事件在本地历史中。交给确定性冲突解决（不在此处改状态）。
-    return { ok: true, forked: true };
+    forked = true;
+    // 不提前 return——继续 afterState 语义验证
   }
 
   // v0.12.5 (审查 P0): 加密完整性 ≠ 状态机完整性。
@@ -337,11 +339,15 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
   }
   if (hasLocalRecord) {
     // 主链事件：beforeState 必须匹配本地当前状态（任务头部）
-    if (event.beforeState.status !== task.status) {
-      return { ok: false, reason: `beforeState mismatch: event=${event.beforeState.status}, local=${task.status}` };
-    }
-    if ((event.beforeState.assigneeFingerprintActual || "") !== (task.assigneeFingerprintActual || "")) {
-      return { ok: false, reason: "beforeState assignee mismatch" };
+    // fork 事件：beforeState 必须匹配父事件的 afterState（通过 eventIndex 查找父事件？）
+    // 目前只校验主链 beforeState 匹配；fork 事件跳过 beforeState 匹配（因为 fork 父不是当前 head）
+    if (!forked) {
+      if (event.beforeState.status !== task.status) {
+        return { ok: false, reason: `beforeState mismatch: event=${event.beforeState.status}, local=${task.status}` };
+      }
+      if ((event.beforeState.assigneeFingerprintActual || "") !== (task.assigneeFingerprintActual || "")) {
+        return { ok: false, reason: "beforeState assignee mismatch" };
+      }
     }
   }
   // 仅当 beforeState ≠ afterState（4-arg 显式转移）时验证状态机；
@@ -351,14 +357,78 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
     if (!st.ok) return st;
   }
 
-  return { ok: true };
+  return { ok: true, forked: forked || undefined }; // forked 仅 true 时返回
 }
 
 /**
- * 验证状态转换语义（v0.12.5，审查 P0）。
- * 不信任事件里自声明的 afterState——根据 beforeState + action 推导期望结果，
- * 再与 afterState 比对。非法转移（如 OPEN →claim→ COMPLETED）在此被拒绝，
- * 即使签名/eventHash 全部合法。
+ * 推导状态转移的期望结果（v0.12.6，审查 P0）——**唯一的状态转移来源**。
+ * 协议自己计算"beforeState + action + actor → 应该变成什么"，
+ * 不再相信事件发送者自报的 afterState。live path（validate）与 replay path
+ * （canonicalizeTask）共用此函数，保证两条路径结果一致。
+ *
+ * @param {object} beforeState { status, assigneeFingerprintActual, result }
+ * @param {string} action publish|claim|complete|cancel
+ * @param {string} actor fingerprint
+ * @param {object} [payload] 事件载荷（complete 的 result 可来自 payload）
+ * @returns {object} expected afterState（完整字段）
+ * @throws {Error} 若转移非法
+ */
+export function deriveNextState(beforeState, action, actor, payload = null) {
+  const b = beforeState || {};
+  const ts = Date.now();
+  const status = b.status ?? null;
+
+  const after = {
+    status,
+    assigneeFingerprintActual: b.assigneeFingerprintActual || "",
+    result: b.result ?? null,
+  };
+
+  if (action === "publish") {
+    if (status !== null && status !== undefined) {
+      throw new Error(`illegal state transition: ${status} →publish→ open (publish requires genesis)`);
+    }
+    after.status = TASK_STATUS.OPEN;
+    after.assigneeFingerprintActual = "";
+    after.result = null;
+    return after;
+  }
+  if (action === "claim") {
+    if (status !== TASK_STATUS.OPEN) {
+      throw new Error(`illegal state transition: ${status} →claim→ claimed (claim requires open)`);
+    }
+    after.status = TASK_STATUS.CLAIMED;
+    after.assigneeFingerprintActual = actor; // claim 的 assignee 必须是 actor 本人
+    after.result = null; // claim 不携带 result
+    return after;
+  }
+  if (action === "complete") {
+    if (status !== TASK_STATUS.CLAIMED) {
+      throw new Error(`illegal state transition: ${status} →complete→ completed (complete requires claimed)`);
+    }
+    after.status = TASK_STATUS.COMPLETED;
+    after.assigneeFingerprintActual = b.assigneeFingerprintActual || ""; // 保留 assignee
+    // complete 的 result 可来自 payload.state.result / payload.result / beforeState.result
+    const carriedResult = payload?.state?.result ?? payload?.result ?? null;
+    after.result = carriedResult !== undefined && carriedResult !== null ? carriedResult : (b.result ?? null);
+    return after;
+  }
+  if (action === "cancel") {
+    if (status !== TASK_STATUS.OPEN && status !== TASK_STATUS.CLAIMED) {
+      throw new Error(`illegal state transition: ${status} →cancel→ cancelled (cancel requires open|claimed)`);
+    }
+    after.status = TASK_STATUS.CANCELLED;
+    after.assigneeFingerprintActual = ""; // cancel 清空 assignee
+    after.result = null;
+    return after;
+  }
+  throw new Error(`unknown action: ${action}`);
+}
+
+/**
+ * 验证状态转换语义（v0.12.5→v0.12.6）。
+ * v0.12.6: 改为 deriveNextState() + compare——协议自己推导 expected，
+ * 不再信任事件自报的 afterState；并完整比较状态字段（含 result）。
  *
  * @param {object} event 事件（需含 beforeState/afterState/action/actor）
  * @returns {{ok: boolean, reason?: string, expected?: object}}
@@ -367,32 +437,29 @@ export function validateStateTransition(event) {
   const before = event.beforeState;
   const after = event.afterState;
   if (!before || !after) return { ok: false, reason: "event missing beforeState/afterState" };
-  const action = event.action;
+  try {
+    const expected = deriveNextState(before, event.action, event.actor, event.payload);
+    // 全字段比较（status + assignee + result）——不只比 status
+    const mismatches = [];
+    if (after.status !== expected.status) mismatches.push(`status: declared=${after.status}, expected=${expected.status}`);
+    if ((after.assigneeFingerprintActual || "") !== (expected.assigneeFingerprintActual || "")) {
+      mismatches.push(`assignee: declared=${after.assigneeFingerprintActual || ""}, expected=${expected.assigneeFingerprintActual || ""}`);
+    }
+    if (actionHasResult(event.action) && (after.result ?? null) !== (expected.result ?? null)) {
+      mismatches.push(`result: declared=${after.result ?? null}, expected=${expected.result ?? null}`);
+    }
+    if (mismatches.length > 0) {
+      return { ok: false, reason: `afterState mismatch: ${mismatches.join("; ")}` };
+    }
+    return { ok: true, expected };
+  } catch (err) {
+    return { ok: false, reason: err?.message || String(err) };
+  }
+}
 
-  // 推导合法结果：beforeStatus + action → expected afterStatus
-  let expectedStatus = null;
-  const isPublish = action === "publish";
-  const isCancel = action === "cancel";
-  const isClaim = action === "claim";
-  const isComplete = action === "complete";
-  if (isPublish && (before.status === null || before.status === undefined)) expectedStatus = TASK_STATUS.OPEN;
-  else if (isClaim && before.status === TASK_STATUS.OPEN) expectedStatus = TASK_STATUS.CLAIMED;
-  else if (isComplete && before.status === TASK_STATUS.CLAIMED) expectedStatus = TASK_STATUS.COMPLETED;
-  else if (isCancel && (before.status === TASK_STATUS.OPEN || before.status === TASK_STATUS.CLAIMED)) expectedStatus = TASK_STATUS.CANCELLED;
-  else return { ok: false, reason: `illegal state transition: ${before.status} →${action}→ ${after.status}` };
-
-  if (after.status !== expectedStatus) {
-    return { ok: false, reason: `afterState status mismatch: declared=${after.status}, expected=${expectedStatus}` };
-  }
-  // claim 的 assignee 必须是 actor 本人
-  if (isClaim && (after.assigneeFingerprintActual || "") !== event.actor) {
-    return { ok: false, reason: "afterState assignee must be the claim actor" };
-  }
-  // cancel 必须清空 assignee
-  if (isCancel && after.assigneeFingerprintActual) {
-    return { ok: false, reason: "afterState assignee must be empty after cancel" };
-  }
-  return { ok: true, expected: { status: expectedStatus } };
+/** action 是否涉及 result 字段 */
+function actionHasResult(action) {
+  return action === "complete";
 }
 
 /**
@@ -535,10 +602,17 @@ export class TaskStore {
       if (!this.events.has(task.id)) this.events.set(task.id, []);
       this.events.get(task.id).push(event);
       task.lastEventHash = event.eventHash || event.eventId; // v0.10.1: 真哈希链尾
-      // v0.12.5: eventIndex 对象映射（O(1) fork 检测）替代 eventHashes 数组
+      // v0.12.6: eventIndex 升级为元数据索引（O(1) fork 检测 + 免扫描父事件查找）
       if (!task.eventIndex) task.eventIndex = {};
-      task.eventIndex[event.eventHash || event.eventId] = true;
       task.eventHeight = (task.eventHeight || 0) + 1;
+      task.eventIndex[event.eventHash || event.eventId] = {
+        eventId: event.eventId,
+        parentHash: event.previousHash || null,
+        actor: event.actor,
+        action: event.action,
+        ts: event.ts,
+        height: task.eventHeight,
+      };
     }
     this.tasks.set(task.id, task);
     this._saveTasks();
@@ -662,7 +736,7 @@ export class TaskStore {
     }
     if (chain.length === 0) return null;
 
-    // 从 genesis 向前重放，用 payload.state 重建状态
+    // 从 genesis 向前重放，用 deriveNextState 推导期望状态（不信任事件声明）
     // 兼容无 payload.state 的旧事件（fallback 到 event.status）
     const reconstructed = {
       ...task,
@@ -677,47 +751,85 @@ export class TaskStore {
       eventHashes: [],   // 兼容旧字段（保留读取，新写入走 eventIndex）
       eventIndex: {},
     };
+    // v0.12.6: 重放时跟踪当前 canonical 状态，对每个事件：
+    //   1. 连续性检查：event.beforeState === 当前 canonical（全字段 stateHash）
+    //   2. deriveNextState() 推导期望状态
+    //   3. 验证：期望状态 === event.afterState（不信任声明）
+    //   4. 应用：期望状态（不是 afterState）
+    let currentState = { status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
     for (let i = 0; i < chain.length; i++) {
       const ev = chain[i];
-      // v0.12.5 (审查 P0-②): 重放时验证状态机合法性，而不只是 eventHash。
-      // 相邻事件约束：event[i].afterState === event[i+1].beforeState。
-      // 兼容 3-arg 旧事件（beforeState=afterState，legacy 模式）——跳过连续性检查。
-      if (i > 0) {
-        const prev = chain[i - 1];
-        const prevAfter = prev.afterState || prev.payload?.state || null;
-        const curBefore = ev.beforeState || ev.payload?.state || null;
-        // 仅当相邻状态的 status 不同且都非空时检查连续性（旧事件 before=after 不触发）
-        if (prevAfter && curBefore && prevAfter.status !== curBefore.status) {
-          // 允许 3-arg 兼容：beforeState === afterState 时跳过连续检查
-          const evBefore = ev.beforeState;
-          const evAfter = ev.afterState;
-          if (!evBefore || !evAfter || evBefore.status !== evAfter.status) {
-            throw new Error(`canonicalizeTask: chain state discontinuity at ${ev.eventId} (${prevAfter.status} → ${curBefore.status})`);
-          }
-        }
-      }
-      // 单事件状态转移合法性：仅当 beforeState !== afterState（4-arg 显式转移）时验证
-      if (ev.beforeState && ev.afterState && ev.action && ev.action !== "publish") {
-        if (ev.beforeState.status !== ev.afterState.status) {
-          const st = validateStateTransition(ev);
-          if (!st.ok) {
-            throw new Error(`canonicalizeTask: illegal state transition at ${ev.eventId}: ${st.reason}`);
-          }
-        }
-      }
-      // v0.12.4 (审查 P1-④): replay 阶段重新验证 eventHash 自洽——
-      // 本地 events 文件被篡改（或旧版本无新字段）时拒绝，而不是照吃。
+      // v0.12.4 (审查 P1-④): replay 阶段重新验证 eventHash 自洽
       if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
         throw new Error(`canonicalizeTask: event ${ev.eventId} content tampered (eventHash mismatch)`);
       }
-      // v0.12.4: 重放优先用 afterState（执行后状态）；兼容旧事件 payload.state
-      const state = ev.afterState || ev.payload?.state || {};
-      reconstructed.status = state.status || ev.status || reconstructed.status;
-      if (state.assigneeFingerprintActual) reconstructed.assigneeFingerprintActual = state.assigneeFingerprintActual;
-      if (state.result !== undefined && state.result !== null) reconstructed.result = state.result;
+      if (i > 0) {
+        // 连续性检查：全字段比较（v0.12.6，不再只比 status）
+        const curBefore = ev.beforeState || ev.payload?.state || null;
+        if (curBefore) {
+          const curState = { status: currentState.status, assigneeFingerprintActual: currentState.assigneeFingerprintActual || "", result: currentState.result ?? null };
+          const curSimple = { status: curBefore.status, assigneeFingerprintActual: curBefore.assigneeFingerprintActual || "", result: curBefore.result ?? null };
+          if (curState.status !== curSimple.status || curState.assigneeFingerprintActual !== curSimple.assigneeFingerprintActual || (curState.result ?? null) !== (curSimple.result ?? null)) {
+            // 允许 3-arg 兼容：beforeState === afterState 时跳过连续检查
+            const evBefore = ev.beforeState;
+            const evAfter = ev.afterState;
+            if (!evBefore || !evAfter || evBefore.status !== evAfter.status || evBefore.assigneeFingerprintActual !== evAfter.assigneeFingerprintActual) {
+              throw new Error(`canonicalizeTask: chain state discontinuity at ${ev.eventId} (current=${JSON.stringify(curState)}, before=${JSON.stringify(curSimple)})`);
+            }
+          }
+        }
+      }
+      // 用 deriveNextState 推导期望状态（v0.12.6）
+      if (ev.beforeState && ev.afterState && ev.action) {
+        if (ev.beforeState.status !== ev.afterState.status || ev.beforeState.assigneeFingerprintActual !== ev.afterState.assigneeFingerprintActual) {
+          if (i === 0) {
+            // genesis 事件（publish）：直接应用 afterState，deriveNextState 需要 null 前置状态
+            const state = ev.afterState || ev.payload?.state || {};
+            currentState.status = state.status || ev.status || currentState.status;
+            if (state.assigneeFingerprintActual) currentState.assigneeFingerprintActual = state.assigneeFingerprintActual;
+            if (state.result !== undefined && state.result !== null) currentState.result = state.result;
+          } else {
+            // 非 genesis 事件：用 deriveNextState 推导，不信任声明
+            try {
+              const expected = deriveNextState(currentState, ev.action, ev.actor, ev.payload);
+              // 验证后状态与声明的 afterState 一致
+              const after = ev.afterState;
+              if (after.status !== expected.status) throw new Error(`afterState.status mismatch: declared=${after.status}, expected=${expected.status}`);
+              if ((after.assigneeFingerprintActual || "") !== (expected.assigneeFingerprintActual || "")) throw new Error(`afterState.assignee mismatch: declared=${after.assigneeFingerprintActual || ""}, expected=${expected.assigneeFingerprintActual || ""}`);
+              if (actionHasResult(ev.action) && (after.result ?? null) !== (expected.result ?? null)) throw new Error(`afterState.result mismatch: declared=${after.result ?? null}, expected=${expected.result ?? null}`);
+              // 应用推导的状态（不是 afterState）
+              currentState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
+            } catch (err) {
+              throw new Error(`canonicalizeTask: illegal state transition at ${ev.eventId}: ${err.message}`);
+            }
+          }
+        } else {
+          // 3-arg 兼容（beforeState===afterState）：直接应用
+          const state = ev.afterState || ev.payload?.state || {};
+          currentState.status = state.status || ev.status || currentState.status;
+          if (state.assigneeFingerprintActual) currentState.assigneeFingerprintActual = state.assigneeFingerprintActual;
+          if (state.result !== undefined && state.result !== null) currentState.result = state.result;
+        }
+      } else {
+        // 极旧事件（无 beforeState/afterState）：fallback
+        const state = ev.payload?.state || {};
+        currentState.status = state.status || ev.status || currentState.status;
+        if (state.assigneeFingerprintActual) currentState.assigneeFingerprintActual = state.assigneeFingerprintActual;
+        if (state.result !== undefined && state.result !== null) currentState.result = state.result;
+      }
+      reconstructed.status = currentState.status;
+      reconstructed.assigneeFingerprintActual = currentState.assigneeFingerprintActual;
+      reconstructed.result = currentState.result;
       reconstructed.lastEventHash = ev.eventHash || ev.eventId;
-      reconstructed.eventHeight = (reconstructed.eventHeight || 0) + 1; // v0.12.4
-      reconstructed.eventIndex[reconstructed.lastEventHash] = true;
+      reconstructed.eventHeight = (reconstructed.eventHeight || 0) + 1;
+      reconstructed.eventIndex[reconstructed.lastEventHash] = {
+        eventId: ev.eventId,
+        parentHash: ev.previousHash || null,
+        actor: ev.actor,
+        action: ev.action,
+        ts: ev.ts,
+        height: reconstructed.eventHeight,
+      };
       if (ev.action === "claim") reconstructed.claimedAt = ev.ts;
       if (ev.action === "complete") reconstructed.completedAt = ev.ts;
       if (ev.action === "cancel") reconstructed.cancelledAt = ev.ts;
