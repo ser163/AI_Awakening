@@ -76,10 +76,26 @@ export class WorldModel {
     try {
       fs.mkdirSync(path.dirname(this.logFile), { recursive: true });
       const text = fs.readFileSync(this.logFile, "utf8");
-      for (const line of text.trim().split("\n").filter(Boolean)) {
-        this._replay(JSON.parse(line));
+      if (!text.trim()) return;
+      const lines = text.trim().split("\n").filter(Boolean);
+      for (let i = 0; i < lines.length; i++) {
+        try {
+          this._replay(JSON.parse(lines[i]));
+        } catch (err) {
+          // v0.12.4 (审查 P1-⑤): 区分"首次启动"与"日志损坏"。
+          // 已运行半年、第 N 行 JSON 坏掉 ≠ 第一次启动。
+          this.persistentHealthy = false;
+          this.persistenceError = `world log corrupted at line ${i + 1}: ${err?.message || err}`;
+          break; // 停止重放——损坏后继续读取会让世界建立在不一致状态上
+        }
       }
-    } catch { /* 首次运行 */ }
+    } catch (err) {
+      // ENOENT → 首次运行（静默）；其他 IO 错误 → 暴露
+      if (err?.code !== "ENOENT") {
+        this.persistentHealthy = false;
+        this.persistenceError = `world log load failed: ${err?.message || err}`;
+      }
+    }
   }
 
   /** 重放一条日志事件（幂等：append-only 日志 → 内存状态） */
@@ -104,14 +120,32 @@ export class WorldModel {
     } else if (rec.kind === "evidence") {
       this._addEvidenceToClaim(rec, now);
     } else if (rec.kind === "claim_retracted") {
-      // 撤销整个 claim（如发现原始证据系伪造）
-      this.claims.delete(rec.id);
-    } else if (rec.kind === "evidence_retracted") {
-      // 撤销单条证据
-      const c = this.claims.get(rec.claimId);
+      // 撤销整个 claim（如发现原始证据系伪造）——标记而非删除（v0.12.4）
+      const c = this.claims.get(rec.id);
       if (c) {
-        c.evidence = c.evidence.filter((ev) => ev.evidenceId !== rec.evidenceId);
-        if (c.evidence.length === 0) this.claims.delete(rec.claimId);
+        c.status = "retracted";
+        c.retractedAt = rec.ts || now;
+        c.retractedBy = rec.retractedBy || "";
+        c.reason = rec.reason || "";
+      }
+    } else if (rec.kind === "evidence_retracted") {
+      // v0.12.4: 非破坏性撤销——标记 status=retracted，保留历史（"有历史的世界不该忘记"）
+      const c = this.claims.get(rec.claimId);
+      if (c && rec.evidenceId) {
+        const ev = c.evidence.find((e) => e.evidenceId === rec.evidenceId);
+        if (ev) {
+          ev.status = "retracted";
+          ev.retractedAt = rec.ts || now;
+          ev.retractedBy = rec.retractedBy || "";
+          ev.reason = rec.reason || "";
+        }
+      }
+      // 整个 claim 撤销（evidenceId=null）
+      if (c && !rec.evidenceId) {
+        c.status = "retracted";
+        c.retractedAt = rec.ts || now;
+        c.retractedBy = rec.retractedBy || "";
+        c.reason = rec.reason || "";
       }
     } else if (rec.kind === "relation") {
       const rid = `${rec.from}|${rec.type}|${rec.to}`;
@@ -261,10 +295,17 @@ export class WorldModel {
         id: claimId,
         // v0.12.0: Claim 一等公民字段
         claimId,                                  // 可追踪标识（= id，供引用/撤销/修订）
+        // v0.12.4 (审查 P1-⑥): Proposition 身份与 Claim 身份显式分离。
+        //   propositionId = subject|predicate|object（世界主张本身）
+        //   claimId       = 该主张的可追踪容器（含证据/修订历史）
+        //   Evidence      = 单条观察（时间窗独立）
+        //   四层：Proposition ≠ Claim ≠ Evidence ≠ Belief
+        propositionId: claimId,
         subject: rec.subject,
         predicate: rec.predicate,
         object: rec.object,
         createdAt: now,                           // 主张首次成立时间（区别于证据时间）
+        revisions: [],                            // v0.12.4: 修订历史（回填自证据时间窗；见 claimAt）
         evidence: [evidenceItem],
       });
     }
@@ -355,19 +396,22 @@ export class WorldModel {
   /**
    * 撤销一条证据（如发现来源不可信）。
    */
-  retractEvidence(subject, predicate, object, evidenceId = null) {
+  retractEvidence(subject, predicate, object, evidenceId = null, meta = {}) {
     const claimId = `${subject}|${predicate}|${String(object)}`;
     const c = this.claims.get(claimId);
     if (!c) return false;
-    if (evidenceId) {
-      this._append({ kind: "evidence_retracted", claimId, evidenceId, ts: Date.now() });
-      c.evidence = c.evidence.filter((ev) => ev.evidenceId !== evidenceId);
-      if (c.evidence.length === 0) this.claims.delete(claimId);
-    } else {
-      this._append({ kind: "claim_retracted", id: claimId, ts: Date.now() });
-      this.claims.delete(claimId);
-    }
-    this._pushEvent({ kind: "evidence_retracted", claimId, ts: Date.now() });
+    const now = Date.now();
+    const retraction = {
+      kind: "evidence_retracted",
+      claimId,
+      evidenceId: evidenceId || null,
+      ts: now,
+      retractedBy: meta.retractedBy || "",
+      reason: meta.reason || "",
+    };
+    this._append(retraction);
+    this._replay(retraction); // v0.12.4: 非破坏性——标记 status=retracted，不物理删除
+    this._pushEvent({ kind: "evidence_retracted", claimId, evidenceId, ts: now });
     return true;
   }
 
@@ -433,14 +477,20 @@ export class WorldModel {
     const relevant = [];    // active claims
     let staleClaims = [];   // 全部证据已过期
     for (const c of this.claims.values()) {
+      if (c.status === "retracted") continue; // v0.12.4: 整条 claim 已撤销
       if (c.subject !== subject || c.predicate !== predicate) continue;
       if (object !== null && c.object !== object) continue;
       // v0.12.3: 三组证据计算——allEvidence（过 validFrom）/ activeEvidence（不过期）/ staleEvidence（已过期）
       const allEvidence = c.evidence.filter((ev) => {
         if (ev.validFrom && now < ev.validFrom) return false; // 未生效
+        if (ev.status === "retracted") return false; // v0.12.4: 已撤销 ≠ 世界曾相信的证据
         return true;
       });
-      const activeEvidence = allEvidence.filter((ev) => !ev.validUntil || now <= ev.validUntil);
+      const activeEvidence = allEvidence.filter((ev) => {
+        if (ev.validUntil && now > ev.validUntil) return false; // 已过期
+        if (ev.status === "retracted") return false; // v0.12.4: 已撤销
+        return true;
+      });
       if (activeEvidence.length > 0) {
         relevant.push({ claim: c, validEvidence: activeEvidence });
       } else if (allEvidence.length > 0) {

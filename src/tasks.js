@@ -101,11 +101,23 @@ export const TASK_POLICIES = {
 /** 已知 authority 白名单（v0.12.3）——未知 authority 拒绝加载，不静默 ok:true */
 const KNOWN_AUTHORITIES = new Set(["any", "publisher", "assignee", "quorum"]);
 
-/** 归一化 policy 条目：字符串旧格式 → 结构化对象（兼容 v0.12.1） */
+/** 已知 fork 规则白名单（v0.12.4）——与 authority 白名单风格一致，未知→throw */
+const KNOWN_FORK_RULES = new Set(["publisher", "assignee", "newest"]);
+
+/**
+ * 归一化 policy 条目（v0.12.4，审查 P0 三态）：
+ *   undefined/null → return null（调用方继承 default）
+ *   invalid（非字符串非对象）→ throw
+ *   字符串 "any"/"publisher"/"assignee" → {authority: 同值}
+ *   对象 {authority} → as-is
+ * @param {*} entry
+ * @returns {object|null}
+ */
 function normalizePolicyEntry(entry) {
+  if (entry === undefined || entry === null) return null;
   if (typeof entry === "string") return { authority: entry };
   if (entry && typeof entry === "object" && entry.authority) return entry;
-  return { authority: "any" };
+  throw new Error(`invalid policy entry: ${JSON.stringify(entry)} — must be string or {authority: ...}`);
 }
 
 /**
@@ -117,7 +129,8 @@ function normalizePolicyEntry(entry) {
  */
 function resolveAuthority(policy, action) {
   const rule = normalizePolicyEntry((policy || {})[action]);
-  const authority = rule.authority;
+  // 若 entry 为 null（缺失），继承 default（已在 mergePolicy 确保，但防御性处理）
+  const authority = rule ? rule.authority : "publisher";
   if (typeof authority === "string" && authority.startsWith("quorum(")) {
     throw new Error(`unsupported policy: ${action} = "${authority}" — quorum 未实现，拒绝静默降级为 any`);
   }
@@ -145,6 +158,9 @@ function canonicalizeEvent(ev) {
     ts: ev.ts,
     nonce: ev.nonce,
     status: ev.status,
+    // v0.12.4: beforeState/afterState 纳入签名域（防篡改）
+    beforeState: ev.beforeState || null,
+    afterState: ev.afterState || null,
     payload: ev.payload || null,
   });
 }
@@ -160,6 +176,26 @@ function genId(prefix) {
 }
 
 /**
+ * 深合并 TaskPolicy（v0.12.4，审查 P0）：
+ *   DEFAULT + 用户 override —— 缺失 action 继承 default（禁止缺省→any）；
+ *   显式 action 覆盖 default；未知 action 保留（由 authority 白名单在解析时拒绝）。
+ * @param {object} userPolicy 用户策略（可部分）
+ * @returns {object} 合并后的完整策略
+ */
+function mergePolicy(userPolicy) {
+  const base = JSON.parse(JSON.stringify(TASK_POLICIES.DEFAULT)); // 深拷贝默认
+  if (!userPolicy || typeof userPolicy !== "object") return base;
+  for (const key of Object.keys(userPolicy)) {
+    const v = userPolicy[key];
+    if (v === undefined || v === null) continue; // 显式 null → 继承 default
+    base[key] = (typeof v === "object" && !Array.isArray(v))
+      ? { ...base[key], ...v } // 部分 action 对象（如只给 authority）也深合并
+      : v;
+  }
+  return base;
+}
+
+/**
  * 创建一个任务对象（初始 OPEN 状态）。
  */
 export function createTask({ title, description = "", requiredCapabilities = [], assigneeFingerprint = "", meta = {}, policy = null }) {
@@ -171,7 +207,7 @@ export function createTask({ title, description = "", requiredCapabilities = [],
     requiredCapabilities,
     assigneeFingerprint,
     meta,
-    policy: policy || { ...TASK_POLICIES.DEFAULT }, // v0.12.1: 可配置策略
+    policy: mergePolicy(policy), // v0.12.4: 深合并，缺失 action 继承 DEFAULT
     status: TASK_STATUS.OPEN,
     publisherFingerprint: "",
     publisherName: "",
@@ -182,6 +218,7 @@ export function createTask({ title, description = "", requiredCapabilities = [],
     completedAt: null,
     cancelledAt: null,
     lastEventHash: null, // v0.10.0: 状态链尾，v0.11.0: 可能为分叉主链头
+    eventHeight: 0,      // v0.12.4: 事件高度（替代 eventHashes 无限增长）
     forks: [],           // v0.11.0: 分叉列表 [{headEventHash, actor, ts, action, height}]
   };
 }
@@ -195,7 +232,16 @@ export function createTask({ title, description = "", requiredCapabilities = [],
  * @param {object} task 任务当前状态
  * @returns {object} 签名事件
  */
-export function createTaskEvent(identity, action, task) {
+export function createTaskEvent(identity, action, beforeTask, afterTask = null) {
+  // v0.12.4: 拆 beforeState / afterState（审查 P0-③）。
+  // 旧调用（3 参数，afterTask=null）→ beforeState = afterState = task 快照（向后兼容）。
+  // 新调用（4 参数）→ beforeState = beforeTask 快照，afterState = afterTask 快照。
+  // beforeTask=null（publish 等 genesis 事件）→ before 合成空状态。
+  const task = afterTask || beforeTask; // 兼容旧调用：只有一个状态
+  const before = afterTask ? (beforeTask || { status: null, assigneeFingerprintActual: "", result: null }) : task;
+  const after = afterTask || task;
+  const beforeState = { status: before.status, assigneeFingerprintActual: before.assigneeFingerprintActual || "", result: before.result ?? null };
+  const afterState = { status: after.status, assigneeFingerprintActual: after.assigneeFingerprintActual || "", result: after.result ?? null };
   const event = {
     eventId: genId("evt"),
     taskId: task.id,
@@ -204,14 +250,13 @@ export function createTaskEvent(identity, action, task) {
     previousHash: task.lastEventHash || null, // v0.10.1: 真哈希链
     ts: Date.now(),
     nonce: crypto.randomBytes(16).toString("hex"),
-    status: task.status,
-    // v0.12.0: 状态快照并入 payload —— 被签名覆盖（防篡改），fork 重建时可恢复状态
+    status: task.status, // 保留旧字段（兼容旧 canonicalizeTask）
+    // v0.12.4: 明确的 beforeState / afterState（含之前的 state 快照，按需迁移）
+    beforeState,
+    afterState,
+    // 旧 payload.state 保留（兼容旧 canonicalizeTask 重放）
     payload: {
-      state: {
-        status: task.status,
-        assigneeFingerprintActual: task.assigneeFingerprintActual || "",
-        result: task.result ?? null,
-      },
+      state: afterState,
     },
   };
   // v0.10.1: eventHash = SHA-256(canonicalizeEvent) 防篡改；签名覆盖 canonical
@@ -490,6 +535,10 @@ export class TaskStore {
     ];
     if (candidates.length === 0) return null;
     const forkRule = (task.policy && task.policy.fork) || "publisher";
+    // v0.12.4: fork rule 白名单——未知规则 throw，不静默 reinterpret 成 newest
+    if (!KNOWN_FORK_RULES.has(forkRule)) {
+      throw new Error(`unsupported fork rule: "${forkRule}" — 必须是 publisher/assignee/newest`);
+    }
     candidates.sort((a, b) => {
       if (forkRule === "publisher") {
         const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
@@ -540,6 +589,11 @@ export class TaskStore {
     while (cur && byHash[cur]) {
       chain.unshift(byHash[cur]); // 逆序（genesis 在前）
       const ev = byHash[cur];
+      // v0.12.4 (审查 P1-④): replay 阶段重新验证 eventHash 自洽——
+      // 本地 events 文件被篡改（或旧版本无新字段）时拒绝，而不是照吃。
+      if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
+        throw new Error(`canonicalizeTask: event ${ev.eventId} content tampered (eventHash mismatch)`);
+      }
       cur = ev.previousHash || null;
     }
     if (chain.length === 0) return null;
@@ -559,11 +613,13 @@ export class TaskStore {
       eventHashes: [],
     };
     for (const ev of chain) {
-      const state = ev.payload?.state || {};
+      // v0.12.4: 重放优先用 afterState（执行后状态）；兼容旧事件 payload.state
+      const state = ev.afterState || ev.payload?.state || {};
       reconstructed.status = state.status || ev.status || reconstructed.status;
       if (state.assigneeFingerprintActual) reconstructed.assigneeFingerprintActual = state.assigneeFingerprintActual;
       if (state.result !== undefined && state.result !== null) reconstructed.result = state.result;
       reconstructed.lastEventHash = ev.eventHash || ev.eventId;
+      reconstructed.eventHeight = (reconstructed.eventHeight || 0) + 1; // v0.12.4
       if (!reconstructed.eventHashes.includes(reconstructed.lastEventHash)) reconstructed.eventHashes.push(reconstructed.lastEventHash);
       if (ev.action === "claim") reconstructed.claimedAt = ev.ts;
       if (ev.action === "complete") reconstructed.completedAt = ev.ts;

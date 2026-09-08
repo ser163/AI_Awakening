@@ -129,6 +129,7 @@ E:\pr\AI_Awakening\
 | 2026-09-08 | v0.12.1 | **语义统一** | **110** | claimAt 按信念选冠军 (非证据数), deriveBeliefAt 历史时点, _scoreEvidence 统一评分, applyCanonicalState 写回, TaskPolicy 可配置 (fork/cancel/complete/verify), event nonce 128-bit, 术语声明 (belief=support score 非概率) |
 | 2026-09-08 | v0.12.2 | **诚实策略** | **114** | quorum 未实现→显式 throw (拒绝降级为 any), TaskPolicyEngine 结构化 (authority/conditions/threshold), canonicalTaskStateHash 全字段判等, source.identity/evidenceId/provenanceId 三概念分离, epistemic state (SUPPORTED/CONTRADICTED/STALE), dominance=支持度占比替代冲突计数, 日志 schemaVersion, persistence healthy 标记, PROTOCOL.md |
 | 2026-09-08 | v0.12.3 | **语义正确性** | **117** | authority 白名单+未知→throw (拒绝静默 ok:true), fork tie-breaker ts 相同→eventHash lexical, STALE 四态闭环 (allEvidence/activeEvidence/staleEvidence 三组计算), epistemicStatus() 显式 UNKNOWN, TaskStore persistentHealthy 统一, conditions/threshold 标记 reserved, canonicalTaskStateHash 执行态注释, PROTOCOL.md 扩展 12 章 spec |
+| 2026-09-08 | v0.12.4 | **策略与事件语义** | **120** | TaskPolicy 深合并 (缺省继承 DEFAULT, 禁止缺省→any), normalizePolicyEntry 三态 (缺省/null/显式), fork rule 白名单, TaskEvent beforeState/afterState (签名域+重放), replay eventHash 自洽验证, 日志损坏 vs 首次启动分离 (行级+ENOENT), Claim/Proposition 身份分离, retractEvidence 非破坏性 (status=retracted 保留历史), eventHeight 字段 |
 
 > 2026-09-08 在同一天发布了 v0.8.0 和 v0.9.0，因为自我叩问完成后，审查反馈指出信任模型的安全缺陷，随即在同一天完成了信任层补完。
 

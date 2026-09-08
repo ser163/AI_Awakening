@@ -467,7 +467,8 @@ export class AgentNode extends EventEmitter {
     const task = createTask(taskOpts);
     task.publisherFingerprint = this.identity.fingerprint;
     task.publisherName = this.name;
-    const event = createTaskEvent(this.identity, "publish", task);
+    const before = null; // publish: 无前状态
+    const event = createTaskEvent(this.identity, "publish", before, task);
     this.tasks.upsert(task, event);
 
     await this.refreshPeers();
@@ -506,7 +507,8 @@ export class AgentNode extends EventEmitter {
     task.status = "claimed";
     task.assigneeFingerprintActual = this.identity.fingerprint;
     task.claimedAt = Date.now();
-    const event = createTaskEvent(this.identity, "claim", task);
+    const before = { ...task, status: "open", assigneeFingerprintActual: "", claimedAt: null, completedAt: null, cancelledAt: null };
+    const event = createTaskEvent(this.identity, "claim", before, task);
     this.tasks.upsert(task, event);
 
     await this.refreshPeers();
@@ -538,7 +540,8 @@ export class AgentNode extends EventEmitter {
     task.status = "completed";
     task.result = result;
     task.completedAt = Date.now();
-    const event = createTaskEvent(this.identity, "complete", task);
+    const before = { ...task, status: "claimed", result: null, completedAt: null };
+    const event = createTaskEvent(this.identity, "complete", before, task);
     this.tasks.upsert(task, event);
 
     await this.refreshPeers();

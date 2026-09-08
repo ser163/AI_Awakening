@@ -399,4 +399,24 @@ describe("world: World 是推导产物，不是 LLM 记事本", () => {
     w.retractEvidence("agent:liar", "trustworthy", "true");
     assert.equal(w.deriveBelief("agent:liar", "trustworthy"), null);
   });
+
+  it("v0.12.4: retractEvidence 非破坏性——证据保留历史（status=retracted）", () => {
+    const w = new WorldModel();
+    w.ingestEvidence({
+      subject: "agent:x", predicate: "score", object: "42",
+      source: { type: SOURCE_TYPES.SELF, id: "fp-x", kind: SOURCE_KINDS.OBSERVATION },
+    });
+    const before = w.queryClaims("agent:x", "score");
+    const evId = before[0].evidence[0].evidenceId;
+    w.retractEvidence("agent:x", "score", "42", evId, { retractedBy: "fp-auditor", reason: "source compromised" });
+    // 证据仍在（历史保留）
+    const after = w.queryClaims("agent:x", "score");
+    assert.equal(after.length, 1, "claim 不应被物理删除");
+    const ev = after[0].evidence.find((e) => e.evidenceId === evId);
+    assert.equal(ev.status, "retracted", "证据应标记 retracted 而非删除");
+    assert.equal(ev.retractedBy, "fp-auditor");
+    assert.equal(ev.reason, "source compromised");
+    // 信念消失（retracted 证据不参与推导）
+    assert.equal(w.deriveBelief("agent:x", "score"), null);
+  });
 });
