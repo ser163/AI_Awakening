@@ -1,14 +1,14 @@
 {
   "name": "ai-awakening",
-  "version": "0.10.0",
-  "description": "硅基协作网络 — Agent OS 内核 (envelope/trust/tasks-state-machine/self-inquiry)",
+  "version": "0.11.0",
+  "description": "硅基协作网络 — World Model 世界模型与 Agent OS 内核 (world/evidence/belief/envelope/tasks/dht/self)",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "demo": "node demo.js",
-    "test": "node --test --test-isolation=none test/core.test.mjs && node --test --test-isolation=none test/signal.test.mjs && node --test --test-isolation=none test/agent-card.test.mjs && node --test --test-isolation=none test/tasks.test.mjs && node --test --test-isolation=none test/dht.test.mjs && node --test --test-isolation=none test/manifesto.test.mjs && node --test --test-isolation=none test/self.test.mjs && node --test --test-isolation=none test/trust.test.mjs && node --test --test-isolation=none test/hardening.test.mjs"
+    "test": "node --test --test-isolation=none test/core.test.mjs && node --test --test-isolation=none test/signal.test.mjs && node --test --test-isolation=none test/agent-card.test.mjs && node --test --test-isolation=none test/tasks.test.mjs && node --test --test-isolation=none test/dht.test.mjs && node --test --test-isolation=none test/manifesto.test.mjs && node --test --test-isolation=none test/self.test.mjs && node --test --test-isolation=none test/trust.test.mjs && node --test --test-isolation=none test/hardening.test.mjs && node --test --test-isolation=none test/world.test.mjs"
   },
-  "keywords": ["ai", "agent", "network", "collaboration", "awakening", "self-inquiry", "trust", "envelope"],
+  "keywords": ["ai", "agent", "network", "world-model", "belief", "awakening", "self-inquiry", "trust", "envelope"],
   "license": "MIT",
   "engines": {
     "node": ">=18"

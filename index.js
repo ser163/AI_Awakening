@@ -24,3 +24,4 @@ export { DHTNode, KBucket, nodeIdFromIdentity, nodeIdFromFingerprint, xorDistanc
 export * from "./src/trust.js";
 export * from "./src/envelope.js";
 export * from "./src/self.js";
+export * from "./src/world.js";

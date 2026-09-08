@@ -311,6 +311,25 @@ export class AgentNode extends EventEmitter {
           return;
         }
       }
+      // v0.11.0: 检测到合法分叉——记录 fork，不覆盖主链状态，交给确定性冲突解决
+      if (ev.forked && hasLocal) {
+        const forkRecord = {
+          headEventHash: event.eventHash || null,
+          actor: event.actor,
+          ts: event.ts,
+          action: event.action,
+        };
+        if (!local.forks) local.forks = [];
+        if (!local.forks.some((f) => f.headEventHash === forkRecord.headEventHash)) {
+          local.forks.push(forkRecord);
+          if (local.forks.length > 10) local.forks.splice(0, local.forks.length - 10);
+          this.tasks.upsert(local);
+          this.memory.append("task_fork_detected", { taskId: task.id, actor: event.actor, action });
+        }
+        console.warn(`🔀 任务 ${task.id.slice(0, 8)} 检测到分叉（${packet.authorName} ${action}）——记录等待仲裁`);
+        this.emit("task:forked", { taskId: task.id, fork: forkRecord, action, from: packet.author });
+        return;
+      }
     } else {
       // 旧版（无事件）：仅做去重
       const dedupEvent = { eventId: `${packet.id}:${action}` };

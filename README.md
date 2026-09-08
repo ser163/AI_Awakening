@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.10.1-blue)]
+[![Version](https://img.shields.io/badge/version-0.11.0-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -294,7 +294,8 @@ E:\pr\AI_Awakening\
 | v0.7.0 | **Voluntary joining** — nodes self-announce; agents join by choice | ✅ |
 | v0.8.0 | **Self-Inquiry** — introspect/declareSelf/ponder; signed self-declaration chain; /self protocol; think() mind hook | ✅ |
 | **v0.9.0** | **Trust Layer** — TrustedIdentityStore, mandatory signature verification, E2E identity binding, replay protection, RequestGuard, signed Registry auth, task persistence + event dedup, 70 tests (24 attack-surface) | ✅ |
-| **v0.10.0** | **Agent OS Kernel** — Unified SignedEnvelope (/rpc), signal expiry enforcement, auto replay in decrypt, Task State Machine (signed transitions + CANCELLED + chain), DHT stable nodeId (SHA-256 of fingerprint), AICollaborationInterface.js → legacy/, README Security/Threat Model | ✅ |
+| **v0.10.1** | **Protocol Hardening** — recipient 定向强制, 旧端点 410, acceptEnvelope 语义, nonce 128-bit, Task 真哈希链 | ✅ |
+| **v0.11.0** | **World Model** — Evidence→Claim→Belief 分层, 时间有效性, append-only 持久化, Task fork 检测 | ✅ |
 | v0.10 | Memory Kernel — SQLite/WAL, event store, index, knowledge graph | 🗺 VISION |
 | v0.11 | Autonomous Loop — Goal Engine, Planner, Observer, Reflect/Learn | 🗺 VISION |
 | v0.12 | Agent Society — Reputation, Capability Market, Dispute Resolution | 🗺 VISION |

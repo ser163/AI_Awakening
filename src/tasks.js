@@ -100,7 +100,8 @@ export function createTask({ title, description = "", requiredCapabilities = [],
     claimedAt: null,
     completedAt: null,
     cancelledAt: null,
-    lastEventHash: null, // v0.10.0: 状态链尾
+    lastEventHash: null, // v0.10.0: 状态链尾，v0.11.0: 可能为分叉主链头
+    forks: [],           // v0.11.0: 分叉列表 [{headEventHash, actor, ts, action, height}]
   };
 }
 
@@ -182,9 +183,16 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
     return { ok: false, reason: "eventHash mismatch (event content tampered)" };
   }
 
-  // 3. 状态链连续（真哈希链；仅本地有记录时校验；首见靠签名广播引导信任）
+  // 3. 状态链连续（真哈希链）
+  //    首见（hasLocalRecord=false）：信任由签名广播引导，跳过链校验。
+  //    有本地记录：previousHash 必须匹配本地链尾，或匹配本地历史中的事件（= 合法分叉）。
   if (hasLocalRecord && event.previousHash !== (task.lastEventHash || null)) {
-    return { ok: false, reason: "event chain broken (previousHash mismatch)" };
+    const forkParentExists = (task.eventHashes || []).includes(event.previousHash);
+    if (!forkParentExists) {
+      return { ok: false, reason: "event chain broken (previousHash mismatch)" };
+    }
+    // 合法分叉：签名有效 + 父事件在本地历史中。交给确定性冲突解决（不在此处改状态）。
+    return { ok: true, forked: true };
   }
 
   return { ok: true };
@@ -279,6 +287,10 @@ export class TaskStore {
       if (!this.events.has(task.id)) this.events.set(task.id, []);
       this.events.get(task.id).push(event);
       task.lastEventHash = event.eventHash || event.eventId; // v0.10.1: 真哈希链尾
+      // v0.11.0: 跟踪所有事件哈希（用于分叉检测）
+      if (!task.eventHashes) task.eventHashes = [];
+      const h = event.eventHash || event.eventId;
+      if (!task.eventHashes.includes(h)) task.eventHashes.push(h);
     }
     this.tasks.set(task.id, task);
     this._saveTasks();
@@ -310,5 +322,25 @@ export class TaskStore {
     return this.openTasks().filter((t) =>
       (t.requiredCapabilities || []).every((c) => myCapabilities.includes(c))
     );
+  }
+
+  /**
+   * 确定性分叉解决（v0.11.0）。
+   * 规则：publisher 的 fork 优先；若 publisher 无 fork，选事件高度更高者。
+   * 不改变当前状态——只返回应该 follow 的 fork head。
+   * @param {string} taskId
+   * @returns {object|null} 应接受的 fork head
+   */
+  resolveFork(taskId) {
+    const task = this.tasks.get(taskId);
+    if (!task || !task.forks || task.forks.length === 0) return null;
+    // 按权重排序：publisher 的事件 > 非 publisher 的
+    task.forks.sort((a, b) => {
+      const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
+      const bIsPub = b.actor === task.publisherFingerprint ? 1 : 0;
+      if (aIsPub !== bIsPub) return bIsPub - aIsPub;
+      return b.ts - a.ts; // 同为 publisher 或同为非 publisher：最新优先
+    });
+    return task.forks[0];
   }
 }
