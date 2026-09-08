@@ -201,6 +201,28 @@ export class NodeClient {
   }
 
   /**
+   * v0.10.0: 发送统一签名信封 RPC（/rpc 端点）。
+   * 所有节点间 RPC 应优先走这里，而不是直接 POST 明文端点。
+   *
+   * @param {string} address 目标节点地址
+   * @param {object} envelope 签名信封（createEnvelope 产物）
+   * @returns {Promise<object>} {success, ...} 或 {error}
+   */
+  async sendEnvelope(address, envelope) {
+    try {
+      const res = await fetch(`${address}/rpc`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(envelope),
+      });
+      const data = await res.json();
+      return { httpStatus: res.status, ...data };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  }
+
+  /**
    * 将本节点的 Agent Card 签名注册到注册表（A2A 发现层）。
    */
   async registerAgentCard(card) {
@@ -246,6 +268,7 @@ export class NodeServer extends EventEmitter {
     this.agentCard = null; // A2A Agent Card（由节点注入）
     this.dhtHandler = null; // DHT RPC 处理器（由节点注入）
     this.selfHandler = null; // 自我声明应答器（v0.8.0，由节点注入）
+    this.rpcHandler = null; // 统一签名信封处理器（v0.10.0，由节点注入）
     this.guard = new RequestGuard({ maxBodyBytes: 512 * 1024, rateLimit: 600 });
   }
 
@@ -255,7 +278,15 @@ export class NodeServer extends EventEmitter {
         const url = new URL(req.url, `http://localhost:${this.port}`);
         const path = url.pathname;
 
-        if (req.method === "POST" && path === "/knowledge") {
+        if (req.method === "POST" && path === "/rpc") {
+          // v0.10.0: 统一签名信封入口——所有节点间 RPC 走这里。
+          // body = SignedEnvelope {protocol, version, type, sender, recipient, timestamp, nonce, requestId, payload, signature}
+          // 验签/防重放由 AgentNode 注入的 rpcHandler 完成。
+          if (!this.rpcHandler) return send(404, { error: "rpc not enabled" });
+          const result = await this.rpcHandler(body);
+          if (result?.ok) return send(200, { success: true, ...result });
+          return send(401, { error: result?.reason || "rpc rejected" });
+        } else if (req.method === "POST" && path === "/knowledge") {
           this.emit("knowledge", body);
           return send(200, { success: true, received: true });
         } else if (req.method === "POST" && path === "/task") {

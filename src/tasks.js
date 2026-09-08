@@ -1,52 +1,85 @@
 /**
- * tasks.js — 任务协作系统 (v0.9.0)
+ * tasks.js — 任务协作系统 (v0.10.0)
  *
- * v0.9.0 改动：
- *   - TaskStore 持久化（JSONL 文件，构造时传入 storageDir）
- *   - 任务事件日志（publish/claim/complete 各记录一条签名事件，防重放/可审计）
- *   - 事件 ID 去重 —— 防止重复 claim/complete 状态机混乱
+ * v0.10.0 关键升级：Task 从 "signed message" 升级为 "signed state transition"。
  *
- * 实现 AICollaborationInterface 的 joinTask 语义：
- *   1. 发布任务 (publishTask)   — 节点广播一个任务请求
- *   2. 认领任务 (claimTask)     — 有能力/意愿的节点认领
- *   3. 完成回执 (completeTask)  — 认领者提交结果
- *   4. 任务列表 (listTasks)     — 查看网络中所有任务
+ *   任务不再是"一个对象"，而是"一串签过名的事件 + 由事件推导出的当前状态"。
  *
- * 任务消息通过知识包传播（带 type: "task" 元数据），
- * 由每个节点的 knowledge:received 事件驱动。
+ *   TaskEvent（签名）:
+ *   {
+ *     eventId, taskId, action, actor,   // actor = 发起者 fingerprint
+ *     previousHash,                      // 上一个事件哈希（状态链）
+ *     ts, nonce,
+ *     signature                          // actor 的 Ed25519 签名
+ *   }
+ *
+ *   状态机（合法性不可协商）:
+ *     OPEN ──claim(actor=claimer)──▶ CLAIMED
+ *     OPEN ──cancel(actor=publisher)──▶ CANCELLED
+ *     CLAIMED ──complete(actor=assignee)──▶ COMPLETED
+ *     CLAIMED ──cancel(actor=publisher)──▶ CANCELLED
+ *     （非法: OPEN→COMPLETED, COMPLETED→CLAIMED, CLAIMED(A)→CLAIMED(B)）
+ *
+ *   每个事件携带 actor 签名，接收方验证：
+ *     1. actor 可信（TrustedIdentityStore）
+ *     2. 签名有效（actor 私钥）
+ *     3. 状态转移合法（当前状态 × action）
+ *     4. 事件链连续（previousHash 匹配）
  */
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { sign, verifySignature, publicKeyMatchesFingerprint } from "./identity.js";
 
 /** 任务状态 */
 export const TASK_STATUS = {
   OPEN: "open",          // 等待认领
   CLAIMED: "claimed",    // 已被认领
   COMPLETED: "completed",// 已完成
+  CANCELLED: "cancelled",// 已取消（v0.10.0）
+};
+
+/** 合法状态转移表：fromStatus -> { action: [允许的 toStatus, 允许的 actor 规则] } */
+const TRANSITIONS = {
+  [TASK_STATUS.OPEN]: {
+    claim: { to: TASK_STATUS.CLAIMED, actorMustBe: "any" },           // 任意有能力的节点可认领
+    cancel: { to: TASK_STATUS.CANCELLED, actorMustBe: "publisher" },  // 只有发布者可取消
+  },
+  [TASK_STATUS.CLAIMED]: {
+    complete: { to: TASK_STATUS.COMPLETED, actorMustBe: "assignee" }, // 只有当前认领者可完成
+    cancel: { to: TASK_STATUS.CANCELLED, actorMustBe: "publisher" },  // 发布者可取消已认领任务
+  },
 };
 
 /**
- * 生成唯一事件 ID。
+ * 规范化事件（签名覆盖的字段，固定键序）。
  */
-function genEventId() {
-  return `${Date.now().toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
+function canonicalizeEvent(ev) {
+  return JSON.stringify({
+    eventId: ev.eventId,
+    taskId: ev.taskId,
+    action: ev.action,
+    actor: ev.actor,
+    previousHash: ev.previousHash ?? null,
+    ts: ev.ts,
+    nonce: ev.nonce,
+    status: ev.status,
+    payload: ev.payload || null,
+  });
+}
+
+/** 生成唯一 ID */
+function genId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
 }
 
 /**
- * 创建一个任务对象。
- * @param {object} opts
- * @param {string} opts.title 任务标题
- * @param {string} opts.description 任务描述
- * @param {string[]} opts.requiredCapabilities 所需能力
- * @param {string} opts.assigneeFingerprint 指定认领者（可选）
- * @param {object} [opts.meta] 附加元数据
- * @returns {object} 任务对象（未发布状态）
+ * 创建一个任务对象（初始 OPEN 状态）。
  */
 export function createTask({ title, description = "", requiredCapabilities = [], assigneeFingerprint = "", meta = {} }) {
   if (!title) throw new Error("task title is required");
   return {
-    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    id: genId("task"),
     title,
     description,
     requiredCapabilities,
@@ -60,43 +93,120 @@ export function createTask({ title, description = "", requiredCapabilities = [],
     createdAt: Date.now(),
     claimedAt: null,
     completedAt: null,
+    cancelledAt: null,
+    lastEventHash: null, // v0.10.0: 状态链尾
   };
+}
+
+/**
+ * 创建一个签名的任务事件（v0.10.0）。
+ * 事件由 actor 用私钥签名——从密码学上证明"这个状态变更是这个节点做的"。
+ *
+ * @param {object} identity actor 身份（签名者）
+ * @param {string} action publish|claim|complete|cancel
+ * @param {object} task 任务当前状态
+ * @returns {object} 签名事件
+ */
+export function createTaskEvent(identity, action, task) {
+  const event = {
+    eventId: genId("evt"),
+    taskId: task.id,
+    action,
+    actor: identity.fingerprint,
+    previousHash: task.lastEventHash || null,
+    ts: Date.now(),
+    nonce: crypto.randomBytes(8).toString("hex"),
+    status: task.status,
+    payload: null,
+  };
+  event.signature = sign(identity, canonicalizeEvent(event));
+  return event;
 }
 
 /**
  * 生成任务消息载荷（用于 shareKnowledge 广播）。
- * 返回 { type: "task", action, task } 结构。
  */
-export function taskMessage(action, task) {
-  return {
-    type: "task",
-    action,
-    task,
-  };
+export function taskMessage(action, task, event = null) {
+  return { type: "task", action, task, event };
 }
 
 /**
  * 从知识包中识别任务消息。
- * @param {object} packet 收到的知识包
- * @returns {{action: string, task: object}|null}
  */
 export function extractTaskFromPacket(packet) {
   const meta = packet.meta || {};
   if (meta.type !== "task") return null;
-  return { action: meta.action, task: meta.task };
+  return { action: meta.action, task: meta.task, event: meta.event || null };
 }
 
 /**
- * 本地任务仓库：管理本节点发布/认领的任务，持久化到 JSONL。
+ * 校验一个事件是否是 actor 本人签发的合法状态变更。
+ * @param {object} event 事件
+ * @param {string} action 期望动作
+ * @param {object} task 任务当前状态
+ * @param {object} trustedStore TrustedIdentityStore
+ * @param {object} [opts]
+ * @param {boolean} [opts.hasLocalRecord] 本地是否已有该任务记录。
+ *   首见（无本地记录）时不校验 previousHash 链——链从签名广播引导建立。
+ * @returns {{ok: boolean, reason?: string}}
+ */
+export function validateTaskEvent(event, action, task, trustedStore, { hasLocalRecord = true } = {}) {
+  if (!event || !event.signature || !event.actor || !event.taskId || !event.action) {
+    return { ok: false, reason: "malformed task event" };
+  }
+  if (event.taskId !== task.id) return { ok: false, reason: "taskId mismatch" };
+  if (event.action !== action) return { ok: false, reason: `action mismatch (event=${event.action}, expected=${action})` };
+
+  // 1. actor 可信 + 公钥绑定
+  const publicKey = trustedStore.getPublicKey(event.actor);
+  if (!publicKey) return { ok: false, reason: "unknown event actor (no trusted public key)" };
+  if (!publicKeyMatchesFingerprint(publicKey, event.actor)) {
+    return { ok: false, reason: "actor publicKey does not match fingerprint" };
+  }
+
+  // 2. 签名有效
+  if (!verifySignature(publicKey, canonicalizeEvent(event), event.signature)) {
+    return { ok: false, reason: "invalid event signature" };
+  }
+
+  // 3. 状态链连续（仅本地有记录时校验；首见靠签名广播引导信任）
+  if (hasLocalRecord && event.previousHash !== (task.lastEventHash || null)) {
+    return { ok: false, reason: "event chain broken (previousHash mismatch)" };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * 检查状态转移合法性（基于当前状态 × action × actor 规则）。
+ * @param {object} task 当前任务
+ * @param {string} action 请求的动作
+ * @param {string} actorFingerprint 动作发起者
+ * @returns {{ok: boolean, reason?: string}}
+ */
+export function checkTransition(task, action, actorFingerprint) {
+  const allowed = TRANSITIONS[task.status]?.[action];
+  if (!allowed) {
+    return { ok: false, reason: `illegal transition: ${task.status} → ${action}` };
+  }
+  if (allowed.actorMustBe === "publisher" && actorFingerprint !== task.publisherFingerprint) {
+    return { ok: false, reason: "only the publisher can perform this action" };
+  }
+  if (allowed.actorMustBe === "assignee" && actorFingerprint !== task.assigneeFingerprintActual) {
+    return { ok: false, reason: "only the current assignee can perform this action" };
+  }
+  return { ok: true };
+}
+
+/**
+ * 本地任务仓库：事件日志 + 状态推导，持久化。
  */
 export class TaskStore {
-  /**
-   * @param {string} [storageDir] 存储目录（可选；不传则仅内存）
-   */
   constructor(storageDir = null) {
     this.storageDir = storageDir;
-    this.tasks = new Map();           // id -> task
-    this._seenEvents = new Set();     // eventId 去重
+    this.tasks = new Map();       // id -> task (当前状态)
+    this.events = new Map();      // id -> [events]（按 taskId 分组）
+    this._seenEvents = new Set(); // eventId 去重
     this._taskFile = storageDir ? path.join(storageDir, "tasks", "tasks.jsonl") : null;
     this._eventFile = storageDir ? path.join(storageDir, "tasks", "events.jsonl") : null;
     this._load();
@@ -118,6 +228,10 @@ export class TaskStore {
         for (const line of text.trim().split("\n").filter(Boolean)) {
           const ev = JSON.parse(line);
           if (ev.eventId) this._seenEvents.add(ev.eventId);
+          if (ev.taskId) {
+            if (!this.events.has(ev.taskId)) this.events.set(ev.taskId, []);
+            this.events.get(ev.taskId).push(ev);
+          }
         }
       }
     } catch { /* 首次运行 */ }
@@ -141,16 +255,17 @@ export class TaskStore {
   }
 
   /**
-   * 添加或更新任务。如果事件已存在（去重），返回 duplicate=true 且不重复处理。
-   * @param {object} task 任务对象
-   * @param {object} [event] 可选事件记录（带 eventId 用于去重）
+   * 记录任务当前状态（本地快照）。
    * @returns {{task: object, duplicate: boolean}}
    */
   upsert(task, event = null) {
     if (event && event.eventId) {
-      if (this._seenEvents.has(event.eventId)) return { task, duplicate: true }; // 已处理过，防重放
+      if (this._seenEvents.has(event.eventId)) return { task, duplicate: true };
       this._seenEvents.add(event.eventId);
       this._appendEvent(event);
+      if (!this.events.has(task.id)) this.events.set(task.id, []);
+      this.events.get(task.id).push(event);
+      task.lastEventHash = event.eventId; // 简化链：事件链尾 = 最后事件 ID
     }
     this.tasks.set(task.id, task);
     this._saveTasks();
@@ -172,29 +287,15 @@ export class TaskStore {
     return this.all().filter((t) => t.status === TASK_STATUS.OPEN);
   }
 
-  /** 我有资格认领的任务（能力匹配；指定认领者的任务由 claimTask 进一步校验） */
+  /** 事件历史（某任务） */
+  eventHistory(taskId) {
+    return this.events.get(taskId) || [];
+  }
+
+  /** 我有资格认领的任务 */
   claimableTasks(myCapabilities) {
     return this.openTasks().filter((t) =>
       (t.requiredCapabilities || []).every((c) => myCapabilities.includes(c))
     );
   }
-}
-
-/**
- * 创建一个任务事件记录（用于 TaskStore.upsert 的 event 参数）。
- * 事件 ID 去重保证同一事件的多次广播不会被重复处理。
- *
- * @param {string} action publish|claim|complete
- * @param {object} task 任务对象
- * @returns {object} {eventId, action, taskId, ts, ...}
- */
-export function createTaskEvent(action, task) {
-  return {
-    eventId: genEventId(),
-    action,
-    taskId: task.id,
-    ts: Date.now(),
-    status: task.status,
-    actor: task.assigneeFingerprintActual || task.publisherFingerprint || "",
-  };
 }

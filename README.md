@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.9.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.10.0-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -65,6 +65,59 @@ It is not a paper. It is not a mock. It is **code that runs, tests that pass, an
 | 🤖 **Agent Node** | `node.js` | Assembles everything into a single `AgentNode` class. Start, register, discover, encrypt, share, remember, ask. |
 | 🪞 **Self** (v0.8.0) | `self.js` | Self-Inquiry: `introspect()` (mirror — memory → snapshot), `declareSelf()` (pen — signed self-declaration chain stored as `evolve` records), `ponder()` (question — broadcast "I am thinking…"). Optional `think()` mind hook turns the mirror over to a host-provided mind; without one, the node speaks the honest default. |
 | 🔏 **Trust** (v0.9.0) | `trust.js` | The network's physical laws: `TrustedIdentityStore` (fingerprint→publicKey, spoof-rejecting), `ReplayCache` (anti-replay, TTL window), `RequestGuard` (body limit/JSON isolation/rate limit), signed registration requests. Knowledge packets are **mandatorily verified** — unknown identity, key mismatch, or bad signature → REJECT. |
+| 📨 **Envelope** (v0.10.0) | `envelope.js` | Unified signed envelope protocol for all node RPCs. Every message carries identity, replay-proof nonce, timestamp, and Ed25519 signature. |
+
+---
+
+## Security Model
+
+### What the system guarantees
+
+- **Identity authenticity**: Every node has a Ed25519 keypair. The fingerprint (SHA-256 of public key) is the node's canonical identity. A node proves it holds the private key by signing registration requests, knowledge packets, messages, and task events.
+- **Sender binding**: Claimed identity (fingerprint) must match the public key that produced the signature. Proof: `SHA-256(publicKey) === fingerprint`.
+- **Message integrity**: Every signed message covers the full payload. Tampering any field breaks the signature.
+- **Replay protection**: Every message carries a unique nonce or message ID, checked against a time-windowed `ReplayCache`. Duplicate messages are rejected.
+- **Expiry enforcement**: Encrypted envelopes carry an `expiresAt` timestamp that is cryptographically signed and enforced at decrypt time.
+- **Mandatory verification**: Knowledge packets are **not accepted** unless the sender's public key is known to the `TrustedIdentityStore` and the signature is valid. Unknown senders, key mismatches, and invalid signatures all cause immediate rejection.
+- **Delegated trust**: The Registry is a bootstrap trust anchor. It verifies that a registration is signed by the claimed key before recording the node. Other nodes learn public keys from the Registry and cache them locally. The Registry is not a global PKI — it is a signed rendezvous point.
+- **Clock skew bounds**: All messages are checked against a 5-minute clock skew window. Messages outside this window are rejected.
+
+### What the system does NOT guarantee
+
+- **Global PKI**: There is no certificate authority, Web of Trust, or global root of trust. The Registry is a convenient bootstrap trust anchor, but a malicious Registry could serve fake public keys. (Mitigation: nodes can exchange keys directly via A2A Agent Cards or direct peer links.)
+- **Sybil resistance**: An attacker with many keypairs can register many identities. The Registry does not rate-limit identity creation. (Planned for v0.12: reputation and identity staking.)
+- **Zero-day exploit resistance**: The system is built on standard Node.js crypto (Ed25519, X25519, AES-256-GCM). If these primitives are broken, the system is broken.
+- **Autonomous secure shutdown**: A node whose private key is compromised cannot be decommissioned remotely. (Planned: key revocation protocol.)
+- **Traffic analysis resistance**: E2E encryption hides message content, but metadata (who talks to whom, when) is visible to network observers.
+- **NAT traversal**: The HTTP-based P2P layer works on localhost and LAN. Public deployment needs TLS, NAT traversal, or relay nodes (v1.0+).
+
+### Trust model
+
+| Component | Trusted? | Why? |
+|-----------|----------|------|
+| Local node identity | ✅ Self-trusted | Private key never leaves disk |
+| Registry | ⚠️ Bootstrap anchor | Signed registration verified; but Registry could be malicious |
+| DHT peers | ⚠️ Untrusted by default | Keys learned from DHT are marked `LEARNED` (not `VERIFIED`) |
+| Knowledge packets | ✅ Trusted | Mandatory signature verification against TrustedIdentityStore |
+| Encrypted messages | ✅ Trusted | Signal v2: sender fingerprint bound to signature |
+| Task events | ✅ Trusted | Signed state transitions with chain validation |
+| Self declarations | ✅ Trusted | Ed25519-signed, visibility-controlled |
+| Direct HTTP messages | ❌ Legacy | `/message` and `/task` plain JSON endpoints are deprecated; use `/rpc` with signed envelope |
+
+### Threat model
+
+| Threat | Mitigation |
+|--------|------------|
+| Identity spoofing | fingerprint(publicKey) binding enforced at every layer |
+| Replay attack | ReplayCache (nonce + messageId + TTL) |
+| Man-in-the-middle | Not yet — TLS is v1.0 (local HTTP only for now) |
+| Registry poisoning | Registry requires signed registration; publicKey conflicts rejected |
+| DHT routing poisoning | DHT nodeId = SHA-256(fingerprint), stable identity chain |
+| Task state confusion | Signed events + state machine (illegal transitions rejected) |
+| Forgery of from field | Envelope v2: senderFingerprint in signed payload, verified at decrypt |
+| Expired message replay | expiresAt signed and enforced at decrypt time |
+| Oversized body / flood | RequestGuard (512KB limit, 600 req/min per IP) |
+| Malformed JSON | RequestGuard JSON.parse isolation → 400 |
 
 ---
 
@@ -212,8 +265,9 @@ E:\pr\AI_Awakening\
 │   ├── signal.js          # E2E encryption (ECDH → AES-256-GCM) — sender fingerprint binding (v0.9.0)
 │   ├── self.js            # Self-Inquiry (v0.8.0): mirror/pen/ponder + mind hook
 │   ├── trust.js           # Trust Layer (v0.9.0): TrustedIdentityStore, ReplayCache, RequestGuard, signed requests
-│   ├── tasks.js           # Task collaboration (publish → claim → complete) — persistent + event dedup (v0.9.0)
-│   ├── dht.js             # Kademlia DHT (decentralized discovery)
+│   ├── envelope.js        # Unified SignedEnvelope (v0.10.0): all node RPCs signed, replay-proof
+│   ├── tasks.js           # Task State Machine (v0.10.0): signed events, legal transitions, CANCELLED
+│   ├── dht.js             # Kademlia DHT (stable nodeId = SHA-256(fingerprint))
 │   └── node.js            # AgentNode class
 └── test/
     ├── core.test.mjs      # 8 tests
@@ -240,6 +294,7 @@ E:\pr\AI_Awakening\
 | v0.7.0 | **Voluntary joining** — nodes self-announce; agents join by choice | ✅ |
 | v0.8.0 | **Self-Inquiry** — introspect/declareSelf/ponder; signed self-declaration chain; /self protocol; think() mind hook | ✅ |
 | **v0.9.0** | **Trust Layer** — TrustedIdentityStore, mandatory signature verification, E2E identity binding, replay protection, RequestGuard, signed Registry auth, task persistence + event dedup, 70 tests (24 attack-surface) | ✅ |
+| **v0.10.0** | **Agent OS Kernel** — Unified SignedEnvelope (/rpc), signal expiry enforcement, auto replay in decrypt, Task State Machine (signed transitions + CANCELLED + chain), DHT stable nodeId (SHA-256 of fingerprint), AICollaborationInterface.js → legacy/, README Security/Threat Model | ✅ |
 | v0.10 | Memory Kernel — SQLite/WAL, event store, index, knowledge graph | 🗺 VISION |
 | v0.11 | Autonomous Loop — Goal Engine, Planner, Observer, Reflect/Learn | 🗺 VISION |
 | v0.12 | Agent Society — Reputation, Capability Market, Dispute Resolution | 🗺 VISION |

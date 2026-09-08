@@ -19,11 +19,14 @@ export const ALPHA = 3;       // 并发查询数
 export const ID_BITS = 160;   // 节点 ID 位数
 const ID_BYTES = ID_BITS / 8;
 
-/** 计算节点 ID：sha256(name + fingerprint) 截断为 160 bit */
-export function nodeIdFromIdentity(name, fingerprint) {
-  const h = crypto.createHash("sha256").update(`${name}:${fingerprint}`).digest();
+/** 计算节点 ID：SHA-256(fingerprint) 截断为 160 bit (v0.10.0)
+ * 不再依赖 name——身份链稳定：Identity → Fingerprint → Node ID。 */
+export function nodeIdFromFingerprint(fingerprint) {
+  const h = crypto.createHash("sha256").update(fingerprint).digest();
   return h.subarray(0, ID_BYTES);
 }
+/** @deprecated 旧版 nodeIdFromIdentity 依赖 name，身份链不稳定 */
+export const nodeIdFromIdentity = nodeIdFromFingerprint;
 
 /** XOR 距离（Buffer 比较） */
 export function xorDistance(a, b) {

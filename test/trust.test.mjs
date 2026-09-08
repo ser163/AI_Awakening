@@ -330,11 +330,14 @@ describe("trust: E2E 恶意节点被拒收（真实网络）", () => {
 });
 
 describe("trust: 任务持久化", () => {
+  const actor = loadOrCreateIdentity(path.join(tmp, "task_actor"), "task-actor");
+
   it("任务跨实例重启后仍在", () => {
     const dir = path.join(tmp, "task_persist");
     const store1 = new TaskStore(dir);
     const task = createTask({ title: "持久任务", requiredCapabilities: ["vision"] });
-    store1.upsert(task, createTaskEvent("publish", task));
+    task.publisherFingerprint = actor.fingerprint;
+    store1.upsert(task, createTaskEvent(actor, "publish", task));
 
     // 模拟重启：新实例从磁盘加载
     const store2 = new TaskStore(dir);
@@ -347,7 +350,8 @@ describe("trust: 任务持久化", () => {
     const dir = path.join(tmp, "task_dedup");
     const store = new TaskStore(dir);
     const task = createTask({ title: "去重任务" });
-    const event = createTaskEvent("publish", task);
+    task.publisherFingerprint = actor.fingerprint;
+    const event = createTaskEvent(actor, "publish", task);
     const r1 = store.upsert(task, event);
     assert.equal(r1.duplicate, false);
     const r2 = store.upsert({ ...task, title: "改过的任务" }, event); // 重放同一事件

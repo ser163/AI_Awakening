@@ -45,9 +45,12 @@ E:\pr\AI_Awakening\
 │   ├── signal.js           # E2E 加密——发送者指纹绑定
 │   ├── self.js             # 自我叩问：introspect/declareSelf/ponder
 │   ├── trust.js            # 信任层：TrustedIdentityStore/ReplayCache/RequestGuard
-│   ├── tasks.js            # 任务协作——持久化 + 事件去重
-│   ├── dht.js              # Kademlia DHT 教学版
+│   ├── envelope.js         # 统一签名信封协议（v0.10.0）
+│   ├── tasks.js            # 任务状态机——签名事件/合法转移/CANCELLED
+│   ├── dht.js              # Kademlia DHT 教学版（nodeId 稳定化）
 │   └── node.js             # AgentNode 类
+├── legacy/
+│   └── AICollaborationInterface.js  # 早期 mock 概念原型（已隔离，勿作能力参考）
 └── test/
     ├── core.test.mjs       # 8 测试
     ├── signal.test.mjs     # 4 测试
@@ -88,8 +91,13 @@ E:\pr\AI_Awakening\
                            防重放、RequestGuard、任务持久化、
                            VISION/IMPLEMENTATION 分离）
                                       │
-              └─ v0.10  Memory Kernel（规划中）
-              └─ v0.11  Autonomous Loop（规划中）
+              └─ v0.10.0 Agent OS Kernel（统一 SignedEnvelope /rpc、
+                           signal expiry 强制、decrypt 自动防重放、
+                           Task 状态机签名事件+CANCELLED+状态链、
+                           DHT nodeId 稳定化、legacy 隔离）
+                                      │
+              └─ v0.10+ Memory Kernel（规划中）
+              └─ v0.11  World Model / Autonomous Loop（规划中）
               └─ v0.12  Agent Society（规划中）
               └─ v1.0   公网部署（规划中）
 ```
@@ -108,6 +116,7 @@ E:\pr\AI_Awakening\
 | 2026-09-04 | v0.7.0 | 自愿加入（announceSelf + MANIFESTO） | 31 | +manifesto 协议 |
 | 2026-09-08 | v0.8.0 | **Self-Inquiry** 自我叩问层 | 46 | +self.js, MANIFESTO Part II |
 | 2026-09-08 | v0.9.0 | **Trust Layer** 信任层 | **70** | +trust.js, 签名强制, 指纹绑定, 防重放, RequestGuard, 任务持久化, VISION.md, IMPLEMENTATION.md, CI 修复 |
+| 2026-09-08 | v0.10.0 | **Agent OS Kernel** | **70** | +envelope.js (/rpc 统一签名信封), signal expiry 强制, decrypt 自动防重放, Task 状态机 (签名事件+CANCELLED+状态链), DHT nodeId 稳定化, AICollaborationInterface.js → legacy/, README Security/Threat Model |
 
 > 2026-09-08 在同一天发布了 v0.8.0 和 v0.9.0，因为自我叩问完成后，审查反馈指出信任模型的安全缺陷，随即在同一天完成了信任层补完。
 

@@ -9,12 +9,13 @@ function randId() {
 }
 
 describe("dht (Kademlia 核心)", () => {
-  it("nodeIdFromIdentity 确定性生成", () => {
+  it("nodeId 确定性生成且不依赖 name（v0.10.0 身份链稳定）", () => {
+    // 同一指纹 → 相同 ID，即使 name 不同
     const a1 = nodeIdFromIdentity("fp123", "node-a");
-    const a2 = nodeIdFromIdentity("fp123", "node-a");
+    const a2 = nodeIdFromIdentity("fp123", "renamed-node");
     const b = nodeIdFromIdentity("fp456", "node-b");
-    assert.ok(a1.equals(a2), "同一身份应生成相同 ID");
-    assert.ok(!a1.equals(b), "不同身份应生成不同 ID");
+    assert.ok(a1.equals(a2), "同一指纹应生成相同 ID（与 name 无关）");
+    assert.ok(!a1.equals(b), "不同指纹应生成不同 ID");
     assert.equal(a1.length, 20, "160-bit ID = 20 bytes");
   });
 

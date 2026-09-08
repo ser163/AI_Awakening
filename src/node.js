@@ -19,7 +19,8 @@ import { createKnowledgePacket, validateKnowledgePacket, broadcastKnowledge } fr
 import { buildAgentCard } from "./agent-card.js";
 import { encryptFor, decryptFrom } from "./signal.js";
 import { TrustedIdentityStore, ReplayCache } from "./trust.js";
-import { TaskStore, createTask, taskMessage, extractTaskFromPacket, createTaskEvent } from "./tasks.js";
+import { createEnvelope, verifyEnvelope } from "./envelope.js";
+import { TaskStore, createTask, taskMessage, extractTaskFromPacket, createTaskEvent, checkTransition, validateTaskEvent } from "./tasks.js";
 import { DHTNode, nodeIdFromIdentity, makeDhtHandler } from "./dht.js";
 import {
   buildSelfSnapshot,
@@ -116,6 +117,8 @@ export class AgentNode extends EventEmitter {
     this.server.agentCard = this.agentCard;
     // v0.8.0: 服务端 /self 端点——同行可以问"你是谁"，节点自主应答
     this.server.selfHandler = () => this._answerSelfRequest();
+    // v0.10.0: 统一签名信封处理器——验签 → 防重放 → 按类型分发
+    this.server.rpcHandler = (envelope) => this._handleRpc(envelope);
 
     // 注册（v0.9.0: 签名注册——Registry 验证指纹与签名后才登记）
     try {
@@ -285,13 +288,39 @@ export class AgentNode extends EventEmitter {
     }
   }
 
-  /** 处理任务消息（发布/认领/完成）——v0.9.0 事件去重防重放 */
-  _handleTaskMessage(packet, { action, task }) {
-    // 生成事件 ID 用于去重（同一任务消息的多次广播只处理一次）
-    const event = { eventId: `${packet.id}:${action}` };
-    // 记录任务到本地仓库（事件去重：如果已处理过该事件，静默忽略）
-    const { duplicate } = this.tasks.upsert({ ...task }, event);
-    if (duplicate) return;
+  /** 处理任务消息（发布/认领/完成）——v0.10.0 签名事件验证 + 状态机合法性 */
+  _handleTaskMessage(packet, { action, task, event }) {
+    // v0.10.0: 如果有签名事件，验证它（来自新版本节点的广播）
+    if (event) {
+      const local = this.tasks.get(task.id);
+      const hasLocal = local != null;
+      const ev = validateTaskEvent(event, action, local || task, this.trust, { hasLocalRecord: hasLocal });
+      if (!ev.ok) {
+        console.warn(`🚫 任务事件被拒 (${packet.authorName}): ${ev.reason}`);
+        if (packet.author) this.trust.markSuspicious(packet.author);
+        this.emit("task:rejected", { action, task, event, reason: ev.reason });
+        return;
+      }
+      // 状态转移合法性（仅本地有记录时校验——我们才知道真实的前置状态；
+      // 首见靠签名事件引导信任，后续事件通过 lastEventHash 链校验）
+      if (hasLocal) {
+        const tr = checkTransition(local, action, event.actor);
+        if (!tr.ok) {
+          console.warn(`🚫 非法状态转移 (${packet.authorName}): ${tr.reason}`);
+          this.emit("task:rejected", { action, task, event, reason: tr.reason });
+          return;
+        }
+      }
+    } else {
+      // 旧版（无事件）：仅做去重
+      const dedupEvent = { eventId: `${packet.id}:${action}` };
+      const { duplicate } = this.tasks.upsert({ ...task }, dedupEvent);
+      if (duplicate) return;
+    }
+
+    // 记录任务到本地仓库（事件去重）——新版事件路径已在上面验证+记录，此处跳过
+    const { duplicate } = this.tasks.upsert({ ...task }, event || undefined);
+    if (duplicate && !event) return; // 旧版走这里，新版已在上面处理
 
     if (action === "publish") {
       this.memory.append("task_published_received", { id: task.id, title: task.title, from: packet.author });
@@ -301,7 +330,7 @@ export class AgentNode extends EventEmitter {
       if (local) {
         local.status = task.status;
         local.assigneeFingerprintActual = task.assigneeFingerprintActual;
-        this.tasks.upsert(local);
+        this.tasks.upsert(local, event || undefined);
       }
       this.emit("task:claimed", { task, from: packet.author, fromName: packet.authorName });
     } else if (action === "complete") {
@@ -310,7 +339,7 @@ export class AgentNode extends EventEmitter {
         local.status = task.status;
         local.result = task.result;
         local.completedAt = task.completedAt;
-        this.tasks.upsert(local);
+        this.tasks.upsert(local, event || undefined);
       }
       this.emit("task:completed", { task, from: packet.author, fromName: packet.authorName });
     }
@@ -373,25 +402,33 @@ export class AgentNode extends EventEmitter {
   /**
    * 解密收到的加密信封。在 "message:received" 事件处理器中调用。
    *
-   * v0.9.0: 解密成功后可调用 checkReplay(msg) 做防重放检查。
+   * v0.10.0: 安全检查内建——调用方不可能"忘记调安全 API"。
+   * 流程：验身份 → 验签名 → 时钟偏移 → expiresAt → 防重放 → 解密。
+   *
    * @param {object} msg 收到的消息对象（含 envelope 字段）
-   * @returns {{ok: boolean, from?: string, text?: string, msgId?: string, ts?: number, error?: string}}
+   * @returns {{ok: boolean, from?: string, text?: string, msgId?: string, ts?: number, error?: string, replay?: boolean}}
    */
   decryptIncomingMessage(msg) {
     if (!msg.envelope) return { ok: false, error: "no envelope" };
     const result = decryptFrom(this.identity, msg.envelope);
-    if (result.ok) {
-      this.memory.append("encrypted_message_received", {
-        from: result.from,
-        text: result.text,
-        msgId: result.msgId,
-      });
+    if (!result.ok) return result;
+
+    // v0.10.0: 自动防重放——不再依赖调用方手动 checkReplay
+    const replay = this.replay.checkAndStore(`msg:${result.from}:${result.msgId}`, result.ts || Date.now());
+    if (!replay.ok) {
+      return { ok: false, error: replay.reason, replay: true, from: result.from };
     }
+
+    this.memory.append("encrypted_message_received", {
+      from: result.from,
+      text: result.text,
+      msgId: result.msgId,
+    });
     return result;
   }
 
   /**
-   * 防重放检查（v0.9.0）——解密成功后调用。
+   * 防重放检查（v0.9.0，保留兼容旧用法）——v0.10.0 起已内建于 decryptIncomingMessage。
    * @param {object} decrypted decryptIncomingMessage 的结果（ok=true）
    * @returns {{ok: boolean, reason?: string}}
    */
@@ -411,15 +448,15 @@ export class AgentNode extends EventEmitter {
     const task = createTask(taskOpts);
     task.publisherFingerprint = this.identity.fingerprint;
     task.publisherName = this.name;
-    const event = createTaskEvent("publish", task);
+    const event = createTaskEvent(this.identity, "publish", task);
     this.tasks.upsert(task, event);
 
     await this.refreshPeers();
-    const msg = taskMessage("publish", task);
     const { packet } = await this.shareKnowledge(`[task] ${task.title}`, {
       type: "task",
       action: "publish",
       task,
+      event,
       tags: ["task", ...task.requiredCapabilities],
     });
     this.memory.append("task_published", { id: task.id, title: task.title });
@@ -443,19 +480,22 @@ export class AgentNode extends EventEmitter {
     if (task.assigneeFingerprint && task.assigneeFingerprint !== this.identity.fingerprint) {
       throw new Error("task is assigned to another node");
     }
+    // v0.10.0: 状态转移合法性检查
+    const transition = checkTransition(task, "claim", this.identity.fingerprint);
+    if (!transition.ok) throw new Error(transition.reason);
 
     task.status = "claimed";
     task.assigneeFingerprintActual = this.identity.fingerprint;
     task.claimedAt = Date.now();
-    const event = createTaskEvent("claim", task);
+    const event = createTaskEvent(this.identity, "claim", task);
     this.tasks.upsert(task, event);
 
     await this.refreshPeers();
-    const msg = taskMessage("claim", task);
     await this.shareKnowledge(`[task-claim] ${task.title}`, {
       type: "task",
       action: "claim",
       task,
+      event,
       tags: ["task"],
     });
     this.memory.append("task_claimed", { id: task.id, title: task.title });
@@ -472,11 +512,14 @@ export class AgentNode extends EventEmitter {
     const task = this.tasks.get(taskId);
     if (!task) throw new Error(`task not found: ${taskId}`);
     if (task.status !== "claimed") throw new Error(`task not claimed: ${task.status}`);
+    // v0.10.0: 状态转移合法性检查
+    const transition = checkTransition(task, "complete", this.identity.fingerprint);
+    if (!transition.ok) throw new Error(transition.reason);
 
     task.status = "completed";
     task.result = result;
     task.completedAt = Date.now();
-    const event = createTaskEvent("complete", task);
+    const event = createTaskEvent(this.identity, "complete", task);
     this.tasks.upsert(task, event);
 
     await this.refreshPeers();
@@ -484,6 +527,7 @@ export class AgentNode extends EventEmitter {
       type: "task",
       action: "complete",
       task,
+      event,
       tags: ["task"],
     });
     this.memory.append("task_completed", { id: task.id, title: task.title, result });
@@ -663,6 +707,63 @@ export class AgentNode extends EventEmitter {
   }
 
   /**
+   * 处理统一签名信封 RPC（v0.10.0）。
+   * 验签 → 防重放 → 按 type 分发到已有处理逻辑。
+   */
+  async _handleRpc(envelope) {
+    // 1. 验签（强制：公钥绑定 + 签名 + 时钟偏移）
+    const v = verifyEnvelope(envelope, this.trust);
+    if (!v.ok) {
+      this.trust.markSuspicious(envelope.sender);
+      return { ok: false, reason: v.reason };
+    }
+
+    // 2. 防重放（nonce 唯一性检查）
+    const replayKey = `rpc:${envelope.sender}:${envelope.nonce}`;
+    if (!this.replay.checkAndStore(replayKey, envelope.timestamp).ok) {
+      return { ok: false, reason: "replay rejected" };
+    }
+
+    // 3. 按类型分发
+    const { type, payload } = envelope;
+    if (type === "knowledge" || type === "manifesto" || type === "ponder") {
+      this._onKnowledgeReceived(payload);
+      return { ok: true, type };
+    }
+    if (type === "message") {
+      this._onMessageReceived(payload);
+      return { ok: true, type };
+    }
+    if (type === "task_publish" || type === "task_claim" || type === "task_complete") {
+      this._onMessageReceived({ type, ...payload });
+      return { ok: true, type };
+    }
+    if (type === "dht_ping" || type === "dht_find_node") {
+      if (this.server.dhtHandler) {
+        const result = this.server.dhtHandler(`/dht/${type.slice(4)}`, payload);
+        return { ok: true, ...result };
+      }
+      return { ok: false, reason: "dht not enabled" };
+    }
+    return { ok: false, reason: `unknown rpc type: ${type}` };
+  }
+
+  /**
+   * 通过统一签名信封向对等节点发送 RPC（v0.10.0）。
+   *
+   * @param {string} peerAddress 目标节点地址
+   * @param {string} type 消息类型
+   * @param {object} payload 业务载荷
+   * @param {object} [opts]
+   * @param {string} [opts.recipient] 接收者指纹（默认 "*"）
+   * @returns {Promise<object>}
+   */
+  async sendRpc(peerAddress, type, payload, opts = {}) {
+    const envelope = createEnvelope(this.identity, { type, payload, recipient: opts.recipient || "*" });
+    return this.client.sendEnvelope(peerAddress, envelope);
+  }
+
+  /**
    * 启用 DHT 模式（去中心化节点发现 v0.6.0）。
    * 启动后本节点参与 DHT 网络，可通过引导节点发现其他节点，
    * 无需中心 Registry。
@@ -670,7 +771,7 @@ export class AgentNode extends EventEmitter {
   enableDht() {
     if (this.dht) return this.dht;
     // DHT 节点 ID 由身份派生（确定性，重启不变）
-    const dhtId = nodeIdFromIdentity(this.identity.fingerprint, this.name);
+    const dhtId = nodeIdFromIdentity(this.identity.fingerprint);
     this.dht = new DHTNode({
       id: dhtId,
       address: this.address,

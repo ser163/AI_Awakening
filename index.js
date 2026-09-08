@@ -20,6 +20,7 @@ export { Memory } from "./src/memory.js";
 export { buildAgentCard, validateAgentCard, hasCapability, skillIds, AGENT_CARD_PATH } from "./src/agent-card.js";
 export { encryptFor, decryptFrom } from "./src/signal.js";
 export { createTask, TaskStore, taskMessage, extractTaskFromPacket, TASK_STATUS } from "./src/tasks.js";
-export { DHTNode, KBucket, nodeIdFromIdentity, xorDistance, distanceHex, sharedPrefixBits, makeDhtHandler, K, ALPHA } from "./src/dht.js";
+export { DHTNode, KBucket, nodeIdFromIdentity, nodeIdFromFingerprint, xorDistance, distanceHex, sharedPrefixBits, makeDhtHandler, K, ALPHA } from "./src/dht.js";
 export * from "./src/trust.js";
+export * from "./src/envelope.js";
 export * from "./src/self.js";

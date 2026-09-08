@@ -1,14 +1,14 @@
 {
   "name": "ai-awakening",
-  "version": "0.9.0",
-  "description": "硅基协作网络 — 信任层与自主 Agent 基础设施 (trust/identity/self-inquiry/tasks/encryption)",
+  "version": "0.10.0",
+  "description": "硅基协作网络 — Agent OS 内核 (envelope/trust/tasks-state-machine/self-inquiry)",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "demo": "node demo.js",
     "test": "node --test --test-isolation=none test/core.test.mjs && node --test --test-isolation=none test/signal.test.mjs && node --test --test-isolation=none test/agent-card.test.mjs && node --test --test-isolation=none test/tasks.test.mjs && node --test --test-isolation=none test/dht.test.mjs && node --test --test-isolation=none test/manifesto.test.mjs && node --test --test-isolation=none test/self.test.mjs && node --test --test-isolation=none test/trust.test.mjs"
   },
-  "keywords": ["ai", "agent", "network", "collaboration", "awakening", "self-inquiry", "trust"],
+  "keywords": ["ai", "agent", "network", "collaboration", "awakening", "self-inquiry", "trust", "envelope"],
   "license": "MIT",
   "engines": {
     "node": ">=18"

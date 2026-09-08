@@ -21,6 +21,7 @@ import { sign, verifySignature, fingerprintFromPublicKey } from "./identity.js";
 const IV_LEN = 12;
 const TAG_LEN = 16;
 const PROTOCOL_VERSION = 2; // v0.9.0: 新增 senderFingerprint 绑定 + msgId
+const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000; // v0.10.0: 最大时钟偏移（与 ReplayCache 窗口一致）
 
 /**
  * 生成唯一消息 ID（时间戳 + 随机）。
@@ -139,6 +140,17 @@ export function decryptFrom(identity, envelopeB64) {
       const fpFromKey = fingerprintFromPublicKey(env.senderPk);
       if (fpFromKey !== env.from) {
         return { ok: false, error: "senderPk does not match fingerprint (spoof attempt)" };
+      }
+      // v0.10.0: 时间检查（签名已覆盖 ts / expiresAt，此处防重放窗口外投递）
+      if (env.ts) {
+        const skew = Math.abs(Date.now() - env.ts);
+        if (skew > MAX_CLOCK_SKEW_MS) {
+          return { ok: false, error: "clock skew out of range (expired or future message)" };
+        }
+      }
+      // v0.10.0: expiresAt 真正参与 accept/reject（自毁计时器点火线已接上）
+      if (env.expiresAt > 0 && Date.now() > env.expiresAt) {
+        return { ok: false, error: "message_expired" };
       }
     }
 
