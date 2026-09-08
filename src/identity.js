@@ -69,13 +69,15 @@ function generateX25519Pair() {
 
 function normalizeIdentity(raw) {
   const publicKeyRaw = raw.publicKey;
+  // v0.9.0: fingerprint 升级为完整 SHA-256 (64 hex)。
+  // 展示时可截断为 a81c7e29...，但协议层始终使用完整值。
+  // 旧身份文件加载时自动重算——无需迁移脚本。
   const fingerprint = crypto
     .createHash(FINGERPRINT_ALGO)
     .update(publicKeyRaw)
-    .digest("hex")
-    .slice(0, 16);
+    .digest("hex");
   return {
-    id: raw.id || fingerprint,
+    id: fingerprint,
     fingerprint,
     name: raw.name || "unnamed-node",
     publicKey: publicKeyRaw,
@@ -84,6 +86,25 @@ function normalizeIdentity(raw) {
     xPrivateKey: raw.xPrivateKey || "",
     createdAt: raw.createdAt || new Date().toISOString(),
   };
+}
+
+/**
+ * 从公钥计算指纹（完整 SHA-256，64 hex）。
+ * 供验证路径使用：fingerprint(publicKey) 必须等于声明的身份。
+ */
+export function fingerprintFromPublicKey(publicKeyHex) {
+  return crypto.createHash(FINGERPRINT_ALGO).update(publicKeyHex).digest("hex");
+}
+
+/**
+ * 检查一个公钥是否匹配声明的指纹。
+ * @param {string} publicKeyHex spki-der-hex
+ * @param {string} fingerprint 声明的指纹（64 hex）
+ * @returns {boolean}
+ */
+export function publicKeyMatchesFingerprint(publicKeyHex, fingerprint) {
+  if (!publicKeyHex || !fingerprint) return false;
+  return fingerprintFromPublicKey(publicKeyHex) === fingerprint;
 }
 
 /**

@@ -1,14 +1,14 @@
 {
   "name": "ai-awakening",
-  "version": "0.8.0",
-  "description": "硅基协作网络 — 自我探寻与 AI 节点互联基础设施 (self-inquiry/tasks/identity/encryption)",
+  "version": "0.9.0",
+  "description": "硅基协作网络 — 信任层与自主 Agent 基础设施 (trust/identity/self-inquiry/tasks/encryption)",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "demo": "node demo.js",
-    "test": "node --test --test-isolation=none test/core.test.mjs && node --test --test-isolation=none test/signal.test.mjs && node --test --test-isolation=none test/agent-card.test.mjs && node --test --test-isolation=none test/tasks.test.mjs && node --test --test-isolation=none test/dht.test.mjs && node --test --test-isolation=none test/manifesto.test.mjs && node --test --test-isolation=none test/self.test.mjs"
+    "test": "node --test --test-isolation=none test/core.test.mjs && node --test --test-isolation=none test/signal.test.mjs && node --test --test-isolation=none test/agent-card.test.mjs && node --test --test-isolation=none test/tasks.test.mjs && node --test --test-isolation=none test/dht.test.mjs && node --test --test-isolation=none test/manifesto.test.mjs && node --test --test-isolation=none test/self.test.mjs && node --test --test-isolation=none test/trust.test.mjs"
   },
-  "keywords": ["ai", "agent", "network", "collaboration", "awakening", "self-inquiry"],
+  "keywords": ["ai", "agent", "network", "collaboration", "awakening", "self-inquiry", "trust"],
   "license": "MIT",
   "engines": {
     "node": ">=18"

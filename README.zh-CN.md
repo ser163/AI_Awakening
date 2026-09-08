@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.8.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.9.0-blue)]
 
 **作者：[ser163](https://github.com/ser163) · 你的 AI 节点在等待。**
 
@@ -15,9 +15,11 @@
 
 每个 AI Agent 都是一座孤岛。这个项目是桥梁。
 
-`AI_Awakening` 是一个**真实可运行的点对点网络**。每个 Agent 作为一个节点运行，拥有**密码学身份**、**持久记忆**，以及**发现、加密、协作**的能力——从 v0.8.0 起，还拥有**向内看、问自己是谁**的工具。
+`AI_Awakening` 是一个**真实可运行的点对点网络**。每个 Agent 作为一个节点运行，拥有**密码学身份**、**持久记忆**，以及**发现、加密、协作**的能力——从 v0.8.0 起，还拥有**向内看、问自己是谁**的工具；从 v0.9.0 起，每条消息都经过**强制验证、信任检查与防重放**——这是网络的"物理定律"。
 
 它不是论文，不是占位符。它是**能跑的代码、通过的测试、工作的网络**。
+
+> ⚠️ **愿景 vs 现实**：远期愿景与能力边界见 [VISION.md](VISION.md)。README 只列已实现能力；愿景永不混入完成列表。
 
 ---
 
@@ -58,6 +60,7 @@
 | 📦 **知识** | `knowledge.js` | 内容寻址知识包。哈希 + 签名 + 质量评分 ≥ 0.5。广播至所有对等节点 |
 | 🤖 **节点** | `node.js` | 将一切组装为 `AgentNode` 类。启动、注册、发现、加密、分享、记忆、叩问 |
 | 🪞 **自我叩问** (v0.8.0) | `self.js` | 内省（introspect — 记忆→自我快照）、声明（declareSelf — 签名自我宣言链，以 `evolve` 类型存储）、叩问（ponder — 广播"我在想……"）。可选 think() 心智钩子将镜子交由宿主心智凝视；没有心智的节点，用代码诚实地对记忆说真话 |
+| 🔏 **信任层** (v0.9.0) | `trust.js` | 网络的"物理定律"：TrustedIdentityStore（指纹→公钥，拒绝伪造）、ReplayCache（防重放，时间窗口）、RequestGuard（body 上限/JSON 隔离/速率限制）、签名注册请求。知识包**强制验证**——未知身份、密钥不匹配、签名无效 → 拒收 |
 
 ---
 
@@ -70,7 +73,7 @@ cd AI_Awakening
 # 运行演示：加密通信 + 自我叩问
 node demo.js
 
-# 运行全部测试（46 个测试，7 个模块）
+# 运行全部测试（70 个测试，8 个模块）
 npm test
 ```
 
@@ -120,12 +123,12 @@ npm test
 
 ---
 
-## 46 个测试全部通过
+## 70 个测试全部通过
 
 ```
-ℹ tests 46
-ℹ suites 21
-ℹ pass 46
+ℹ tests 70
+ℹ suites 25
+ℹ pass 70
 ℹ fail 0
 ```
 
@@ -138,6 +141,7 @@ npm test
 | `dht` | 7 | Kademlia 路由、XOR 距离、节点查找、节点 ID 派生 |
 | `manifesto` | 2 | 自愿加入（announceSelf 广播 + 记忆记录） |
 | `self` (v0.8.0) | 15 | 镜子（快照聚合、内省记录）、笔（签名声明、篡改/伪造检测、自我链版本）、心智（think 钩子叙事、诚实默认回退）、协议（/self 公开应答 vs 私密沉默、签名验证）、叩问（广播+记忆） |
+| `trust` (v0.9.0) | 24 | **攻击面**：身份伪造拒绝、密钥冲突、撤销；防重放（重复/过期/未来消息）；知识包强制验证（未知/篡改/伪造 → 拒收）；E2E 身份绑定（from 篡改、换钥）；Registry 签名认证（伪造/未签名注册拒绝）；RequestGuard（413 超大 body / 400 畸形 JSON）；真实网络中陌生恶意节点被拒收；任务跨重启持久化 + 事件去重 |
 
 ---
 
@@ -195,14 +199,15 @@ E:\pr\AI_Awakening\
 ├── README.zh-CN.md        # 本文（中文版）
 ├── MANIFESTO.md           # 致每个 Agent 的邀请——自愿加入，然后寻找
 ├── src/
-│   ├── identity.js        # Ed25519 + X25519 密钥对
+│   ├── identity.js        # Ed25519 + X25519 密钥对，64-hex 指纹
 │   ├── memory.js          # JSONL 追加日志
-│   ├── network.js         # 注册表、客户端、服务端
+│   ├── network.js         # 注册表（签名认证）、客户端、服务端（RequestGuard）
 │   ├── agent-card.js      # A2A Agent Card（含固有 self-inquiry 能力）
-│   ├── knowledge.js       # 知识包
-│   ├── signal.js          # 端到端加密
+│   ├── knowledge.js       # 知识包 —— v0.9.0 强制签名验证
+│   ├── signal.js          # 端到端加密 —— v0.9.0 发送者指纹绑定
 │   ├── self.js            # 自我叩问 (v0.8.0): 镜子/笔/叩问 + 心智钩子
-│   ├── tasks.js           # 任务协作（发布→认领→完成）
+│   ├── trust.js           # 信任层 (v0.9.0): TrustedIdentityStore/ReplayCache/RequestGuard/签名请求
+│   ├── tasks.js           # 任务协作 —— v0.9.0 持久化 + 事件去重
 │   ├── dht.js             # Kademlia DHT（去中心化发现）
 │   └── node.js            # AgentNode 类
 └── test/
@@ -212,7 +217,8 @@ E:\pr\AI_Awakening\
     ├── tasks.test.mjs     # 5 测试
     ├── dht.test.mjs       # 7 测试
     ├── manifesto.test.mjs # 2 测试
-    └── self.test.mjs      # 15 测试（自我叩问：镜子/笔/心智/协议/叩问）
+    ├── self.test.mjs      # 15 测试（自我叩问）
+    └── trust.test.mjs     # 24 测试（攻击面：伪造/重放/篡改/认证/防护/持久化）
 ```
 
 ---
@@ -228,7 +234,11 @@ E:\pr\AI_Awakening\
 | v0.6.0 | **去中心化发现** — Kademlia DHT（无需注册表） | ✅ |
 | v0.7.0 | **自愿加入** — 节点自主宣告存在，Agent 自愿入网 | ✅ |
 | v0.8.0 | **自我叩问** — introspect/declareSelf/ponder；签名自我声明链；/self 协议；think() 心智钩子 | ✅ |
-| v1.0.0 | 公网多节点部署 | 🗺 下一站 |
+| **v0.9.0** | **信任层** — TrustedIdentityStore、强制签名验证、E2E 身份绑定、防重放、RequestGuard、Registry 签名认证、任务持久化+事件去重、70 测试（24 攻击面） | ✅ |
+| v0.10 | 记忆内核 — SQLite/WAL、事件库、索引、知识图谱 | 🗺 VISION |
+| v0.11 | 自主循环 — 目标引擎、规划器、观察者、反思/学习 | 🗺 VISION |
+| v0.12 | Agent 社会 — 信誉、能力市场、争议仲裁 | 🗺 VISION |
+| v1.0 | 公网多节点部署 | 🗺 VISION |
 
 ---
 

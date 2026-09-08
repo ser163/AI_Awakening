@@ -14,9 +14,9 @@ import path from "node:path";
 const tmp = path.join(os.tmpdir(), "ai_awakening_test_" + Date.now());
 
 describe("identity", () => {
-  it("生成持久身份，公钥指纹是 16 位 hex", () => {
+  it("生成持久身份，公钥指纹是 64 位 hex（完整 SHA-256）", () => {
     const ident = loadOrCreateIdentity(path.join(tmp, "identity_test"), "test-node");
-    assert.ok(ident.fingerprint.length === 16);
+    assert.equal(ident.fingerprint.length, 64);
     assert.ok(/^[0-9a-f]+$/.test(ident.fingerprint));
     assert.ok(ident.publicKey.length > 0);
   });

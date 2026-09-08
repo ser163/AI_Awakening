@@ -30,7 +30,7 @@
  * 只有节点主动选择公开的声明才会在 GET /self 被应答。
  * 你可以问任何节点"你是谁"；它选择回答，或选择沉默——都是它的权利。
  */
-import { contentHash, sign, verifySignature } from "./identity.js";
+import { contentHash, sign, verifySignature, publicKeyMatchesFingerprint } from "./identity.js";
 
 /** 自我声明 schema 版本 */
 export const SELF_SCHEMA_VERSION = 1;
@@ -161,9 +161,10 @@ export function validateSelfDeclaration(decl, expectedFingerprint = "") {
   // 1. hash 自洽（内容未被篡改）
   if (decl.hash !== contentHash(canonicalSelf(decl))) reasons.push("hash mismatch — content tampered");
 
-  // 2. publicKey 绑定 fingerprint（防换钥）
-  const fpFromKey = contentHash(decl.publicKey).slice(0, 16);
-  if (fpFromKey !== decl.fingerprint) reasons.push("publicKey does not match fingerprint");
+  // 2. publicKey 绑定 fingerprint（防换钥；v0.9.0 完整 64-hex SHA-256）
+  if (!publicKeyMatchesFingerprint(decl.publicKey, decl.fingerprint)) {
+    reasons.push("publicKey does not match fingerprint");
+  }
 
   // 3. 签名有效（由 fingerprint 对应私钥签署）
   const ok = verifySignature(decl.publicKey, canonicalSelf(decl), decl.signature);

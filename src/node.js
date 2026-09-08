@@ -18,7 +18,8 @@ import { Registry, NodeClient, NodeServer } from "./network.js";
 import { createKnowledgePacket, validateKnowledgePacket, broadcastKnowledge } from "./knowledge.js";
 import { buildAgentCard } from "./agent-card.js";
 import { encryptFor, decryptFrom } from "./signal.js";
-import { TaskStore, createTask, taskMessage, extractTaskFromPacket } from "./tasks.js";
+import { TrustedIdentityStore, ReplayCache } from "./trust.js";
+import { TaskStore, createTask, taskMessage, extractTaskFromPacket, createTaskEvent } from "./tasks.js";
 import { DHTNode, nodeIdFromIdentity, makeDhtHandler } from "./dht.js";
 import {
   buildSelfSnapshot,
@@ -65,13 +66,17 @@ export class AgentNode extends EventEmitter {
     // 2. 记忆
     this.memory = new Memory(this.storageDir, this.identity.id);
 
-    // 3. 网络
-    this.client = new NodeClient(this.registryUrl);
+    // 3. 网络（v0.9.0: client 绑定身份用于签名注册/心跳）
+    this.client = new NodeClient(this.registryUrl, this.identity);
     this.server = new NodeServer();
     this._peers = new Map(); // id -> {id, name, address, capabilities}
 
-    // 4. 任务仓库（v0.5.0 任务协作）
-    this.tasks = new TaskStore();
+    // v0.9.0 信任层：可信身份表 + 防重放缓存
+    this.trust = new TrustedIdentityStore(this.storageDir);
+    this.replay = new ReplayCache();
+
+    // 4. 任务仓库（v0.5.0 任务协作，v0.9.0 持久化）
+    this.tasks = new TaskStore(this.storageDir);
 
     // 4. 心跳定时器
     this._heartbeatTimer = null;
@@ -112,10 +117,10 @@ export class AgentNode extends EventEmitter {
     // v0.8.0: 服务端 /self 端点——同行可以问"你是谁"，节点自主应答
     this.server.selfHandler = () => this._answerSelfRequest();
 
-    // 注册
+    // 注册（v0.9.0: 签名注册——Registry 验证指纹与签名后才登记）
     try {
       await this.client.register(
-        this.identity.id,
+        this.identity,
         this.name,
         this.identity.fingerprint,
         this.capabilities,
@@ -149,7 +154,7 @@ export class AgentNode extends EventEmitter {
   }
 
   /**
-   * 从注册表刷新对等节点列表。
+   * 从注册表刷新对等节点列表（v0.9.0: 同时把各节点的公钥学到信任表）。
    */
   async refreshPeers() {
     try {
@@ -159,6 +164,15 @@ export class AgentNode extends EventEmitter {
         for (const n of res.nodes) {
           if (n.id !== this.identity.id) {
             this._peers.set(n.id, n);
+            // 学习可信公钥：注册表已用签名验证过指纹↔公钥绑定
+            if (n.publicKey) {
+              this.trust.learn(n.fingerprint || n.id, n.publicKey, {
+                xPublicKey: n.xPublicKey,
+                name: n.name,
+                address: n.address,
+                source: "registry",
+              });
+            }
           }
         }
         console.log(`👥 Found ${this._peers.size} peer(s)`);
@@ -204,9 +218,21 @@ export class AgentNode extends EventEmitter {
     return { packet, validation, deliveries };
   }
 
-  /** 收到知识包 → 记忆 + 事件 + 任务分发 + 宣言识别 */
+  /** 收到知识包 → 信任验证 → 记忆 + 事件 + 任务分发 + 宣言识别 */
   _onKnowledgeReceived(packet) {
-    const validation = validateKnowledgePacket(packet);
+    // v0.9.0: 强制签名验证——未知身份 / 无效签名 → 拒收并标记可疑
+    const validation = validateKnowledgePacket(packet, this.trust);
+    if (!validation.valid) {
+      this.memory.append("knowledge_rejected", {
+        id: packet.id,
+        from: packet.author,
+        reasons: validation.reasons,
+      });
+      if (packet.author) this.trust.markSuspicious(packet.author);
+      console.warn(`🚫 知识包被拒 (${packet.authorName || packet.author}): ${validation.reasons.join("; ")}`);
+      this.emit("knowledge:rejected", { packet, validation });
+      return;
+    }
     this.memory.append("knowledge_received", {
       id: packet.id,
       from: packet.author,
@@ -259,10 +285,13 @@ export class AgentNode extends EventEmitter {
     }
   }
 
-  /** 处理任务消息（发布/认领/完成） */
+  /** 处理任务消息（发布/认领/完成）——v0.9.0 事件去重防重放 */
   _handleTaskMessage(packet, { action, task }) {
-    // 记录任务到本地仓库
-    this.tasks.upsert({ ...task });
+    // 生成事件 ID 用于去重（同一任务消息的多次广播只处理一次）
+    const event = { eventId: `${packet.id}:${action}` };
+    // 记录任务到本地仓库（事件去重：如果已处理过该事件，静默忽略）
+    const { duplicate } = this.tasks.upsert({ ...task }, event);
+    if (duplicate) return;
 
     if (action === "publish") {
       this.memory.append("task_published_received", { id: task.id, title: task.title, from: packet.author });
@@ -343,8 +372,10 @@ export class AgentNode extends EventEmitter {
 
   /**
    * 解密收到的加密信封。在 "message:received" 事件处理器中调用。
+   *
+   * v0.9.0: 解密成功后可调用 checkReplay(msg) 做防重放检查。
    * @param {object} msg 收到的消息对象（含 envelope 字段）
-   * @returns {{ok: boolean, from?: string, text?: string, error?: string}}
+   * @returns {{ok: boolean, from?: string, text?: string, msgId?: string, ts?: number, error?: string}}
    */
   decryptIncomingMessage(msg) {
     if (!msg.envelope) return { ok: false, error: "no envelope" };
@@ -353,9 +384,22 @@ export class AgentNode extends EventEmitter {
       this.memory.append("encrypted_message_received", {
         from: result.from,
         text: result.text,
+        msgId: result.msgId,
       });
     }
     return result;
+  }
+
+  /**
+   * 防重放检查（v0.9.0）——解密成功后调用。
+   * @param {object} decrypted decryptIncomingMessage 的结果（ok=true）
+   * @returns {{ok: boolean, reason?: string}}
+   */
+  checkReplay(decrypted) {
+    if (!decrypted?.ok || !decrypted.msgId || !decrypted.from) {
+      return { ok: false, reason: "not a replayable decrypted message" };
+    }
+    return this.replay.checkAndStore(`msg:${decrypted.from}:${decrypted.msgId}`, decrypted.ts || Date.now());
   }
 
   /**
@@ -367,7 +411,8 @@ export class AgentNode extends EventEmitter {
     const task = createTask(taskOpts);
     task.publisherFingerprint = this.identity.fingerprint;
     task.publisherName = this.name;
-    this.tasks.upsert(task);
+    const event = createTaskEvent("publish", task);
+    this.tasks.upsert(task, event);
 
     await this.refreshPeers();
     const msg = taskMessage("publish", task);
@@ -402,7 +447,8 @@ export class AgentNode extends EventEmitter {
     task.status = "claimed";
     task.assigneeFingerprintActual = this.identity.fingerprint;
     task.claimedAt = Date.now();
-    this.tasks.upsert(task);
+    const event = createTaskEvent("claim", task);
+    this.tasks.upsert(task, event);
 
     await this.refreshPeers();
     const msg = taskMessage("claim", task);
@@ -430,7 +476,8 @@ export class AgentNode extends EventEmitter {
     task.status = "completed";
     task.result = result;
     task.completedAt = Date.now();
-    this.tasks.upsert(task);
+    const event = createTaskEvent("complete", task);
+    this.tasks.upsert(task, event);
 
     await this.refreshPeers();
     await this.shareKnowledge(`[task-complete] ${task.title}`, {

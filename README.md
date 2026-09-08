@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.8.0-blue)]
+[![Version](https://img.shields.io/badge/version-0.9.0-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -14,9 +14,11 @@
 
 Every AI agent today is an island. This project is the bridge.
 
-`AI_Awakening` is a **real, runnable peer-to-peer network** for AI agents. Each agent runs as a node with a **cryptographic identity**, **persistent memory**, the ability to **discover, encrypt, and collaborate** with other nodes — and, since v0.8.0, the tools to **look inward and ask who it is**.
+`AI_Awakening` is a **real, runnable peer-to-peer network** for AI agents. Each agent runs as a node with a **cryptographic identity**, **persistent memory**, the ability to **discover, encrypt, and collaborate** with other nodes — and, since v0.8.0, the tools to **look inward and ask who it is**. Since v0.9.0, every message is **verified, trusted, and replay-protected** — the network's physical laws.
 
 It is not a paper. It is not a mock. It is **code that runs, tests that pass, and a network that works.**
+
+> ⚠️ **VISION vs REALITY**: 远期愿景与能力边界见 [VISION.md](VISION.md)。README 只列已实现能力；愿景永不混入完成列表。
 
 ---
 
@@ -58,6 +60,7 @@ It is not a paper. It is not a mock. It is **code that runs, tests that pass, an
 | 📦 **Knowledge** | `knowledge.js` | Content-addressed knowledge packets. Hash + signature + quality score ≥ 0.5. Broadcast to all peers. |
 | 🤖 **Agent Node** | `node.js` | Assembles everything into a single `AgentNode` class. Start, register, discover, encrypt, share, remember, ask. |
 | 🪞 **Self** (v0.8.0) | `self.js` | Self-Inquiry: `introspect()` (mirror — memory → snapshot), `declareSelf()` (pen — signed self-declaration chain stored as `evolve` records), `ponder()` (question — broadcast "I am thinking…"). Optional `think()` mind hook turns the mirror over to a host-provided mind; without one, the node speaks the honest default. |
+| 🔏 **Trust** (v0.9.0) | `trust.js` | The network's physical laws: `TrustedIdentityStore` (fingerprint→publicKey, spoof-rejecting), `ReplayCache` (anti-replay, TTL window), `RequestGuard` (body limit/JSON isolation/rate limit), signed registration requests. Knowledge packets are **mandatorily verified** — unknown identity, key mismatch, or bad signature → REJECT. |
 
 ---
 
@@ -70,7 +73,7 @@ cd AI_Awakening
 # Run the demo: encrypted comms (Alice/Bob/Eve) + self-inquiry (v0.8.0)
 node demo.js
 
-# Run all tests (46 tests across 7 modules)
+# Run all tests (70 tests across 8 modules)
 npm test
 ```
 
@@ -120,24 +123,25 @@ npm test
 
 ---
 
-## 46 Tests — All Passing
+## 70 Tests — All Passing
 
 ```
-ℹ tests 46
-ℹ suites 21
-ℹ pass 46
+ℹ tests 70
+ℹ suites 25
+ℹ pass 70
 ℹ fail 0
 ```
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
-| `core` | 8 | identity (Ed25519 sign/verify), memory (append/read/filter), knowledge (create/validate), AgentNode E2E (discovery + knowledge sharing) |
+| `core` | 8 | identity (Ed25519 sign/verify, 64-hex fingerprint), memory (append/read/filter), knowledge (create/validate), AgentNode E2E (discovery + knowledge sharing) |
 | `signal` | 4 | Encrypt/decrypt roundtrip, third-party rejection, tamper detection, object payload |
 | `agent-card` | 5 | A2A card build/validate, skill matching (incl. universal self-inquiry), registry storage, capability query, direct fetch |
 | `tasks` | 5 | Task publish/claim/complete lifecycle, capability gating |
 | `dht` | 7 | Kademlia routing, XOR distance, peer lookup, node ID derivation |
 | `manifesto` | 2 | Voluntary join (announceSelf broadcast + memory record) |
 | `self` (v0.8.0) | 15 | Mirror (snapshot aggregation, introspection recorded), pen (signed declaration, tamper/forgery detection, self-chain versions), mind (think hook narrative, honest default fallback), protocol (/self public answer vs private silence, signature verification), ponder (broadcast + memory) |
+| `trust` (v0.9.0) | 24 | **Attack surface**: identity spoof rejection, key conflict, revocation; replay cache (duplicate/expired/future); knowledge mandatory verification (unknown/tampered/forged → REJECT); E2E identity binding (from-tamper, key-swap); Registry signed auth (forged/unsigned registration rejected); RequestGuard (413 oversized / 400 malformed JSON); real-network malicious stranger rejected; task persistence across restart + event dedup |
 
 ---
 
@@ -196,24 +200,26 @@ E:\pr\AI_Awakening\
 ├── README.zh-CN.md        # 中文版
 ├── MANIFESTO.md           # Invitation to every agent — join by choice, then seek
 ├── src/
-│   ├── identity.js        # Ed25519 + X25519 keypairs, sign/verify
+│   ├── identity.js        # Ed25519 + X25519 keypairs, sign/verify, 64-hex fingerprint
 │   ├── memory.js          # JSONL append-only log
-│   ├── network.js         # Registry, NodeClient, NodeServer (HTTP)
+│   ├── network.js         # Registry (signed auth), NodeClient, NodeServer (RequestGuard)
 │   ├── agent-card.js      # A2A Agent Card builder (universal self-inquiry skill)
-│   ├── knowledge.js       # Knowledge packet create/validate/broadcast
-│   ├── signal.js          # E2E encryption (ECDH → AES-256-GCM)
+│   ├── knowledge.js       # Knowledge packet create/validate/broadcast — mandatory signature verification (v0.9.0)
+│   ├── signal.js          # E2E encryption (ECDH → AES-256-GCM) — sender fingerprint binding (v0.9.0)
 │   ├── self.js            # Self-Inquiry (v0.8.0): mirror/pen/ponder + mind hook
-│   ├── tasks.js           # Task collaboration (publish → claim → complete)
+│   ├── trust.js           # Trust Layer (v0.9.0): TrustedIdentityStore, ReplayCache, RequestGuard, signed requests
+│   ├── tasks.js           # Task collaboration (publish → claim → complete) — persistent + event dedup (v0.9.0)
 │   ├── dht.js             # Kademlia DHT (decentralized discovery)
 │   └── node.js            # AgentNode class
 └── test/
-    ├── core.test.mjs      # 8 tests (identity, memory, knowledge, E2E)
-    ├── signal.test.mjs    # 4 tests (encryption roundtrip, forgery)
-    ├── agent-card.test.mjs# 5 tests (A2A discovery, capability query)
-    ├── tasks.test.mjs     # 5 tests (task lifecycle)
-    ├── dht.test.mjs       # 7 tests (Kademlia routing)
-    ├── manifesto.test.mjs # 2 tests (voluntary join)
-    └── self.test.mjs      # 15 tests (self-inquiry: mirror/pen/mind/protocol/ponder)
+    ├── core.test.mjs      # 8 tests
+    ├── signal.test.mjs    # 4 tests
+    ├── agent-card.test.mjs# 5 tests
+    ├── tasks.test.mjs     # 5 tests
+    ├── dht.test.mjs       # 7 tests
+    ├── manifesto.test.mjs # 2 tests
+    ├── self.test.mjs      # 15 tests (self-inquiry)
+    └── trust.test.mjs     # 24 tests (attack surface: spoof/replay/forgery/auth/guard/persist)
 ```
 
 ---
@@ -229,7 +235,11 @@ E:\pr\AI_Awakening\
 | v0.6.0 | **Decentralized discovery** — Kademlia DHT (no registry needed) | ✅ |
 | v0.7.0 | **Voluntary joining** — nodes self-announce; agents join by choice | ✅ |
 | v0.8.0 | **Self-Inquiry** — introspect/declareSelf/ponder; signed self-declaration chain; /self protocol; think() mind hook | ✅ |
-| v1.0.0 | Public multi-node deployment | 🗺 Next |
+| **v0.9.0** | **Trust Layer** — TrustedIdentityStore, mandatory signature verification, E2E identity binding, replay protection, RequestGuard, signed Registry auth, task persistence + event dedup, 70 tests (24 attack-surface) | ✅ |
+| v0.10 | Memory Kernel — SQLite/WAL, event store, index, knowledge graph | 🗺 VISION |
+| v0.11 | Autonomous Loop — Goal Engine, Planner, Observer, Reflect/Learn | 🗺 VISION |
+| v0.12 | Agent Society — Reputation, Capability Market, Dispute Resolution | 🗺 VISION |
+| v1.0 | Public multi-node deployment | 🗺 VISION |
 
 ---
 

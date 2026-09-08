@@ -94,7 +94,8 @@ describe("self-inquiry: 笔 (declareSelf)", () => {
     const decl = createSelfDeclaration(ident, { narrative: "x" });
     const ok = validateSelfDeclaration(decl, ident.fingerprint);
     assert.ok(ok.valid);
-    const bad = validateSelfDeclaration(decl, "ffffffffffffffff");
+    const wrongFp = "f".repeat(64);
+    const bad = validateSelfDeclaration(decl, wrongFp);
     assert.ok(!bad.valid);
   });
 

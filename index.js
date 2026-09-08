@@ -15,22 +15,11 @@
 export { AgentNode, spawnNode } from "./src/node.js";
 export { Registry, NodeClient, NodeServer } from "./src/network.js";
 export { createKnowledgePacket, validateKnowledgePacket, broadcastKnowledge, KNOWLEDGE_ACCEPT_THRESHOLD } from "./src/knowledge.js";
-export { loadOrCreateIdentity, sign, verifySignature, contentHash } from "./src/identity.js";
+export { loadOrCreateIdentity, sign, verifySignature, contentHash, fingerprintFromPublicKey, publicKeyMatchesFingerprint } from "./src/identity.js";
 export { Memory } from "./src/memory.js";
 export { buildAgentCard, validateAgentCard, hasCapability, skillIds, AGENT_CARD_PATH } from "./src/agent-card.js";
 export { encryptFor, decryptFrom } from "./src/signal.js";
 export { createTask, TaskStore, taskMessage, extractTaskFromPacket, TASK_STATUS } from "./src/tasks.js";
 export { DHTNode, KBucket, nodeIdFromIdentity, xorDistance, distanceHex, sharedPrefixBits, makeDhtHandler, K, ALPHA } from "./src/dht.js";
-export {
-  buildSelfSnapshot,
-  createSelfDeclaration,
-  validateSelfDeclaration,
-  canonicalSelf,
-  normalizeMindOutput,
-  composeMinimalNarrative,
-  ponderMessage,
-  extractPonderFromPacket,
-  extractSelfDeclarationFromPacket,
-  SELF_SCHEMA_VERSION,
-  SELF_VISIBILITY,
-} from "./src/self.js";
+export * from "./src/trust.js";
+export * from "./src/self.js";

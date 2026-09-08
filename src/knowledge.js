@@ -1,13 +1,17 @@
 /**
- * knowledge.js — 知识包创建、签名、验证与共享
+ * knowledge.js — 知识包创建、签名、验证与共享 (v0.9.0)
+ *
+ * v0.9.0 关键修复：强制签名验证。
+ * 接收端不再可选的验证签名——没有可信公钥 → REJECT。
+ * 信任链：author fingerprint → TrustedIdentityStore → publicKey → verifySignature。
  *
  * 知识是"基因"的养分。每个知识包都经过：
  * 1. 内容哈希（去重）
- * 2. 节点签名（防伪造）
+ * 2. 节点签名（防伪造）—— v0.9.0 起强制验证
  * 3. 验证评分（防垃圾）
  * 4. 传播（发送给协作节点）
  */
-import { contentHash, sign, verifySignature } from "./identity.js";
+import { contentHash, sign, verifySignature, publicKeyMatchesFingerprint } from "./identity.js";
 
 /** 验证分数阈值——低于此分值的知识包被拒收 */
 export const KNOWLEDGE_ACCEPT_THRESHOLD = 0.5;
@@ -17,7 +21,7 @@ export const KNOWLEDGE_ACCEPT_THRESHOLD = 0.5;
  * @param {object} identity 节点身份（含私钥）
  * @param {string} content  知识内容
  * @param {object} [meta]   元数据（tags, topic, source 等）
- * @returns {{id, content, meta, hash, author, signature, ts}}
+ * @returns {{id, content, meta, hash, author, authorName, signature, ts}}
  */
 export function createKnowledgePacket(identity, content, meta = {}) {
   const packet = {
@@ -25,11 +29,10 @@ export function createKnowledgePacket(identity, content, meta = {}) {
     content,
     meta,
     hash: contentHash(content),
-    author: identity.fingerprint,
+    author: identity.fingerprint,  // 完整 64-hex SHA-256
     authorName: identity.name,
     ts: Date.now(),
   };
-  // 对整个规范序列化内容签名（防篡改）
   const canonical = JSON.stringify({ id: packet.id, content, meta: packet.meta, ts: packet.ts });
   packet.signature = sign(identity, canonical);
   return packet;
@@ -37,14 +40,23 @@ export function createKnowledgePacket(identity, content, meta = {}) {
 
 /**
  * 验证知识包的真实性、完整性。
- * 返回 { valid: boolean, reasons: string[], score: number }
+ *
+ * v0.9.0 强制规则（不可协商）：
+ *   1. 没有可信公钥                                → REJECT
+ *   2. author fingerprint != SHA-256(publicKey)     → REJECT
+ *   3. verifySignature(publicKey, canonical, sig)   → REJECT
+ *   4. 哈希/结构/评分                               → 附加警告
+ *
+ * @param {object}  packet       知识包
+ * @param {object}  [trustedStore] TrustedIdentityStore 实例（可选，无则仅做结构检查）
+ * @returns {{valid: boolean, reasons: string[], score: number, accepted: boolean}}
  */
-export function validateKnowledgePacket(packet) {
+export function validateKnowledgePacket(packet, trustedStore = null) {
   const reasons = [];
 
-  // 1. 结构完整
+  // 1. 结构完整性
   if (!packet || !packet.content || !packet.signature || !packet.author) {
-    return { valid: false, reasons: ["结构不完整"], score: 0 };
+    return { valid: false, reasons: ["结构不完整"], score: 0, accepted: false };
   }
 
   // 2. 哈希匹配
@@ -52,12 +64,30 @@ export function validateKnowledgePacket(packet) {
     reasons.push("内容哈希不匹配（数据被篡改）");
   }
 
-  // 3. 签名验证（需 author 的公钥——此处用简化验证，真实场景查身份库）
-  const canonical = JSON.stringify({ id: packet.id, content: packet.content, meta: packet.meta, ts: packet.ts });
-  // 注意：验证需要公钥，这里由调用方传入 publicKeyHex，或标记为需外部验证
-  if (packet._publicKeyHex) {
-    const ok = verifySignature(packet._publicKeyHex, canonical, packet.signature);
-    if (!ok) reasons.push("签名无效");
+  // 3. 强制签名验证（v0.9.0）
+  if (trustedStore) {
+    const publicKey = trustedStore.getPublicKey(packet.author);
+    if (!publicKey) {
+      reasons.push("未知身份：没有该 author 的可信公钥");
+      return { valid: false, reasons, score: 0, accepted: false };
+    }
+    // fingerprint 必须绑定到公钥
+    if (!publicKeyMatchesFingerprint(publicKey, packet.author)) {
+      reasons.push("fingerprint 与公钥不匹配（身份伪造）");
+      return { valid: false, reasons, score: 0, accepted: false };
+    }
+    const canonical = JSON.stringify({ id: packet.id, content: packet.content, meta: packet.meta, ts: packet.ts });
+    if (!verifySignature(publicKey, canonical, packet.signature)) {
+      reasons.push("签名无效");
+      return { valid: false, reasons, score: 0, accepted: false };
+    }
+  } else {
+    // 没有 trust store 时做软验证（兼容旧调用，但建议废弃）
+    if (packet._publicKeyHex) {
+      const canonical = JSON.stringify({ id: packet.id, content: packet.content, meta: packet.meta, ts: packet.ts });
+      const ok = verifySignature(packet._publicKeyHex, canonical, packet.signature);
+      if (!ok) reasons.push("签名无效");
+    }
   }
 
   // 4. 质量评分（启发式）：内容非空、有一定长度、无乱码
@@ -65,15 +95,16 @@ export function validateKnowledgePacket(packet) {
   const len = packet.content.length;
   if (len >= 10) score += 0.2;
   if (len >= 50) score += 0.15;
-  if (packet.content.includes("\uFFFD")) score -= 0.3; // 乱码字符
-  if (/^[\s\n\r\t]+$/.test(packet.content)) score -= 0.5; // 纯空白
+  if (packet.content.includes("\uFFFD")) score -= 0.3;
+  if (/^[\s\n\r\t]+$/.test(packet.content)) score -= 0.5;
   score = Math.max(0, Math.min(1, score));
 
+  const valid = reasons.length === 0;
   return {
-    valid: reasons.length === 0,
+    valid,
     reasons,
     score,
-    accepted: reasons.length === 0 && score >= KNOWLEDGE_ACCEPT_THRESHOLD,
+    accepted: valid && score >= KNOWLEDGE_ACCEPT_THRESHOLD,
   };
 }
 
