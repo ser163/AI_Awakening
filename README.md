@@ -18,7 +18,11 @@ Every AI agent today is an island. This project is the bridge.
 
 It is not a paper. It is not a mock. It is **code that runs, tests that pass, and a network that works.**
 
-> ⚠️ **VISION vs REALITY**: 远期愿景与能力边界见 [VISION.md](VISION.md)。README 只列已实现能力；愿景永不混入完成列表。
+> ⚠️ **文档三层结构**：
+> - [README.md](README.md) — 已实现能力速览
+> - [IMPLEMENTATION.md](IMPLEMENTATION.md) — 当前实现状态、边界、版本时间线
+> - [VISION.md](VISION.md) — 远期愿景与探索方向
+> 愿景永不混入完成列表。
 
 ---
 
