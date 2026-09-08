@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.1",
-  "description": "硅基协作网络 — Cognitive Kernel 认知内核 (belief/world-model/self-state/task-policy/envelope)",
+  "version": "0.12.2",
+  "description": "硅基协作网络 — Cognitive Kernel 认知内核 (belief/world-model/self-state/task-policy-engine)",
   "type": "module",
   "main": "index.js",
   "scripts": {

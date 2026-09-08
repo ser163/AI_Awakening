@@ -394,6 +394,56 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     const ev = createTaskEvent(alice, "publish", task);
     assert.equal(ev.nonce.length, 32, "16 bytes = 32 hex chars");
   });
+
+  it("v0.12.2: quorum(N) 未实现 → 显式 throw，拒绝静默降级为 any", () => {
+    // 旧字符串格式
+    const taskA = createTask({ title: "quorum 旧格式", policy: { ...TASK_POLICIES.DEFAULT, verify: "quorum(2)" } });
+    taskA.publisherFingerprint = alice.fingerprint;
+    assert.throws(
+      () => checkTransition(taskA, "verify", bob.fingerprint),
+      /unsupported policy.*quorum/,
+      "quorum(N) 必须抛错，不能降级为 any"
+    );
+    // 新结构化格式 quorum + threshold
+    const taskB = createTask({ title: "quorum 新格式", policy: { ...TASK_POLICIES.DEFAULT, verify: { authority: "quorum", threshold: 2 } } });
+    taskB.publisherFingerprint = alice.fingerprint;
+    assert.throws(
+      () => checkTransition(taskB, "verify", bob.fingerprint),
+      /unsupported policy.*quorum/,
+      "结构化 quorum 也必须抛错"
+    );
+    // 默认策略不再声明 quorum（COLLABORATIVE 的 verify 已改回 publisher——诚实 > 好看）
+    const taskC = createTask({ title: "无 quorum", policy: TASK_POLICIES.COLLABORATIVE });
+    assert.equal(taskC.policy.verify.authority, "publisher", "COLLABORATIVE 不应再伪装 quorum");
+    // 注意：verify 不在当前 TRANSITIONS 表（未实现为状态机动作），
+    // 但策略声明已写死 publisher（诚实），不宣称 quorum。
+  });
+
+  it("v0.12.2: canonicalTaskStateHash 判等覆盖全字段", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "stateHash 判等" });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", task);
+    ts.upsert(task, e1);
+
+    const bobClaim = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: bobClaim.eventHash }, bobClaim);
+
+    const aliceClaim = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    const local = ts.get(task.id);
+    local.forks = [{ headEventHash: aliceClaim.eventHash, actor: alice.fingerprint, ts: aliceClaim.ts, action: "claim" }];
+    ts.upsert(local);
+    ts.eventHistory(task.id).push(aliceClaim);
+
+    const canon = ts.canonicalizeTask(task.id);
+    assert.ok(canon);
+    // 仅 status/lastEventHash 相同但 assignee 不同 → stateHash 不同 → 必须写回
+    const before = ts.get(task.id);
+    assert.equal(before.assigneeFingerprintActual, bob.fingerprint);
+    const applied = ts.applyCanonicalState(task.id);
+    assert.ok(applied, "assignee 不同时 stateHash 判等必须触发写回");
+    assert.equal(ts.get(task.id).assigneeFingerprintActual, alice.fingerprint);
+  });
 });
 
 describe("v0.12.0: SelfState（自我从叙事升级为结构化状态）", () => {

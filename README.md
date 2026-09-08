@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.1-blue)]
+[![Version](https://img.shields.io/badge/version-0.12.2-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -298,6 +298,7 @@ E:\pr\AI_Awakening\
 | **v0.11.0** | **World Model** — Evidence→Claim→Belief 分层, 时间有效性, append-only 持久化, Task fork 检测 | ✅ |
 | **v0.12.0** | **Cognitive Kernel** — Belief 数学修复 (1−e^(−support)), 来源去重防刷票, 三维时间, claimAt 时点查询, canonicalizeTask 状态重建, SelfState | ✅ |
 | **v0.12.1** | **语义统一** — claimAt 按信念选冠军 (非证据数), deriveBeliefAt 历史时点, applyCanonicalState 写回, TaskPolicy 可配置 (fork/cancel/complete), event nonce 128-bit | ✅ |
+| **v0.12.2** | **诚实策略** — quorum 未实现→显式 throw (拒绝降级), TaskPolicyEngine 结构化 (authority/conditions/threshold), stateHash 判等, source.identity 三概念分离, epistemic state (SUPPORTED/CONTRADICTED/STALE), dominance 相对支持度, schemaVersion, persistence health | ✅ |
 | v0.10 | Memory Kernel — SQLite/WAL, event store, index, knowledge graph | 🗺 VISION |
 | v0.11 | Autonomous Loop — Goal Engine, Planner, Observer, Reflect/Learn | 🗺 VISION |
 | v0.12 | Agent Society — Reputation, Capability Market, Dispute Resolution | 🗺 VISION |

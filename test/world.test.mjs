@@ -302,6 +302,56 @@ describe("world: 时间有效性", () => {
     assert.ok(b);
     assert.equal(b.object, "Osaka");
   });
+
+  it("v0.12.2: epistemic state——SUPPORTED vs CONTRADICTED vs STALE", () => {
+    const w = new WorldModel();
+    const now = Date.now();
+    // 无冲突 → SUPPORTED
+    w.ingestEvidence({
+      subject: "agent:epist", predicate: "status", object: "alive",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+      observedAt: now, validFrom: now, validUntil: null,
+    });
+    const b1 = w.deriveBelief("agent:epist", "status");
+    assert.equal(b1.epistemicState, "SUPPORTED");
+    assert.ok(b1.dominance >= 1.0, "无冲突时 dominance 应为 1");
+
+    // 有冲突 → CONTRADICTED
+    w.ingestEvidence({
+      subject: "agent:epist", predicate: "status", object: "dead",
+      source: { type: SOURCE_TYPES.AGENT, id: "fp-other", kind: SOURCE_KINDS.ASSERTION },
+      observedAt: now, validFrom: now, validUntil: null,
+    });
+    const b2 = w.deriveBelief("agent:epist", "status");
+    assert.equal(b2.epistemicState, "CONTRADICTED");
+    // dominance = support(best) / Σsupport: self(1.0) / (1.0 + 0.8) ≈ 0.56
+    assert.ok(b2.dominance < 0.8, "矛盾时 dominance 应降低");
+    assert.ok(b2.conflicts >= 1);
+  });
+
+  it("v0.12.2: dominance 相对支持度——A=5.0 vs B=0.1 几乎不受影响，A=5.0 vs B=4.9 信心腰斩", () => {
+    const w = new WorldModel();
+    const now = Date.now();
+    // Claim A: 5 个强证据（self×5, 但同源去重只计1次——用不同 identity 模拟独立来源）
+    for (let i = 0; i < 5; i++) {
+      w.ingestEvidence({
+        subject: "agent:dom", predicate: "score", object: "A",
+        source: { type: SOURCE_TYPES.SENSOR, identity: `sensor-strong-${i}`, kind: SOURCE_KINDS.MEASUREMENT },
+        observedAt: now, validFrom: now, validUntil: null,
+      });
+    }
+    // Claim B: 弱反对（1 个 relay）
+    w.ingestEvidence({
+      subject: "agent:dom", predicate: "score", object: "B",
+      source: { type: SOURCE_TYPES.AGENT, identity: "relay-weak", kind: SOURCE_KINDS.RELAY },
+      observedAt: now, validFrom: now, validUntil: null,
+    });
+    const b = w.deriveBelief("agent:dom", "score");
+    assert.equal(b.object, "A");
+    assert.ok(b.dominance > 0.85, "A=5×sensor vs B=1×relay → dominance 应接近 0.95");
+    // 5×sensor(0.95) = 4.75, 1×relay(0.3) = 0.3 → dominance = 4.75/5.05 ≈ 0.94
+    assert.ok(b.belief > 0.8, "dominance 高时 belief 应接近无矛盾");
+  });
 });
 
 describe("world: World 是推导产物，不是 LLM 记事本", () => {

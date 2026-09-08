@@ -52,42 +52,77 @@ const TRANSITIONS = {
 };
 
 /**
- * TaskPolicy（v0.12.1）——任务的权威模型可配置，不再写死。
- * 审查指出：publisher wins 不适合所有任务（cancel 归 publisher 合理，
- * 但 complete 应归 assignee、verify 可能需要 quorum）。
- * 每项取值为 action 的授权规则：
+ * TaskPolicyEngine（v0.12.2）——任务的权威模型，结构化、可配置、拒绝假实现。
+ *
+ * 审查指出的两个核心问题：
+ *   ① quorum(N) 曾是"接口先行，语义未实现"——配置看起来比实际安全级别高。
+ *      修复：未实现的策略显式 throw，绝不静默降级为 "any"。
+ *   ② TaskPolicy 只是 actor authorization，不是 policy engine。
+ *      修复：每个 action 升级为结构化对象 { authority, conditions?, threshold? }。
+ *
+ * 每项 action 的 authority 取值：
  *   "any"        — 任意可信节点
  *   "publisher"  — 仅发布者
  *   "assignee"   — 仅当前认领者
- *   "quorum(N)"  — 需要 N 个可信节点确认（预留；当前实现按任意处理，接口已定型）
- * fork 规则决定分叉冲突时谁胜出：
+ *   "quorum"     — 需要 threshold 个可信节点确认（v0.12.2 起未实现 → throw，拒绝假安全）
+ * fork 规则（字符串，不涉及 authorization）：
  *   "publisher"  — publisher 分支优先（默认，兼容 v0.12.0）
  *   "newest"     — 最新时间戳优先（适合无权威方的协作）
  *   "assignee"   — 当前认领者分支优先（适合任务执行权仲裁）
+ *
+ * 兼容旧格式：字符串 "any"/"publisher"/"assignee" 等价于 { authority: 同值 }。
  */
 export const TASK_POLICIES = {
   DEFAULT: {
-    claim: "any",
-    complete: "assignee",
-    cancel: "publisher",
-    verify: "publisher",
+    claim: { authority: "any" },
+    complete: { authority: "assignee" },
+    cancel: { authority: "publisher" },
+    verify: { authority: "publisher" },
     fork: "publisher",
   },
   COLLABORATIVE: {
-    claim: "any",
-    complete: "assignee",
-    cancel: "publisher",
-    verify: "quorum(2)",
+    claim: { authority: "any" },
+    complete: { authority: "assignee" },
+    cancel: { authority: "publisher" },
+    verify: { authority: "publisher" }, // quorum 未实现前不宣称 quorum（诚实 > 好看）
     fork: "newest",
   },
   EXECUTOR_AUTHORITY: {
-    claim: "any",
-    complete: "assignee",
-    cancel: "publisher",
-    verify: "assignee",
+    claim: { authority: "any" },
+    complete: { authority: "assignee" },
+    cancel: { authority: "publisher" },
+    verify: { authority: "assignee" },
     fork: "assignee",
   },
 };
+
+/** 归一化 policy 条目：字符串旧格式 → 结构化对象（兼容 v0.12.1） */
+function normalizePolicyEntry(entry) {
+  if (typeof entry === "string") return { authority: entry };
+  if (entry && typeof entry === "object" && entry.authority) return entry;
+  return { authority: "any" };
+}
+
+/**
+ * 解析 authority 规则。
+ * @param {object} policy 任务策略
+ * @param {string} action claim|complete|cancel|verify
+ * @returns {string} authority 规则（any/publisher/assignee/quorum）
+ * @throws 若策略为未实现的 quorum → 显式拒绝（绝不降级）
+ */
+function resolveAuthority(policy, action) {
+  const rule = normalizePolicyEntry((policy || {})[action]);
+  const authority = rule.authority;
+  if (typeof authority === "string" && authority.startsWith("quorum(")) {
+    // 旧字符串格式 quorum(N)
+    throw new Error(`unsupported policy: ${action} = "${authority}" — quorum 未实现，拒绝静默降级为 any`);
+  }
+  if (authority === "quorum") {
+    // 新结构化格式 quorum + threshold —— 同样未实现
+    throw new Error(`unsupported policy: ${action} = quorum — quorum 未实现，拒绝静默降级为 any`);
+  }
+  return authority;
+}
 
 /**
  * 规范化事件（签名覆盖的字段，固定键序）。
@@ -252,16 +287,24 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
  * @returns {{ok: boolean, reason?: string}}
  */
 export function checkTransition(task, action, actorFingerprint) {
+  // v0.12.2: 先解析 policy（quorum 未实现 → 无论状态如何都显式 throw，拒绝降级）
+  // 这必须在状态转移检查之前——否则 OPEN 状态没有 verify 条目会提前返回 illegal transition，
+  // 掩盖"策略本身未实现"这个更严重的错误。
+  const policy = task.policy || {};
+  if (action === "cancel" || action === "complete" || action === "verify") {
+    resolveAuthority(policy, action); // 只用于验证；实际规则在下方使用
+  }
+
   const allowed = TRANSITIONS[task.status]?.[action];
   if (!allowed) {
     return { ok: false, reason: `illegal transition: ${task.status} → ${action}` };
   }
   // v0.12.1: 策略可配置——取消授权规则读 task.policy（默认 publisher）
-  const policy = task.policy || {};
+  // v0.12.2: resolveAuthority 处理结构化策略 + quorum 拒绝（绝不降级）
   let actorRule = allowed.actorMustBe;
-  if (action === "cancel" && policy.cancel) actorRule = policy.cancel;
-  if (action === "complete" && policy.complete) actorRule = policy.complete;
-  if (action === "verify" && policy.verify) actorRule = policy.verify;
+  if (action === "cancel" || action === "complete" || action === "verify") {
+    actorRule = resolveAuthority(policy, action);
+  }
 
   if (actorRule === "publisher" && actorFingerprint !== task.publisherFingerprint) {
     return { ok: false, reason: "only the publisher can perform this action" };
@@ -269,11 +312,26 @@ export function checkTransition(task, action, actorFingerprint) {
   if (actorRule === "assignee" && actorFingerprint !== task.assigneeFingerprintActual) {
     return { ok: false, reason: "only the current assignee can perform this action" };
   }
-  if (typeof actorRule === "string" && actorRule.startsWith("quorum(")) {
-    // v0.12.1 预留：quorum(N) 需要多方确认；当前单事件无法自证 quorum，
-    // 放行为"任意可信节点可发起，由后续 verify 事件聚合"——接口已定型，语义留给 verify 层。
-  }
   return { ok: true };
+}
+
+/**
+ * 计算任务状态的确定性哈希（v0.12.2）——用于 applyCanonicalState 判等。
+ * 审查指出：人工挑字段判等（如 lastEventHash+status），字段扩展后容易漏。
+ * 改用 stateHash：所有状态字段都参与，未来加字段不会忘。
+ * @param {object} task 任务状态
+ * @returns {string} sha256 hex
+ */
+export function canonicalTaskStateHash(task) {
+  return crypto.createHash("sha256").update(JSON.stringify({
+    status: task.status,
+    assigneeFingerprintActual: task.assigneeFingerprintActual || "",
+    result: task.result ?? null,
+    claimedAt: task.claimedAt ?? null,
+    completedAt: task.completedAt ?? null,
+    cancelledAt: task.cancelledAt ?? null,
+    lastEventHash: task.lastEventHash ?? null,
+  })).digest("hex");
 }
 
 /**
@@ -490,9 +548,10 @@ export class TaskStore {
   }
 
   /**
-   * 应用 canonical 状态（v0.12.1）。
+   * 应用 canonical 状态（v0.12.1/v0.12.2）。
    * 审查指出的问题：canonicalizeTask 只算新状态不写回。
    * 此方法负责：resolveFork → canonicalizeTask → 若状态不同则 upsert 写回。
+   * v0.12.2: 判等改用 canonicalTaskStateHash（不再人工挑 lastEventHash/status 两个字段）。
    * @param {string} taskId
    * @returns {object|null} 应用后的 canonical 状态，或 null（无需变更）
    */
@@ -501,8 +560,8 @@ export class TaskStore {
     if (!task) return null;
     const canon = this.canonicalizeTask(taskId);
     if (!canon) return null; // 无 fork 或主链即 canonical
-    // 检查是否有实质变化
-    if (canon.lastEventHash === task.lastEventHash && canon.status === task.status) return null;
+    // v0.12.2: 状态哈希判等（覆盖 status/assignee/result/timestamps/lastEventHash 全部字段）
+    if (canonicalTaskStateHash(canon) === canonicalTaskStateHash(task)) return null;
     // 写回
     this.upsert(canon);
     return canon;

@@ -55,8 +55,21 @@ export class WorldModel {
     this.relations = new Map(); // id(from|type|to) -> relation
     this.events = [];           // 最近事件环形缓冲
     this._eventCap = 2000;
+    // v0.12.2: 持久化健康状态（⑨修复——静默错误不再假装世界正常运行）
+    this.persistentHealthy = true;
+    this.persistenceError = null;
     this._load();
   }
+
+  /**
+   * 持久化健康状态（v0.12.2，⑨修复）。
+   * World Model 是权威状态（不是 telemetry）——持久化失败必须暴露，不能静默继续。
+   * @returns {boolean} true = 健康
+   */
+  isHealthy() { return this.persistentHealthy; }
+
+  /** 持久化错误信息（v0.12.2）。 */
+  persistenceErrorMessage() { return this.persistenceError; }
 
   _load() {
     if (!this.logFile) return;
@@ -115,8 +128,14 @@ export class WorldModel {
     if (!this.logFile) return;
     try {
       fs.mkdirSync(path.dirname(this.logFile), { recursive: true });
-      fs.appendFileSync(this.logFile, JSON.stringify(rec) + "\n", "utf8");
-    } catch { /* 持久化失败不致命 */ }
+      // v0.12.2 ⑧: 每条记录带 schemaVersion（为未来版本迁移做准备）
+      fs.appendFileSync(this.logFile, JSON.stringify({ schemaVersion: 1, ...rec }) + "\n", "utf8");
+    } catch (err) {
+      // v0.12.2 ⑨: 持久化失败 → 标记 unhealthy（不再静默吞掉）。
+      // World Model 是权威状态——内存成功磁盘失败 = 重启后世界倒退。
+      this.persistentHealthy = false;
+      this.persistenceError = err?.message || String(err);
+    }
   }
 
   _pushEvent(ev) {
@@ -187,8 +206,12 @@ export class WorldModel {
     const source = {
       type: ev.source?.type || SOURCE_TYPES.AGENT,
       id: ev.source?.id || "",
+      // v0.12.2 ⑤: 稳定主体 ID（独立性依据）——与 id（会话级）分开
+      identity: ev.source?.identity || ev.source?.id || "",
       kind: ev.source?.kind || SOURCE_KINDS.ASSERTION,
       eventId: ev.source?.eventId || null,
+      // v0.12.2 ⑤: 因果链预留——derivedFrom 记录传播来源（A→B→C→D 只算一个独立来源）
+      provenanceId: ev.source?.provenanceId || null,
     };
     const evidenceId = `${observedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const claimId = `${ev.subject}|${ev.predicate}|${String(ev.object)}`;
@@ -340,9 +363,14 @@ export class WorldModel {
     const seenSources = new Set();
     let support = 0;
     let relayCount = 0;
+    let staleCount = 0;
+    let newestObservedAt = 0;
     for (const ev of evidence) {
-      // 来源去重：同一 source.id 重复证据只计一次（防刷票）
-      const srcKey = ev.source?.id || ev.source?.type || ev.evidenceId;
+      // v0.12.2 ⑤: source 三概念分离——独立性用 identity，个体用 evidenceId，因果链用 provenanceId（预留）
+      // source.identity = 稳定主体 ID（如 sensor:temperature:01）
+      // source.id       = 会话/事件 ID（可去重但不可靠）
+      // evidenceId      = 个体证据（无 identity/id 时不合并，每证据独立）
+      const srcKey = ev.source?.identity || ev.source?.id || ev.evidenceId;
       if (seenSources.has(srcKey)) continue;
       seenSources.add(srcKey);
 
@@ -354,9 +382,11 @@ export class WorldModel {
 
       support += w * freshness;
       if (ev.source.kind === SOURCE_KINDS.RELAY) relayCount++;
+      if (ev.observedAt && ev.observedAt > newestObservedAt) newestObservedAt = ev.observedAt;
+      if (ageDays > 30) staleCount++;
     }
     const belief = 1 - Math.exp(-support);
-    return { support, belief, evidenceCount: seenSources.size, relayCount };
+    return { support, belief, evidenceCount: seenSources.size, relayCount, staleCount, newestObservedAt };
   }
 
   /**
@@ -397,7 +427,15 @@ export class WorldModel {
     // 对每个 claim 计算证据加权支持度（同一公式，与 claimAt/deriveBeliefAt 统一）
     const scored = relevant.map(({ claim, validEvidence }) => {
       const s = this._scoreEvidence(validEvidence, now);
-      return { claim, belief: s.belief, evidenceCount: s.evidenceCount, relayCount: s.relayCount };
+      return {
+        claim,
+        support: s.support,
+        belief: s.belief,
+        evidenceCount: s.evidenceCount,
+        relayCount: s.relayCount,
+        staleCount: s.staleCount,
+        newestObservedAt: s.newestObservedAt,
+      };
     });
 
     // 选 belief 最高的 claim
@@ -407,15 +445,31 @@ export class WorldModel {
     }
     const conflicting = scored.filter((s) => s.claim.id !== best.claim.id);
 
-    // 矛盾惩罚：有矛盾时降低 belief。每条矛盾 claim 降低 50% 的差距
-    const conflictPenalty = conflicting.length > 0 ? 0.5 * (1 - 1 / (conflicting.length + 1)) : 0;
-    const finalBelief = Math.round(best.belief * (1 - conflictPenalty) * 100) / 100;
+    // v0.12.2 ⑦: 矛盾惩罚从"冲突数量 heuristic"升级为"相对支持度 dominance"。
+    //   旧：0.5 * (1 - 1/(conflicting.length+1))——一个弱反对和十个强反对惩罚一样。
+    //   新：dominance = support(best) / Σ support(all)——相对强度决定信心。
+    //   A=5.0 vs B=0.1 → dominance≈0.98（几乎不受影响）
+    //   A=5.0 vs B=4.9 → dominance≈0.50（信心腰斩）
+    const totalSupport = scored.reduce((sum, s) => sum + s.support, 0);
+    const dominance = totalSupport > 0 ? best.support / totalSupport : 1;
+    const finalBelief = Math.round(best.belief * dominance * 100) / 100;
+
+    // v0.12.2 ⑥: epistemic state——belief strength 与认识状态是两个维度。
+    //   SUPPORTED    — 有有效证据、无冲突
+    //   CONTRADICTED — 存在冲突（无论强弱，dominance 已反映强度）
+    //   STALE        — 所有证据已过期（无新鲜证据）
+    let epistemicState = "SUPPORTED";
+    if (conflicting.length > 0) epistemicState = "CONTRADICTED";
+    if (best.staleCount > 0 && best.staleCount >= best.evidenceCount) epistemicState = "STALE";
 
     return {
       subject,
       predicate,
       object: best.claim.object,
       belief: finalBelief,
+      support: best.support,
+      dominance,            // v0.12.2 ⑦: 相对支持度
+      epistemicState,       // v0.12.2 ⑥: SUPPORTED / CONTRADICTED / STALE
       evidenceCount: best.evidenceCount,
       totalClaims: scored.length,
       conflicts: conflicting.length,
