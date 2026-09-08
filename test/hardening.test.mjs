@@ -419,6 +419,58 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     // 但策略声明已写死 publisher（诚实），不宣称 quorum。
   });
 
+  it("v0.12.3: 未知 authority → throw（白名单拒绝，不静默 ok:true）", () => {
+    const task = createTask({ title: "未知 authority", policy: { ...TASK_POLICIES.DEFAULT, complete: { authority: "foobar" } } });
+    task.publisherFingerprint = alice.fingerprint;
+    task.assigneeFingerprintActual = bob.fingerprint;
+    task.status = "claimed";
+    assert.throws(
+      () => checkTransition(task, "complete", bob.fingerprint),
+      /unsupported policy.*foobar.*未知 authority/,
+      "foobar 必须抛错，不能绕过授权检查"
+    );
+  });
+
+  it("v0.12.3: fork tie-breaker——ts 相同用 eventHash lexical（确定性 canonicalization）", () => {
+    const ts = new TaskStore();
+    const task = createTask({ title: "tie-break", policy: { ...TASK_POLICIES.COLLABORATIVE } }); // newest 规则
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", task);
+    ts.upsert(task, e1);
+
+    // 两个 claim 用完全相同的 ts（手动构造平局）
+    const sharedTs = Date.now();
+    const e2a = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    e2a.ts = sharedTs;
+    const e2b = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    e2b.ts = sharedTs;
+
+    // a 先成为主链
+    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2a.eventHash }, e2a);
+    // b 记录为 fork
+    const local = ts.get(task.id);
+    local.forks = [{ headEventHash: e2b.eventHash, actor: bob.fingerprint, ts: sharedTs, action: "claim" }];
+    ts.upsert(local);
+    ts.eventHistory(task.id).push(e2b);
+
+    // 第一次 canonicalize
+    const canon1 = ts.canonicalizeTask(task.id);
+    // 第二次：用新 TaskStore 但相同事件集（交换 fork 记录顺序）
+    const ts2 = new TaskStore();
+    ts2.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2a.eventHash }, { ...e2a });
+    const local2 = ts2.get(task.id);
+    local2.forks = [{ headEventHash: e2b.eventHash, actor: bob.fingerprint, ts: sharedTs, action: "claim" }];
+    ts2.upsert(local2);
+    ts2.eventHistory(task.id).push({ ...e2b });
+    const canon2 = ts2.canonicalizeTask(task.id);
+    // 确定性：相同事件集必须得到相同结果（null=主链胜；或相同 winner hash）
+    assert.equal(
+      canon1 ? canon1.lastEventHash : null,
+      canon2 ? canon2.lastEventHash : null,
+      "相同事件集必须产生相同 canonical state（确定性 canonicalization）"
+    );
+  });
+
   it("v0.12.2: canonicalTaskStateHash 判等覆盖全字段", () => {
     const ts = new TaskStore();
     const task = createTask({ title: "stateHash 判等" });

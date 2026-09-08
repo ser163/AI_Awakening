@@ -352,6 +352,33 @@ describe("world: 时间有效性", () => {
     // 5×sensor(0.95) = 4.75, 1×relay(0.3) = 0.3 → dominance = 4.75/5.05 ≈ 0.94
     assert.ok(b.belief > 0.8, "dominance 高时 belief 应接近无矛盾");
   });
+
+  it("v0.12.3: STALE 四态闭环——全部证据过期返回 epistemicState=STALE 而非 null", () => {
+    const w = new WorldModel();
+    const past = Date.now() - 100000;
+    // 只有过期证据（validUntil < now）
+    w.ingestEvidence({
+      subject: "agent:stale", predicate: "status", object: "old",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+      observedAt: past, validFrom: past - 1000, validUntil: past + 1,
+    });
+    // deriveBelief 应返回 STALE（非 null）
+    const b = w.deriveBelief("agent:stale", "status");
+    assert.ok(b, "有证据（虽过期）不应返回 null");
+    assert.equal(b.epistemicState, "STALE");
+    assert.equal(b.belief, 0);
+    // epistemicStatus 显式返回 STALE
+    assert.equal(w.epistemicStatus("agent:stale", "status"), "STALE");
+    // 无任何证据时返回 UNKNOWN
+    assert.equal(w.epistemicStatus("agent:never", "seen"), "UNKNOWN");
+    // 正常证据返回 SUPPORTED
+    w.ingestEvidence({
+      subject: "agent:stale", predicate: "new", object: "fresh",
+      source: { type: SOURCE_TYPES.SELF, kind: SOURCE_KINDS.OBSERVATION },
+      observedAt: Date.now(), validFrom: Date.now() - 1000, validUntil: null,
+    });
+    assert.equal(w.epistemicStatus("agent:stale", "new"), "SUPPORTED");
+  });
 });
 
 describe("world: World 是推导产物，不是 LLM 记事本", () => {

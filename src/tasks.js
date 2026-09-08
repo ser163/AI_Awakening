@@ -65,6 +65,8 @@ const TRANSITIONS = {
  *   "publisher"  — 仅发布者
  *   "assignee"   — 仅当前认领者
  *   "quorum"     — 需要 threshold 个可信节点确认（v0.12.2 起未实现 → throw，拒绝假安全）
+ * conditions / threshold：**reserved**（v0.12.3）——尚无 evaluator，仅占位；
+ *   在真正实现 conditions evaluator 与 quorum verifier 之前，系统不会假装它们生效。
  * fork 规则（字符串，不涉及 authorization）：
  *   "publisher"  — publisher 分支优先（默认，兼容 v0.12.0）
  *   "newest"     — 最新时间戳优先（适合无权威方的协作）
@@ -96,6 +98,9 @@ export const TASK_POLICIES = {
   },
 };
 
+/** 已知 authority 白名单（v0.12.3）——未知 authority 拒绝加载，不静默 ok:true */
+const KNOWN_AUTHORITIES = new Set(["any", "publisher", "assignee", "quorum"]);
+
 /** 归一化 policy 条目：字符串旧格式 → 结构化对象（兼容 v0.12.1） */
 function normalizePolicyEntry(entry) {
   if (typeof entry === "string") return { authority: entry };
@@ -108,18 +113,20 @@ function normalizePolicyEntry(entry) {
  * @param {object} policy 任务策略
  * @param {string} action claim|complete|cancel|verify
  * @returns {string} authority 规则（any/publisher/assignee/quorum）
- * @throws 若策略为未实现的 quorum → 显式拒绝（绝不降级）
+ * @throws 若策略为未实现的 quorum 或未知 authority → 显式拒绝（绝不降级）
  */
 function resolveAuthority(policy, action) {
   const rule = normalizePolicyEntry((policy || {})[action]);
   const authority = rule.authority;
   if (typeof authority === "string" && authority.startsWith("quorum(")) {
-    // 旧字符串格式 quorum(N)
     throw new Error(`unsupported policy: ${action} = "${authority}" — quorum 未实现，拒绝静默降级为 any`);
   }
   if (authority === "quorum") {
-    // 新结构化格式 quorum + threshold —— 同样未实现
     throw new Error(`unsupported policy: ${action} = quorum — quorum 未实现，拒绝静默降级为 any`);
+  }
+  // v0.12.3: 未知 authority 白名单拒绝（"foobar" → 不静默 ok:true）
+  if (!KNOWN_AUTHORITIES.has(authority)) {
+    throw new Error(`unsupported policy: ${action} = "${authority}" — 未知 authority，拒绝加载任务`);
   }
   return authority;
 }
@@ -316,9 +323,12 @@ export function checkTransition(task, action, actorFingerprint) {
 }
 
 /**
- * 计算任务状态的确定性哈希（v0.12.2）——用于 applyCanonicalState 判等。
- * 审查指出：人工挑字段判等（如 lastEventHash+status），字段扩展后容易漏。
- * 改用 stateHash：所有状态字段都参与，未来加字段不会忘。
+ * 计算任务"执行态"的确定性哈希（v0.12.2/v0.12.3）——用于 applyCanonicalState 判等。
+ * 审查指出：名称"所有状态字段"不准确——只覆盖业务运行态字段
+ * （status/assignee/result/三个时间戳/lastEventHash），
+ * 静态字段（title/description/policy/publisher）故意不参与。
+ * 因此准确名称应为 canonicalTaskExecutionStateHash / canonicalTaskRuntimeStateHash；
+ * 保留原导出名以兼容调用方，但语义按"执行态"理解。
  * @param {object} task 任务状态
  * @returns {string} sha256 hex
  */
@@ -345,8 +355,15 @@ export class TaskStore {
     this._seenEvents = new Set(); // eventId 去重
     this._taskFile = storageDir ? path.join(storageDir, "tasks", "tasks.jsonl") : null;
     this._eventFile = storageDir ? path.join(storageDir, "tasks", "events.jsonl") : null;
+    // v0.12.3: 持久化健康状态——与 WorldModel 统一，不再静默吞异常
+    this.persistentHealthy = true;
+    this.persistenceError = null;
     this._load();
   }
+
+  /** 持久化健康（v0.12.3） */
+  isHealthy() { return this.persistentHealthy; }
+  persistenceErrorMessage() { return this.persistenceError; }
 
   _load() {
     if (!this._taskFile) return;
@@ -379,7 +396,11 @@ export class TaskStore {
       fs.mkdirSync(path.dirname(this._taskFile), { recursive: true });
       const lines = Array.from(this.tasks.values()).map((t) => JSON.stringify(t)).join("\n") + "\n";
       fs.writeFileSync(this._taskFile, lines, "utf8");
-    } catch { /* 持久化失败不致命 */ }
+    } catch (err) {
+      // v0.12.3: 不再静默——Task 是权威状态，内存成功磁盘失败=重启后任务倒退
+      this.persistentHealthy = false;
+      this.persistenceError = err?.message || String(err);
+    }
   }
 
   _appendEvent(event) {
@@ -387,7 +408,10 @@ export class TaskStore {
     try {
       fs.mkdirSync(path.dirname(this._eventFile), { recursive: true });
       fs.appendFileSync(this._eventFile, JSON.stringify(event) + "\n", "utf8");
-    } catch { /* 持久化失败不致命 */ }
+    } catch (err) {
+      this.persistentHealthy = false;
+      this.persistenceError = err?.message || String(err);
+    }
   }
 
   /**
@@ -476,8 +500,9 @@ export class TaskStore {
         const bIsAsgn = b.actor === task.assigneeFingerprintActual ? 1 : 0;
         if (aIsAsgn !== bIsAsgn) return bIsAsgn - aIsAsgn;
       }
-      // newest 或默认按时间戳降序
-      return b.ts - a.ts;
+      // newest 或默认按时间戳降序；v0.12.3: ts 相同时用 eventHash lexical 打破平局（确定性 canonicalization）
+      if (a.ts !== b.ts) return b.ts - a.ts;
+      return String(a.headEventHash || "").localeCompare(String(b.headEventHash || ""));
     });
     const winner = candidates[0];
     // 主链胜出 → 无需切换

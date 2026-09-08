@@ -332,6 +332,27 @@ export class WorldModel {
   }
 
   /**
+   * 认识状态查询（v0.12.3）——四态闭环的显式入口。
+   * 审查指出：deriveBelief 返回 null 无法区分"UNKNOWN"与"无此主张"，
+   * 客户端会混淆 error / unknown / no-claim。
+   * 此 API 显式返回四态之一：
+   *   UNKNOWN       — 无任何证据（包括从未观察到的 subject/predicate）
+   *   STALE         — 有证据但全部已过期
+   *   SUPPORTED     — 有活跃证据、无冲突
+   *   CONTRADICTED  — 有活跃证据、存在冲突
+   *
+   * @param {string} subject
+   * @param {string} predicate
+   * @param {number} [atMs] 查询时点
+   * @returns {string} SUPPORTED | CONTRADICTED | STALE | UNKNOWN
+   */
+  epistemicStatus(subject, predicate, atMs = Date.now()) {
+    const b = this.deriveBelief(subject, predicate, null, atMs);
+    if (!b) return "UNKNOWN";
+    return b.epistemicState;
+  }
+
+  /**
    * 撤销一条证据（如发现来源不可信）。
    */
   retractEvidence(subject, predicate, object, evidenceId = null) {
@@ -409,20 +430,40 @@ export class WorldModel {
    */
   deriveBelief(subject, predicate, object = null, atMs = Date.now()) {
     const now = atMs;
-    const relevant = [];
+    const relevant = [];    // active claims
+    let staleClaims = [];   // 全部证据已过期
     for (const c of this.claims.values()) {
       if (c.subject !== subject || c.predicate !== predicate) continue;
       if (object !== null && c.object !== object) continue;
-      // 时间有效性：未生效（validFrom 未到）或已过期（validUntil 已过）的证据排除
-      const validEvidence = c.evidence.filter((ev) => {
-        if (ev.validFrom && now < ev.validFrom) return false; // 还未成立
-        if (ev.validUntil && now > ev.validUntil) return false; // 已失效
+      // v0.12.3: 三组证据计算——allEvidence（过 validFrom）/ activeEvidence（不过期）/ staleEvidence（已过期）
+      const allEvidence = c.evidence.filter((ev) => {
+        if (ev.validFrom && now < ev.validFrom) return false; // 未生效
         return true;
       });
-      if (validEvidence.length === 0) continue;
-      relevant.push({ claim: c, validEvidence });
+      const activeEvidence = allEvidence.filter((ev) => !ev.validUntil || now <= ev.validUntil);
+      if (activeEvidence.length > 0) {
+        relevant.push({ claim: c, validEvidence: activeEvidence });
+      } else if (allEvidence.length > 0) {
+        // 全部证据已过期 → STALE（不再跳过）
+        staleClaims.push({ claim: c, evidence: c.evidence, allEvidence });
+      }
     }
-    if (relevant.length === 0) return null;
+    // 四态决策：all=0→UNKNOWN; all>0,active=0→STALE; active>0,no conflict→SUPPORTED; active>0,conflict→CONTRADICTED
+    if (relevant.length === 0) {
+      if (staleClaims.length > 0) {
+        return {
+          subject, predicate,
+          object: staleClaims[0].claim.object,
+          belief: 0, support: 0, dominance: 0,
+          epistemicState: "STALE",
+          evidenceCount: 0, totalClaims: staleClaims.length,
+          conflicts: 0, conflictObjects: [],
+          totalEvidence: staleClaims.reduce((s, sc) => s + sc.allEvidence.length, 0),
+          updatedAt: now,
+        };
+      }
+      return null; // UNKNOWN（无任何证据）
+    }
 
     // 对每个 claim 计算证据加权支持度（同一公式，与 claimAt/deriveBeliefAt 统一）
     const scored = relevant.map(({ claim, validEvidence }) => {

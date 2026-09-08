@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.2-blue)]
+[![Version](https://img.shields.io/badge/version-0.12.3-blue)]
 
 **作者：[ser163](https://github.com/ser163) · 你的 AI 节点在等待。**
 
@@ -244,6 +244,7 @@ E:\pr\AI_Awakening\
 | **v0.12.0** | **认知内核** — Belief 数学修复 (1−e^(−support))、来源去重防刷票、三维时间、claimAt 时点查询、canonicalizeTask 状态重建、SelfState | ✅ |
 | **v0.12.1** | **语义统一** — claimAt 按信念选冠军 (非证据数)、deriveBeliefAt 历史时点、applyCanonicalState 写回、TaskPolicy 可配置 (fork/cancel/complete)、event nonce 128-bit | ✅ |
 | **v0.12.2** | **诚实策略** — quorum 未实现→显式 throw (拒绝降级)、TaskPolicyEngine 结构化 (authority/conditions/threshold)、stateHash 判等、source.identity 三概念分离、epistemic state (SUPPORTED/CONTRADICTED/STALE)、dominance 相对支持度、schemaVersion、persistence health | ✅ |
+| **v0.12.3** | **语义正确性** — authority 白名单 (未知→throw)、fork tie-breaker (ts 相同→eventHash lexical)、STALE 四态闭环、epistemicStatus() 显式 UNKNOWN、TaskStore persistence health、PROTOCOL.md 12 章 spec | ✅ |
 | v0.10 | 记忆内核 — SQLite/WAL、事件库、索引、知识图谱 | 🗺 VISION |
 | v0.11 | 自主循环 — 目标引擎、规划器、观察者、反思/学习 | 🗺 VISION |
 | v0.12 | Agent 社会 — 信誉、能力市场、争议仲裁 | 🗺 VISION |
