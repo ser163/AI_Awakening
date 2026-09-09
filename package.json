@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.23",
-      "description": "硅基协作网络 — World canonical hash(深排序) + legacy migration 隔离 + SHA256 全长, 182 tests",
+  "version": "0.12.24",
+      "description": "硅基协作网络 — World migrateWorldLog 严格迁移检测 + schema/semantic validation 管道, 189 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

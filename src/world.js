@@ -886,17 +886,39 @@ export function migrateWorldLog(storageDir) {
     if (err?.code === "ENOENT") return { ok: true, migrated: 0 };
     return { ok: false, migrated: 0, reason: `read failed: ${err.message}` };
   }
-  // 检测是否已迁移（含事务标记）
-  if (lines.some((l) => l.includes('"kind":"tx_begin"'))) {
+  // Step 1 — 完整解析每一行。坏 JSON：仅容忍尾部截断行（与 _load 的 crash-residue 语义一致），
+  // 其余位置 → 拒绝迁移（不允许"带坏数据的日志"被短路或被打上 hash 印章）。
+  const recs = [];
+  for (let i = 0; i < lines.length; i++) {
+    try {
+      recs.push(JSON.parse(lines[i]));
+    } catch {
+      if (i === lines.length - 1) break; // 尾部半行 = 崩溃残留 → 与 _load 相同丢弃
+      return { ok: false, migrated: 0, reason: `invalid JSON at line ${i + 1}` };
+    }
+  }
+  if (recs.length === 0) return { ok: true, migrated: 0 };
+
+  // Step 2 — 格式判定：出现任何事务标记（tx_begin/tx_commit/txId 字段）→ 文件声明为 transactional。
+  // 必须通过完整结构验证 + eventHash 验证才可短路为 "already transactional"；
+  // 验证失败 → 拒绝（不允许 tx_begin + legacy 行混排的损坏日志绕过迁移）。
+  const hasTxMarkers = recs.some((r) => r && (r.kind === "tx_begin" || r.kind === "tx_commit" || r.txId));
+  if (hasTxMarkers) {
+    const v = validateTransactionalLog(recs);
+    if (!v.ok) return { ok: false, migrated: 0, reason: `transactional log corrupt: ${v.reason}` };
     return { ok: true, migrated: 0, reason: "already transactional" };
   }
+
+  // Step 3 — legacy 格式：先对每条记录做 schema + semantic validation（全通过才允许转换）。
+  for (let i = 0; i < recs.length; i++) {
+    const err = validateLegacyRecord(recs[i]);
+    if (err) return { ok: false, migrated: 0, reason: `record at line ${i + 1}: ${err}` };
+  }
+
+  // Step 4 — 全部验证通过 → 纯函数构造 transactional 输出（此阶段不再失败，尚未触碰磁盘）。
   const outLines = [];
   let migrated = 0;
-  for (const line of lines) {
-    let rec;
-    try { rec = JSON.parse(line); } catch {
-      return { ok: false, migrated, reason: `invalid JSON: ${line.slice(0, 64)}...` };
-    }
+  for (const rec of recs) {
     const txId = crypto.randomUUID();
     outLines.push(JSON.stringify({ schemaVersion: 1, kind: "tx_begin", txId }));
     if (AUTHORITATIVE_KINDS.has(rec.kind)) {
@@ -909,7 +931,8 @@ export function migrateWorldLog(storageDir) {
     }
     outLines.push(JSON.stringify({ schemaVersion: 1, kind: "tx_commit", txId }));
   }
-  // 原子替换：写临时文件 → rename 覆盖（备份原文件）
+
+  // Step 5 — 原子替换：写临时文件 → rename 覆盖（备份原文件）。
   const bakFile = logFile + ".bak.v1";
   const tmpFile = logFile + ".migrating";
   try {
@@ -920,6 +943,108 @@ export function migrateWorldLog(storageDir) {
     return { ok: false, migrated, reason: `write failed: ${err.message}` };
   }
   return { ok: true, migrated };
+}
+
+/**
+ * v0.12.24 (审查 P1): transactional 日志完整验证——严格状态机（与 _load 同一套规则）：
+ *   tx_begin(txId) → RECORD(txId)×N → tx_commit(txId)
+ * 所有权威记录必须 eventHash 存在且正确；任何协议违规 → fail。
+ * 尾部未闭合事务 = 崩溃残留（与 _load 相同丢弃容忍）。
+ * @returns {{ok: boolean, reason?: string}}
+ */
+function validateTransactionalLog(recs) {
+  let pending = null; // {txId, records: []}
+  for (let i = 0; i < recs.length; i++) {
+    const r = recs[i];
+    if (!r || typeof r !== "object") return { ok: false, reason: `line ${i + 1}: not an object` };
+    if (!r.txId) return { ok: false, reason: `line ${i + 1}: record without txId inside transactional log` };
+    if (r.kind === "tx_begin") {
+      if (pending) return { ok: false, reason: `line ${i + 1}: nested tx_begin while tx ${pending.txId} open` };
+      pending = { txId: r.txId, records: [] };
+    } else if (r.kind === "tx_commit") {
+      if (!pending) return { ok: false, reason: `line ${i + 1}: orphan tx_commit` };
+      if (pending.txId !== r.txId) return { ok: false, reason: `line ${i + 1}: tx_commit txId mismatch (${r.txId} vs ${pending.txId})` };
+      // 提交点验证事务内全部权威记录（先验证，通过才视为已提交）
+      for (const rec of pending.records) {
+        if (!AUTHORITATIVE_KINDS.has(rec.kind)) continue; // event 等 telemetry 无 hash
+        const h = worldRecordHash(rec);
+        if (!rec.eventHash) return { ok: false, reason: `authoritative ${rec.kind} missing eventHash` };
+        if (h !== rec.eventHash) return { ok: false, reason: `${rec.kind} eventHash mismatch (record modified)` };
+      }
+      pending = null;
+    } else {
+      // 数据 record
+      if (!pending) return { ok: false, reason: `line ${i + 1}: record ${r.kind} without tx_begin` };
+      if (pending.txId !== r.txId) return { ok: false, reason: `line ${i + 1}: record txId mismatch (${r.txId} vs ${pending.txId})` };
+      pending.records.push(r);
+    }
+  }
+  // 尾部未闭合事务 = 崩溃残留（无 COMMIT 整体丢弃，与 _load 相同容忍）
+  return { ok: true };
+}
+
+/** 可被迁移/加载的合法 kind（权威 + telemetry），其余一律拒绝 */
+const MIGRATABLE_KINDS = new Set([...AUTHORITATIVE_KINDS, "event"]);
+
+/**
+ * v0.12.24 (审查 P1): legacy 记录的 schema + semantic validation——
+ * migration 不能给历史垃圾数据"盖 hash 印章"。任一条非法 → 整个迁移失败，原文件不动。
+ * @returns {string|null} 错误消息或 null（合法）
+ */
+function validateLegacyRecord(rec) {
+  if (!rec || typeof rec !== "object" || Array.isArray(rec)) return "not a record object";
+  const { kind } = rec;
+  if (!kind || typeof kind !== "string") return "missing kind";
+  if (!MIGRATABLE_KINDS.has(kind)) return `unsupported kind: ${String(kind)}`;
+  const needNonEmptyStr = (v, field) =>
+    typeof v !== "string" || v.trim() === "" ? `${field} must be a non-empty string` : null;
+  switch (kind) {
+    case "entity": {
+      const err = needNonEmptyStr(rec.id, "id") || needNonEmptyStr(rec.type, "type");
+      if (err) return err;
+      if (rec.name !== undefined && typeof rec.name !== "string") return "name must be a string";
+      if (rec.meta !== undefined && (typeof rec.meta !== "object" || rec.meta === null || Array.isArray(rec.meta))) return "meta must be an object";
+      break;
+    }
+    case "agent": {
+      const err = needNonEmptyStr(rec.id, "id");
+      if (err) return err;
+      if (rec.name !== undefined && typeof rec.name !== "string") return "name must be a string";
+      if (rec.capabilities !== undefined && !Array.isArray(rec.capabilities)) return "capabilities must be an array";
+      break;
+    }
+    case "evidence": {
+      if (rec.subject === undefined || rec.subject === null || rec.subject === "") return "subject required";
+      if (rec.predicate === undefined || rec.predicate === null || rec.predicate === "") return "predicate required";
+      if (rec.object === undefined) return "object required";
+      if (rec.evidenceId !== undefined && rec.evidenceId !== null && typeof rec.evidenceId !== "string") return "evidenceId must be a string";
+      break;
+    }
+    case "claim_retracted": {
+      const err = needNonEmptyStr(rec.id, "id");
+      if (err) return err;
+      break;
+    }
+    case "evidence_retracted": {
+      const err = needNonEmptyStr(rec.claimId, "claimId");
+      if (err) return err;
+      break;
+    }
+    case "relation": {
+      const err =
+        needNonEmptyStr(rec.from, "from") ||
+        needNonEmptyStr(rec.type, "type") ||
+        needNonEmptyStr(rec.to, "to");
+      if (err) return err;
+      break;
+    }
+    case "event": {
+      if (!rec.data || typeof rec.data !== "object" || Array.isArray(rec.data)) return "data must be an object";
+      break;
+    }
+  }
+  if (rec.ts !== undefined && (typeof rec.ts !== "number" || !Number.isFinite(rec.ts))) return "ts must be a finite number";
+  return null;
 }
 
 /**

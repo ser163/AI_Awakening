@@ -730,6 +730,56 @@ describe("world: transaction commit 语义（P1）", () => {
       assert.ok(fs.existsSync(logFile + ".bak.v1"), "原文件应备份为 .bak.v1");
     });
 
+    it("已迁移（合法事务+eventHash 完整）→ already transactional 短路", () => {
+      const d = path.join(strictDir, "already_mig_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6));
+      const w = new WorldModel(d);
+      w.observeEntity("dev:short", "sensor", "Shortcut");
+      // 迁移函数看到的是完全合法的 transactional 日志
+      const res = migrateWorldLog(d);
+      assert.equal(res.ok, true, "合法 transactional 日志应短路");
+      assert.equal(res.migrated, 0, "不迁移任何记录");
+      assert.ok(res.reason?.includes("already"), "原因含 already");
+      // WorldModel 正常加载不受影响
+      const w2 = new WorldModel(d);
+      assert.ok(w2.isHealthy(), "短路后仍 healthy");
+      assert.equal(w2.entities.get("dev:short")?.name, "Shortcut");
+    });
+
+    it("tx_begin + legacy 无 txId 混合 → 拒绝迁移（不短路也不打 hash）", () => {
+      const d = path.join(strictDir, "mixed_reject_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6));
+      const worldDir = path.join(d, "world");
+      fs.mkdirSync(worldDir, { recursive: true });
+      const logFile = path.join(worldDir, "world.jsonl");
+      // 手工构造：合法 tx_begin → 无 txId legacy 行 → tx_commit（结构违规）
+      fs.writeFileSync(logFile, [
+        JSON.stringify({ schemaVersion: 1, kind: "tx_begin", txId: "tx-mixed" }),
+        JSON.stringify({ schemaVersion: 1, kind: "entity", id: "dev-mixed", type: "sensor", name: "X", ts: 1 }),
+        JSON.stringify({ schemaVersion: 1, kind: "tx_commit", txId: "tx-mixed" }),
+        JSON.stringify({ kind: "agent", id: "fp-mixed", name: "injected", ts: 2 }), // 无 txId — 入侵
+      ].join("\n") + "\n", "utf8");
+      const res = migrateWorldLog(d);
+      assert.equal(res.ok, false, "混合日志应拒绝");
+      assert.ok(res.reason?.includes("corrupt"), "原因含 corrupt");
+      // 原文件未经修改
+      assert.ok(!fs.existsSync(logFile + ".bak.v1"), "不应备份");
+      const content = fs.readFileSync(logFile, "utf8");
+      assert.ok(content.includes("tx-mixed"), "原文件未变");
+    });
+
+    it("legacy 记录缺少必填字段（entity 无 id）→ schema validation 拒绝迁移", () => {
+      const d = path.join(strictDir, "schema_reject_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6));
+      const worldDir = path.join(d, "world");
+      fs.mkdirSync(worldDir, { recursive: true });
+      const logFile = path.join(worldDir, "world.jsonl");
+      fs.writeFileSync(logFile, [
+        JSON.stringify({ schemaVersion: 1, kind: "entity", type: "sensor", name: "orphan", ts: 100 }), // 缺 id
+      ].join("\n") + "\n", "utf8");
+      const res = migrateWorldLog(d);
+      assert.equal(res.ok, false, "缺 id → 拒绝迁移");
+      assert.ok(res.reason?.includes("id"), "原因提及 id");
+      assert.ok(!fs.existsSync(logFile + ".bak.v1"), "不应备份");
+    });
+
     it("正常 BEGIN→RECORD×N→COMMIT 通过（状态机不误伤合法事务）", () => {
       const d = path.join(strictDir, "legal_" + Date.now());
       const w = new WorldModel(d);
