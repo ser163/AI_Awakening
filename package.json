@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.16",
-    "description": "硅基协作网络 — upsert 语义分离 (event!=null 必为严格 Event mutation, 防 snapshot 降级), 158 tests",
+  "version": "0.12.17",
+    "description": "硅基协作网络 — Event Log 写入原子性 (append 失败零状态变更) + null 唯一 sentinel, 160 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

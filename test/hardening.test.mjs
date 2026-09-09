@@ -1485,4 +1485,69 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
       assert.equal(ts2.get(task.id).status, before, "restart replay == live 原状态");
     });
   });
+
+  // v0.12.17 (审查 P0): Event Log append 失败 → 原子拒绝（不改 snapshot, restart 可恢复）
+  describe("Event Log 写入原子性", () => {
+    const aliceStore4 = path.join(fs.realpathSync(os.tmpdir()), "hard_v01217");
+    function mkAlice() { return loadOrCreateIdentity(path.join(aliceStore4, "alice"), "alice"); }
+
+    function setupEv(dir) {
+      const alice = mkAlice();
+      const ts = new TaskStore(dir);
+      const task = createTask({ title: "append_fail", requiredCapabilities: [] });
+      task.publisherFingerprint = alice.fingerprint;
+      const e1 = createTaskEvent(alice, "publish", null, task);
+      ts.upsert(task, e1);
+      return { alice, ts, task, e1 };
+    }
+
+    it("P0 Event Log append 失败 → throw, snapshot 不变, restart 恢复原状", () => {
+      const dir = path.join(aliceStore4, "af_" + Date.now());
+      const { alice, ts, task, e1 } = setupEv(dir);
+      // 把 events.jsonl 换成同名目录 → fs.appendFileSync 抛 ENOTDIR
+      const evFile = path.join(dir, "tasks", "events.jsonl");
+      fs.rmSync(evFile, { force: true });
+      fs.mkdirSync(evFile, { recursive: true }); // 用目录占位
+      const before = ts.get(task.id).status; // open
+      const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+      const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+      // append 失败 → throw
+      assert.throws(() => ts.upsert(claimed, e2), /persistence failed/, "Event Log 失败必须 throw");
+      // snapshot 不变
+      assert.equal(ts.get(task.id).status, before, "append 失败不得修改 snapshot");
+      assert.equal(ts.get(task.id).assigneeFingerprintActual, "", "append 失败不得修改 runtime");
+      // restart → replay 恢复原始 state
+      fs.rmSync(evFile, { recursive: true, force: true }); // 移除目录障碍
+      const ts2 = new TaskStore(dir);
+      assert.equal(ts2.get(task.id).status, before, "restart replay == pre-operation state");
+      assert.ok(ts2.isHealthy(), "重启后 healthy");
+    });
+  });
+
+  // v0.12.17 (审查 P1): null 是唯一 snapshot sentinel；false/0/""/{} 都进入严格拒绝
+  describe("null 唯一 snapshot sentinel", () => {
+    const aliceStore5 = path.join(fs.realpathSync(os.tmpdir()), "hard_v01217b");
+    function mkAlice() { return loadOrCreateIdentity(path.join(aliceStore5, "alice"), "alice"); }
+
+    it("upsert(task, {}) / false / \"\" → throw; upsert(task, null) → 允许", () => {
+      const alice = mkAlice();
+      const dir = path.join(aliceStore5, "ns_" + Date.now());
+      const ts = new TaskStore(dir);
+      const task = createTask({ title: "ns", requiredCapabilities: [] });
+      task.publisherFingerprint = alice.fingerprint;
+      const e1 = createTaskEvent(alice, "publish", null, task);
+      ts.upsert(task, e1);
+      // 非 null 的 falsy 参数全部必须拒
+      assert.throws(() => ts.upsert({ ...task }, {}), /eventId/, "{} → throw");
+      assert.throws(() => ts.upsert({ ...task }, false), /eventId/, "false → throw");
+      assert.throws(() => ts.upsert({ ...task }, ""), /eventId/, "\"\" → throw");
+      assert.throws(() => ts.upsert({ ...task }, 0), /eventId/, "0 → throw");
+      // null 是唯一 sentinel
+      const snapOnly = ts.get(task.id);
+      snapOnly.title = "updated-title";
+      assert.doesNotThrow(() => ts.upsert(snapOnly, null), "null → 允许 snapshot persistence");
+      assert.equal(ts.get(task.id).title, "updated-title", "null 走 snapshot 路径应生效");
+      assert.ok(ts.isHealthy(), "legal snapshot persistence → healthy");
+    });
+  });
 });

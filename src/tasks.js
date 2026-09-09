@@ -927,13 +927,15 @@ export class TaskStore {
   }
 
   _appendEvent(event) {
-    if (!this._eventFile) return;
+    if (!this._eventFile) return true; // 内存模式（无持久化目录）视为成功
     try {
       fs.mkdirSync(path.dirname(this._eventFile), { recursive: true });
       fs.appendFileSync(this._eventFile, JSON.stringify(event) + "\n", "utf8");
+      return true;
     } catch (err) {
       this.persistentHealthy = false;
       this.persistenceError = err?.message || String(err);
+      return false;
     }
   }
 
@@ -942,12 +944,12 @@ export class TaskStore {
    * @returns {{task: object, duplicate: boolean}}
    */
   upsert(task, event = null, { fork = false } = {}) {
-    // v0.12.16 (审查 P0): 语义分离——event !== null 就是一次严格 Event mutation，
-    // 不允许 malformed event（缺 eventId/缺 hash）退化成 snapshot-only 写入。
-    //   upsert(task, event)  → Event-driven mutation：必须 eventId + integrity gate + 进 Event Log
+    // v0.12.16/17 (审查 P0/P1): 语义分离——null 是唯一 snapshot sentinel。
+    //   upsert(task, event)  → 严格 Event mutation：eventId + integrity + **先持久化后改内存**
     //   upsert(task, null)   → snapshot/internal persistence（仅内部合法用途）
-    if (event) {
-      if (!event.eventId) {
+    // 任何非 null 的 malformed 参数（{} / false / 0 / ""）都进入严格路径并被拒绝。
+    if (event !== null) {
+      if (!event || typeof event !== "object" || !event.eventId) {
         const err = new Error("task event requires eventId (malformed event cannot fall back to snapshot)");
         err.integrity = true;
         throw err;
@@ -976,12 +978,20 @@ export class TaskStore {
       if (thisHash && this._seenEventHashes.has(thisHash)) {
         return { task, duplicate: true };
       }
+      // v0.12.17 (审查 P0): **先持久化 Event Log，成功后才允许修改内存状态。**
+      // append 失败 → 立即 throw，绝不进入 events/eventIndex/tasks/snapshot。
+      const appended = this._appendEvent(event);
+      if (!appended) {
+        const err = new Error(`event persistence failed: ${event.eventId}`);
+        err.persistence = true;
+        throw err;
+      }
+      // ---- 持久化成功 → 才更新内存结构 ----
       this._seenEvents.add(event.eventId);
       if (thisHash) {
         this._seenEventHashes.add(thisHash);
         this._eventHashById.set(event.eventId, thisHash);
       }
-      this._appendEvent(event);
       if (!this.events.has(task.id)) this.events.set(task.id, []);
       this.events.get(task.id).push(event);
       // eventIndex 总是记录全部已知事件（含 fork——后续链检测依赖完整索引）
