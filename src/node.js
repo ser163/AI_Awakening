@@ -344,40 +344,61 @@ export class AgentNode extends EventEmitter {
         event.actor,
         event.payload
       );
-      const base = local || { ...task }; // 首见用 packet 静态字段初始化，后续保留本地
+
+      // v0.13.0 (审查 P0-①): 首次创建用纯白名单（不再 {...task} spread——防夹带 runtime 字段）
+      // v0.13.0 (审查 P0-③): publish 强制 actor === publisherFingerprint
+      if (action === "publish" && event.actor !== (task.publisherFingerprint || packet.author)) {
+        console.warn(`🚫 publish actor(${event.actor}) !== publisher(${task.publisherFingerprint})——拒绝`);
+        this.emit("task:rejected", { action, task, event, reason: "publish actor must match publisherFingerprint" });
+        return;
+      }
+
+      const base = local ? { ...local } : {
+        id: task.id,
+        title: task.title || "未命名任务",
+        description: task.description ?? null,
+        publisherFingerprint: task.publisherFingerprint || packet.author,
+        publisherName: task.publisherName || packet.authorName || "",
+        requiredCapabilities: task.requiredCapabilities || [],
+        policy: task.policy || undefined,
+        assigneeFingerprint: "",
+        createdAt: task.createdAt || event.ts,
+      };
+      // Runtime 字段全部从 deriveNextState 推导，绝不从 packet.task 残留
       base.status = nextState.status;
       base.assigneeFingerprintActual = nextState.assigneeFingerprintActual || "";
       base.result = nextState.result ?? null;
+      base.claimedAt = null;
+      base.completedAt = null;
+      base.cancelledAt = null;
+      // 动作时间戳：deriveNextState 只推导 status/assignee/result，
+      // 时间戳由动作语义 + 事件时间确定（先清空再按 action 设置，防首次夹带）
       if (event.action === "claim") base.claimedAt = event.ts;
       if (event.action === "complete") base.completedAt = event.ts;
       if (event.action === "cancel") base.cancelledAt = event.ts;
+      base.lastEventHash = null;
+      base.forks = [];
+      // 若 local 已有，保留其 eventIndex/eventHeight 等索引（upsert 会更新 lastEventHash）
+      if (local) {
+        base.eventIndex = local.eventIndex || {};
+        base.eventHeight = local.eventHeight || 0;
+      }
       this.tasks.upsert(base, event);
       if (action === "publish") {
-        // 首见：用 packet 的静态定义字段初始化（title/publisher/等）
-        // 但 runtime state（status/assignee/result）只来自 event
-        const existing = this.tasks.get(task.id);
-        if (existing) {
-          existing.title = task.title || existing.title;
-          existing.description = task.description ?? existing.description;
-          existing.publisherFingerprint = task.publisherFingerprint || existing.publisherFingerprint || event.actor;
-          existing.publisherName = task.publisherName || existing.publisherName;
-          existing.requiredCapabilities = task.requiredCapabilities || existing.requiredCapabilities || [];
-          existing.policy = task.policy || existing.policy;
-          existing.assigneeFingerprint = task.assigneeFingerprint || existing.assigneeFingerprint || "";
-          this.tasks.upsert(existing);
-        }
-        this.memory.append("task_published_received", { id: task.id, title: task.title, from: packet.author });
-        this.emit("task:published", { task, from: packet.author, fromName: packet.authorName });
+        // v0.13.0 (审查 P0-④): Task Definition immutable——已有任务不再被重复 publish 改定义
+        // 仅首次创建（local 为空时）以上白名单已有静态字段。后续 publish 事件直接忽略静态覆写。
+        this.memory.append("task_published_received", { id: task.id, title: base.title, from: packet.author });
+        this.emit("task:published", { task: base, from: packet.author, fromName: packet.authorName });
       } else if (action === "claim") {
-        this.emit("task:claimed", { task, from: packet.author, fromName: packet.authorName });
+        this.emit("task:claimed", { task: base, from: packet.author, fromName: packet.authorName });
       } else if (action === "complete") {
-        this.emit("task:completed", { task, from: packet.author, fromName: packet.authorName });
+        this.emit("task:completed", { task: base, from: packet.author, fromName: packet.authorName });
       }
-      this.emit("task:update", { action, task, from: packet.author });
+      this.emit("task:update", { action, task: base, from: packet.author });
       return;
     }
 
-    // v0.12.9 (审查 P0): 无 event 的旧包——transport task 不可信。
+    // v0.13.0 (审查 P0): 无 event 的旧包——transport task 不可信。
     // packet.task 的 runtime state（status/assignee/result）一律不写库；
     // 仅可用于首次创建的静态定义字段 + open 初始态。
     const local = this.tasks.get(task.id);
@@ -403,16 +424,14 @@ export class AgentNode extends EventEmitter {
       };
       this.tasks.upsert(fresh, undefined);
       this.memory.append("task_published_received", { id: task.id, title: task.title, from: packet.author });
-      this.emit("task:published", { task, from: packet.author, fromName: packet.authorName });
-      this.emit("task:update", { action, task, from: packet.author });
+      this.emit("task:published", { task: fresh, from: packet.author, fromName: packet.authorName });
+      this.emit("task:update", { action, task: fresh, from: packet.author });
       return;
     }
     if (local && action === "publish") {
-      // 已存在：仅静态字段可更新，runtime state 拒绝从 packet 覆盖
-      local.title = task.title || local.title;
-      local.description = task.description ?? local.description;
-      this.tasks.upsert(local, undefined);
-      this.emit("task:update", { action, task, from: packet.author });
+      // v0.13.0 (审查 P0-④): Task Definition immutable——已有任务不再被重复 publish 改定义
+      this.emit("task:published", { task: local, from: packet.author, fromName: packet.authorName });
+      this.emit("task:update", { action, task: local, from: packet.author });
       return;
     }
     // 无 event 的 claim/complete/cancel 旧包：无法验证状态转移 → 拒绝（不产生状态变化）

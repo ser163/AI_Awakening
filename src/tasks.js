@@ -168,9 +168,11 @@ function canonicalizeEventV1(ev) {
   });
 }
 
-/** V2 canonical（v0.12.8）：semanticVersion 纳入签名域（防版本降级攻击） */
+/** V2 canonical（v0.12.8）：semanticVersion 纳入签名域（防版本降级攻击）。
+ *  v0.13.0: taskDefinitionHash 条件纳入（仅 publish 事件携带；无此字段的旧 v2
+ *  事件 canonical 与以前逐字节相同 → 向后兼容）。 */
 function canonicalizeEventV2(ev) {
-  return JSON.stringify({
+  const o = {
     eventId: ev.eventId,
     taskId: ev.taskId,
     action: ev.action,
@@ -179,11 +181,14 @@ function canonicalizeEventV2(ev) {
     ts: ev.ts,
     nonce: ev.nonce,
     semanticVersion: ev.semanticVersion ?? 2, // v0.12.7+: 版本是安全边界，必须签名
-    status: ev.status,
-    beforeState: ev.beforeState || null,
-    afterState: ev.afterState || null,
-    payload: ev.payload || null,
-  });
+  };
+  // 仅当事件声明 taskDefinitionHash 时纳入签名域（固定键序，位于 semanticVersion 之后）
+  if (ev.taskDefinitionHash) o.taskDefinitionHash = ev.taskDefinitionHash;
+  o.status = ev.status;
+  o.beforeState = ev.beforeState || null;
+  o.afterState = ev.afterState || null;
+  o.payload = ev.payload || null;
+  return JSON.stringify(o);
 }
 
 /**
@@ -201,6 +206,35 @@ function canonicalizeEvent(ev) {
 /** 计算事件的防篡改哈希（v0.10.1: 真哈希，不再是 eventId） */
 export function hashEvent(ev) {
   return crypto.createHash("sha256").update(canonicalizeEvent(ev)).digest("hex");
+}
+
+/**
+ * 计算 Task Definition 的 canonical hash（v0.13.0 审查 P0-②）。
+ * 只覆盖静态定义字段（title/description/publisher/capabilities/policy）——
+ * 不含 runtime state。Genesis Event 绑定此 hash，防 relay 改写任务定义。
+ * 深度排序键：sender/receiver 各自序列化也不受对象键序影响。
+ */
+function deepSortedJSON(value) {
+  if (Array.isArray(value)) return value.map(deepSortedJSON);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value).sort()) out[k] = deepSortedJSON(value[k]);
+    return out;
+  }
+  return value;
+}
+
+export function canonicalizeTaskDefinition(task) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify(deepSortedJSON({
+      taskId: task.id,
+      title: task.title,
+      description: task.description,
+      publisherFingerprint: task.publisherFingerprint,
+      requiredCapabilities: task.requiredCapabilities || [],
+      policy: task.policy || null,
+    })))
+    .digest("hex");
 }
 
 /** 生成唯一 ID */
@@ -289,6 +323,9 @@ export function createTaskEvent(identity, action, beforeTask, afterTask = null) 
     //   v2 = 4-arg 调用：beforeState/afterState 明确，无条件 deriveNextState 验证
     //   v1 = 3-arg 兼容调用：before=after 快照，legacy 语义（仅迁移/读取）
     semanticVersion: afterTask ? 2 : 1,
+    // v0.13.0 (审查 P0-②): genesis(publish) 绑定 Task Definition Hash——
+    //   Event 一旦签名，定义（title/publisher/capabilities/policy）即不可被 relay 改写
+    taskDefinitionHash: action === "publish" ? canonicalizeTaskDefinition(task) : undefined,
     // v0.12.4: 明确的 beforeState / afterState（含之前的 state 快照，按需迁移）
     beforeState,
     afterState,
@@ -373,6 +410,20 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
   if (event.semanticVersion !== undefined && event.semanticVersion !== null) {
     if (typeof event.semanticVersion !== "number" || !KNOWN_SEMANTIC_VERSIONS.has(event.semanticVersion)) {
       return { ok: false, reason: `unsupported semanticVersion: ${event.semanticVersion} (must be 1 or 2)` };
+    }
+  }
+  // v0.13.0 (审查 P0-②/P0-③): genesis(publish) 定义绑定——v2 publish 事件必须携带
+  // taskDefinitionHash 且 hash(packet.task definition) 一致（防 relay 改写定义）；
+  // publisher 身份必须等于 event actor（防 Alice 签事件、Bob 被记为 publisher）。
+  if (action === "publish" && event.semanticVersion === 2) {
+    if (!event.taskDefinitionHash) {
+      return { ok: false, reason: "v2 publish event missing taskDefinitionHash (definition not bound)" };
+    }
+    if (canonicalizeTaskDefinition(task) !== event.taskDefinitionHash) {
+      return { ok: false, reason: "task definition hash mismatch (definition tampered by relay)" };
+    }
+    if (task.publisherFingerprint && event.actor !== task.publisherFingerprint) {
+      return { ok: false, reason: "publish actor must equal task.publisherFingerprint" };
     }
   }
   // v0.12.9 (审查 P0): 版本门控——allowLegacy=false（网络路径）只接受显式 v2；
@@ -626,6 +677,80 @@ export class TaskStore {
         }
       }
     } catch { /* 首次运行 */ }
+    // v0.13.0 (审查 P1-⑥/⑦): event log 验证 + 重建权威 runtime state（snapshot 仅为加速缓存）。
+    //   P1-⑥: snapshot.lastEventHash 与 event log 尾部一致性——log wins。
+    //   P1-⑦: forks 为 derived view（从 events 重算，不信任持久化 snapshot.forks）。
+    this._reconcileFromEvents();
+  }
+
+  /** v0.13.0 P1-⑥/⑦: 从 events 重建 runtime state（event log wins）+ derived forks。 */
+  _reconcileFromEvents() {
+    for (const [id, task] of this.tasks) {
+      const events = this.events.get(id);
+      if (!events || events.length === 0) continue;
+      const byHash = {};
+      for (const ev of events) byHash[ev.eventHash || ev.eventId] = ev;
+      // 找 chain head（不被任何孩子的 previousHash 指向的最后一个事件）
+      const hasChild = new Set();
+      for (const ev of events) if (ev.previousHash) hasChild.add(ev.previousHash);
+      const heads = events.filter(ev => !hasChild.has(ev.eventHash || ev.eventId));
+      if (heads.length === 0) continue;
+      const headEv = heads.find(h => (h.eventHash || h.eventId) === task.lastEventHash)
+        || heads.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0];
+      // 回溯收集主链
+      const chain = [];
+      let cur = headEv.eventHash || headEv.eventId;
+      let guard = 0;
+      while (cur && byHash[cur] && guard++ < 10000) {
+        chain.unshift(byHash[cur]);
+        cur = byHash[cur].previousHash || null;
+      }
+      const mainHashes = new Set(chain.map(ev => ev.eventHash || ev.eventId));
+      // P1-⑦: forks derived——非主链但 previousHash 在主链上的事件
+      const derivedForks = [];
+      for (const ev of events) {
+        const h = ev.eventHash || ev.eventId;
+        if (mainHashes.has(h)) continue;
+        if (ev.previousHash && mainHashes.has(ev.previousHash)) {
+          derivedForks.push({ headEventHash: h, actor: ev.actor, ts: ev.ts, action: ev.action });
+        }
+      }
+      const tailHash = chain.length > 0 ? (chain[chain.length - 1].eventHash || chain[chain.length - 1].eventId) : null;
+      // P1-⑥: snapshot 只是加速缓存——凡有事件链的任务一律从 events 重建权威 runtime。
+      //   （只比对 lastEventHash 不足以发现"status 被篡改但 hash 保留"的快照污染）
+      // v0.13.0: Event Sourcing 原则——events 权威，snapshot 只是启动缓存，始终从 log 推导。
+      // 重放主链重建 runtime state
+      const rebuilt = { ...task, status: null, assigneeFingerprintActual: "", result: null, claimedAt: null, completedAt: null, cancelledAt: null, lastEventHash: null, forks: [], eventIndex: {}, eventHeight: 0 };
+      let curState = { status: null, assigneeFingerprintActual: "", result: null };
+      for (const ev of chain) {
+        const h = ev.eventHash || ev.eventId;
+        if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
+          this.persistentHealthy = false; this.persistenceError = `event ${ev.eventId} tampered (hash mismatch)`;
+          break;
+        }
+        if (ev.semanticVersion === 2) {
+          try {
+            const bf = ev.beforeState || { status: null, assigneeFingerprintActual: "", result: null };
+            const expected = deriveNextState(bf, ev.action, ev.actor, ev.payload);
+            curState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
+          } catch { break; }
+        } else if (ev.afterState) {
+          curState = { status: ev.afterState.status || curState.status, assigneeFingerprintActual: ev.afterState.assigneeFingerprintActual || curState.assigneeFingerprintActual, result: ev.afterState.result ?? curState.result };
+        }
+        rebuilt.status = curState.status; rebuilt.assigneeFingerprintActual = curState.assigneeFingerprintActual; rebuilt.result = curState.result;
+        rebuilt.lastEventHash = h; rebuilt.eventHeight++; rebuilt.eventIndex[h] = { eventId: ev.eventId, parentHash: ev.previousHash || null, actor: ev.actor, action: ev.action, ts: ev.ts, height: rebuilt.eventHeight };
+        if (ev.action === "claim") rebuilt.claimedAt = ev.ts;
+        if (ev.action === "complete") rebuilt.completedAt = ev.ts;
+        if (ev.action === "cancel") rebuilt.cancelledAt = ev.ts;
+      }
+      rebuilt.forks = derivedForks;
+      // 保留静态定义字段（重建只覆盖 runtime state）
+      rebuilt.title = task.title; rebuilt.description = task.description;
+      rebuilt.publisherFingerprint = task.publisherFingerprint; rebuilt.publisherName = task.publisherName;
+      rebuilt.requiredCapabilities = task.requiredCapabilities; rebuilt.policy = task.policy;
+      this.tasks.set(id, rebuilt);
+      this._saveTasks();
+    }
   }
 
   _saveTasks() {

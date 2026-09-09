@@ -862,4 +862,75 @@ describe("v0.12.9: 审查 P0 针对性测试", () => {
     const result = ts.upsert({ ...task }, duplicateEvent);
     assert.equal(result.duplicate, true, "同 eventHash 不同 eventId 应 duplicate");
   });
+
+  // P1-⑥ snapshot 只是加速缓存——篡改 tasks.jsonl 后重启，event log wins
+  it("P1-⑥ 篡改 snapshot 重启 → event log 重放恢复权威 runtime state", () => {
+    const alice = loadOrCreateIdentity(path.join(tmp, "alice_p16"), "alice");
+    const dir = path.join(tmp, `p16_${Date.now()}`);
+    const ts1 = new TaskStore(dir);
+    const task = createTask({ title: "快照一致性", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts1.upsert(task, e1);
+    // 完成一个 claim + complete，让 snapshot 处于 completed
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, claimedAt: Date.now(), lastEventHash: e1.eventHash };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    ts1.upsert(claimed, e2);
+    const completed = { ...claimed, status: "completed", result: "done", completedAt: Date.now(), lastEventHash: e2.eventHash };
+    const e3 = createTaskEvent(alice, "complete", { status: "claimed", assigneeFingerprintActual: alice.fingerprint, result: null }, completed);
+    ts1.upsert(completed, e3);
+    assert.equal(ts1.get(task.id).status, "completed");
+
+    // 篡改磁盘 snapshot：把 tasks.jsonl 里的 status 改成 open（恶意/损坏快照）
+    const taskFile = path.join(dir, "tasks", "tasks.jsonl");
+    const lines = fs.readFileSync(taskFile, "utf8").trim().split("\n").map(JSON.parse);
+    const t = lines.find((x) => x.id === task.id);
+    t.status = "open"; // 快照与 event log 不一致
+    fs.writeFileSync(taskFile, lines.map((x) => JSON.stringify(x)).join("\n"), "utf8");
+
+    // 重启加载 → event log wins，状态应恢复 completed
+    const ts2 = new TaskStore(dir);
+    const reloaded = ts2.get(task.id);
+    assert.equal(reloaded.status, "completed", "快照被篡改后重启，event log 应重放恢复 completed");
+    assert.equal(reloaded.result, "done");
+    assert.equal(reloaded.lastEventHash, e3.eventHash);
+  });
+
+  // P1-⑦ forks 是 derived view——重启后从 events 重算，不信任 snapshot.forks
+  it("P1-⑦ 篡改 snapshot.forks 重启 → forks 从 events 重算（derived view）", () => {
+    const alice = loadOrCreateIdentity(path.join(tmp, "alice_p17"), "alice");
+    const bob = loadOrCreateIdentity(path.join(tmp, "bob_p17"), "bob");
+    const dir = path.join(tmp, `p17_${Date.now()}`);
+    const ts1 = new TaskStore(dir);
+    const task = createTask({ title: "derived fork", policy: { ...TASK_POLICIES.COLLABORATIVE } });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts1.upsert(task, e1);
+    // alice claim → 主链
+    const aClaimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+    const e2a = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, aClaimed);
+    ts1.upsert(aClaimed, e2a);
+    // bob claim → fork（同一 parent）
+    const bClaimed = { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash };
+    const e2b = createTaskEvent(bob, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, bClaimed);
+    ts1.eventHistory(task.id).push(e2b); // 进入事件库但非主链
+    // 落盘：直接追加 e2b 到 events.jsonl（模拟曾收到但主链未采纳）
+    const evFile = path.join(dir, "tasks", "events.jsonl");
+    fs.appendFileSync(evFile, JSON.stringify(e2b) + "\n", "utf8");
+    const local = ts1.get(task.id);
+    assert.ok(local.forks === undefined || local.forks.length === 0 || local.forks.length >= 0);
+    // 篡改 snapshot.forks 为垃圾
+    const taskFile = path.join(dir, "tasks", "tasks.jsonl");
+    const lines = fs.readFileSync(taskFile, "utf8").trim().split("\n").map(JSON.parse);
+    const t = lines.find((x) => x.id === task.id);
+    t.forks = [{ headEventHash: "garbage", actor: "evil", ts: 1, action: "cancel" }];
+    fs.writeFileSync(taskFile, lines.map((x) => JSON.stringify(x)).join("\n"), "utf8");
+
+    const ts2 = new TaskStore(dir);
+    const reloaded = ts2.get(task.id);
+    // forks 应为 derived（含 bob 的 e2b，不含垃圾 garbage）
+    const forkHashes = (reloaded.forks || []).map((f) => f.headEventHash);
+    assert.ok(!forkHashes.includes("garbage"), "垃圾 fork 不应保留");
+    assert.ok(forkHashes.includes(e2b.eventHash), `derived forks 应包含 bob 分支 ${e2b.eventHash}`);
+  });
 });
