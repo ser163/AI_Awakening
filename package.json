@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.19",
-    "description": "硅基协作网络 — World 事务化(BEGIN/RECORD/COMMIT) + Branch 资格统一验证器 + EvidenceId 确定性, 174 tests",
+  "version": "0.12.20",
+      "description": "硅基协作网络 — World 事务严格状态机(fail-closed) + crash-consistent 语义声明, 179 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

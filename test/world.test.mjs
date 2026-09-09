@@ -631,6 +631,58 @@ describe("world: transaction commit 语义（P1）", () => {
     assert.equal(w2.entities.has("device:after"), false, "损坏后的数据不得进入世界");
   });
 
+  // v0.12.20 (审查 P1): 严格事务状态机——非法事务结构必须 fail-closed
+  describe("strict transaction state machine", () => {
+    const strictDir = path.join(dir, "strict_" + Date.now());
+
+    it("RECORD(txId) without BEGIN → fail-closed, 记录不应用", () => {
+      const d = path.join(strictDir, "orphan_rec_" + Date.now());
+      const w = new WorldModel(d);
+      w.observeAgent("fp-alice", "alice");
+      const pre = [...w.agents.keys()].sort();
+      const logFile = path.join(d, "world", "world.jsonl");
+      // 直接写入带 txId 的记录，无 BEGIN（模拟结构损坏）
+      fs.appendFileSync(logFile, '{"schemaVersion":1,"txId":"orphan","kind":"entity","id":"ghost","type":"sensor","name":"Ghost"}\n', "utf8");
+      const w2 = new WorldModel(d);
+      assert.ok(!w2.isHealthy(), "无 BEGIN 的 txId record → unhealthy");
+      assert.deepEqual([...w2.agents.keys()].sort(), pre, "非法记录不得应用（ghost entity 不应出现）");
+    });
+
+    it("COMMIT(txId) without BEGIN → unhealthy", () => {
+      const d = path.join(strictDir, "orphan_commit_" + Date.now());
+      const w = new WorldModel(d);
+      w.observeAgent("fp-alice", "alice");
+      const logFile = path.join(d, "world", "world.jsonl");
+      fs.appendFileSync(logFile, '{"schemaVersion":1,"kind":"tx_commit","txId":"no-begin"}\n', "utf8");
+      const w2 = new WorldModel(d);
+      assert.ok(!w2.isHealthy(), "无 BEGIN 的 commit → unhealthy");
+      assert.equal(w2.agents.get("fp-alice")?.name, "alice", "合法事务仍应应用");
+    });
+
+    it("RECORD(txId=A) after BEGIN(txId=B) → unhealthy, A 不应用", () => {
+      const d = path.join(strictDir, "cross_tx_" + Date.now());
+      const w = new WorldModel(d);
+      w.observeAgent("fp-alice", "alice");
+      const pre = [...w.agents.keys()].sort();
+      const logFile = path.join(d, "world", "world.jsonl");
+      // 合法 tx_begin(B) 后插入 record(A)（模拟日志结构损坏）
+      fs.appendFileSync(logFile, '{"schemaVersion":1,"kind":"tx_begin","txId":"tx-B"}\n', "utf8");
+      fs.appendFileSync(logFile, '{"schemaVersion":1,"txId":"tx-A","kind":"entity","id":"cross-ghost","type":"sensor"}\n', "utf8");
+      const w2 = new WorldModel(d);
+      assert.ok(!w2.isHealthy(), "record(A) inside open tx(B) → unhealthy");
+      assert.deepEqual([...w2.agents.keys()].sort(), pre, "非法 record 不得影响世界");
+    });
+
+    it("正常 BEGIN→RECORD×N→COMMIT 通过（状态机不误伤合法事务）", () => {
+      const d = path.join(strictDir, "legal_" + Date.now());
+      const w = new WorldModel(d);
+      w.observeEntity("device:legal", "sensor", "legal-1");
+      const w2 = new WorldModel(d);
+      assert.ok(w2.isHealthy());
+      assert.equal(w2.entities.get("device:legal")?.name, "legal-1", "合法事务正常应用");
+    });
+  });
+
   it("同 txId 多 record 事务 → 全部应用或全部丢弃（原子性跨 record）", () => {
     const d = path.join(dir, "multi_" + Date.now());
     const w = new WorldModel(d);

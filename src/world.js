@@ -19,6 +19,13 @@
  * 持久化：append-only JSONL 事件日志。启动时重放日志重建状态——
  * 没有"创建 append / 更新内存 / 事件全量 save"三套混杂语义。
  * Entity/Agent/Fact/Relation 的每次变更都是一条日志事件。
+ *
+ * ⚠️ v0.12.20 (审查 P1) 持久化语义声明——**crash-consistent，非 durable commit**：
+ *   _persist() 成功 = 数据已写入 OS file interface（appendFileSync），
+ *   **不保证 fsync 落盘**。进程/OS/磁盘在 write 后、稳定存储前崩溃，
+ *   最后一次事务可能整体丢失——由 BEGIN/RECORD/COMMIT 边界保证：
+ *   "丢失的是整个最后事务"，绝不产生半事务状态。
+ *   需要 durable commit 的场景应显式 fsync（当前本地单节点模型不需要）。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -108,10 +115,14 @@ export class WorldModel {
       const text = fs.readFileSync(this.logFile, "utf8");
       if (!text.trim()) return;
       const lines = text.trim().split("\n").filter(Boolean);
-      // v0.12.19 (审查 P1): 事务感知重放——只应用 BEGIN→RECORDS→COMMIT 完整的 transaction。
-      //   - 无 tx 标记的旧日志行（legacy 格式）→ 逐行直接应用（向后兼容）
-      //   - 文件尾部存在未 commit 的事务 / 半行 JSON（崩溃截断）→ 整体丢弃，不产生半事务状态
-      //   - 非尾部 JSON 损坏 → 标记 unhealthy 并停止（中部损坏 fail-closed，v0.12.4 语义）
+      // v0.12.19/20 (审查 P1/P2): 严格事务状态机重放——
+      //   协议: tx_begin(txId) → RECORD(txId)×N → tx_commit(txId)
+      //   状态: IDLE → BEGIN(A) → OPEN(A) → COMMIT(A) → IDLE
+      //   OPEN(A) 期间: RECORD(A) ✓ | COMMIT(A) ✓ | BEGIN(B)/COMMIT(B)/RECORD(B) → 非法
+      //   IDLE 期间:   RECORD(txId)/COMMIT(txId)（无 BEGIN）→ 非法
+      //   非法 transition → fail-closed：persistentHealthy=false，非法记录绝不 _replay。
+      //   legacy 行（无 txId）→ 逐行直接应用（仅旧日志向后兼容）。
+      //   文件尾部未 commit 事务 / 半行 JSON（崩溃截断）→ 丢弃（crash recovery，见文件头语义）。
       let pendingTx = null; // {txId, records: []}
       for (let i = 0; i < lines.length; i++) {
         let rec;
@@ -128,26 +139,41 @@ export class WorldModel {
           this.persistenceError = `world log corrupted at line ${i + 1}: ${err?.message || err}`;
           break; // 停止重放——损坏后继续读取会让世界建立在不一致状态上
         }
-        if (rec.txId) {
-          if (rec.kind === "tx_begin") {
-            pendingTx = { txId: rec.txId, records: [] };
-          } else if (rec.kind === "tx_commit") {
-            if (pendingTx && pendingTx.txId === rec.txId) {
-              // 事务完整 → 按序应用全部记录
-              for (const r of pendingTx.records) this._replay(r);
-              pendingTx = null;
-            }
-            // 孤儿 commit（无对应 begin）→ 忽略
-          } else if (pendingTx && pendingTx.txId === rec.txId) {
-            pendingTx.records.push(rec);
-          } else if (!pendingTx) {
-            // 带 txId 但无 begin 的记录（异常中段）→ 视为单条直接应用（幂等安全）
-            this._replay(rec);
-          }
-          // txId 不匹配的悬空记录 → 丢弃（属于未 commit 的事务）
-        } else {
+        // 非法事务结构 → fail-closed 并停止（不静默跳过、不直接执行）
+        const txViolation = (msg) => {
+          this.persistentHealthy = false;
+          this.persistenceError = `world log tx protocol violation at line ${i + 1}: ${msg}`;
+          return true; // 已标记失败 → 上层 break
+        };
+        if (!rec.txId) {
           // legacy 行（无事务标记）：直接应用，保持旧日志兼容
           this._replay(rec);
+          continue;
+        }
+        if (rec.kind === "tx_begin") {
+          if (pendingTx) {
+            if (txViolation(`tx_begin(${rec.txId}) while tx ${pendingTx.txId} still open`)) break;
+          }
+          pendingTx = { txId: rec.txId, records: [] };
+        } else if (rec.kind === "tx_commit") {
+          if (!pendingTx) {
+            if (txViolation(`tx_commit(${rec.txId}) without tx_begin`)) break;
+          } else if (pendingTx.txId !== rec.txId) {
+            if (txViolation(`tx_commit(${rec.txId}) inside open tx ${pendingTx.txId}`)) break;
+          } else {
+            // 事务完整 → 按序应用全部记录
+            for (const r of pendingTx.records) this._replay(r);
+            pendingTx = null;
+          }
+        } else {
+          // 数据 record
+          if (!pendingTx) {
+            if (txViolation(`record(${rec.kind || "?"}) with txId ${rec.txId} without tx_begin — 拒绝直接执行`)) break;
+          } else if (pendingTx.txId !== rec.txId) {
+            if (txViolation(`record txId ${rec.txId} inside open tx ${pendingTx.txId}`)) break;
+          } else {
+            pendingTx.records.push(rec);
+          }
         }
       }
       // 尾部未 commit 事务 = 崩溃残留 → 丢弃（transaction boundary 保证不产生半事务状态）
@@ -222,11 +248,16 @@ export class WorldModel {
   }
 
   /**
-   * v0.12.19 (审查 P1): 事务化持久化——每条操作包裹 BEGIN + RECORDS + COMMIT 标记。
+   * v0.12.19/20 (审查 P1): 事务化持久化——每条操作包裹 BEGIN + RECORDS + COMMIT 标记。
    * 写入格式：{txId, kind:"tx_begin"} → {txId, kind:..., ...}×N → {txId, kind:"tx_commit"}。
-   * 所有行在一次 appendFileSync 写入；崩溃时日志尾部未 commit 的事务被视为不完整→重启时丢弃。
+   *
+   * ⚠️ 语义边界（v0.12.20 明确）：**crash-consistent，非 durable commit**。
+   * 单次 appendFileSync 成功 = 已交给 OS file interface；无 fsync。
+   * 进程/OS 崩溃可能丢失整个最后事务（BEGIN..COMMIT 全部未落盘），
+   * 但绝不产生半事务状态——重放时无 COMMIT 的事务整体丢弃。
+   *
    * @param {object|object[]} recs 单条或数组（数据记录，不含事务标记）
-   * @returns {boolean} true = 全部落盘成功
+   * @returns {boolean} true = 写入 OS 成功
    */
   _persist(recs) {
     if (!this.logFile) return true; // 内存模式
