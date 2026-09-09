@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.8-blue)]
+[![Version](https://img.shields.io/badge/version-0.12.9-blue)]
 
 **作者：[ser163](https://github.com/ser163) · 你的 AI 节点在等待。**
 
@@ -250,6 +250,7 @@ E:\pr\AI_Awakening\
 | **v0.12.6** | **State Transition Unification** — fork 不再免检 (forked 标记后仍验证语义)、deriveNextState() 唯一状态转移来源 (live/replay 共用)、canonicalize 全字段连续性 (status+assignee+result)、eventIndex 元数据索引 (hash→{actor,action,ts,height}) | ✅ |
 | **v0.12.7** | **no-op 无旁路** — semanticVersion 显式版本 (v2 无条件 deriveNextState, v1 legacy)、before=after 不再跳过验证、genesis 也走 deriveNextState、deriveNextState 纯函数化 (删 Date.now)、no-op signed event 测试 | ✅ |
 | **v0.12.8** | **版本签名完整性** — canonicalizeEvent 版本化 (V2 含 semanticVersion 签名防降级)、semanticVersion 白名单 (3≥/字符串/null 拒)、版本降级 attack (v2→v1) 签名失效、v1 网络接收→REJECT (仅 local migration)、132 tests | ✅ |
+| **v0.12.9** | **Event 唯一状态权威** — packet.task 仅 transport (runtime state 一律 deriveNextState 推导，不再 upsert(packet.task))、allowLegacy 门控 (网络=v2 only/本地 migration=v1 allowed)、eventId/eventHash 一致性 (同 id 异 hash→tamper 拒)、无事件旧包 claim/complete→拒、135 tests | ✅ |
 | v0.10 | 记忆内核 — SQLite/WAL、事件库、索引、知识图谱 | 🗺 VISION |
 | v0.11 | 自主循环 — 目标引擎、规划器、观察者、反思/学习 | 🗺 VISION |
 | v0.12 | Agent 社会 — 信誉、能力市场、争议仲裁 | 🗺 VISION |

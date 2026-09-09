@@ -20,7 +20,7 @@ import { buildAgentCard } from "./agent-card.js";
 import { encryptFor, decryptFrom } from "./signal.js";
 import { TrustedIdentityStore, ReplayCache } from "./trust.js";
 import { createEnvelope, acceptEnvelope } from "./envelope.js";
-import { TaskStore, createTask, taskMessage, extractTaskFromPacket, createTaskEvent, checkTransition, validateTaskEvent } from "./tasks.js";
+import { TaskStore, createTask, taskMessage, extractTaskFromPacket, createTaskEvent, checkTransition, validateTaskEvent, deriveNextState } from "./tasks.js";
 import { DHTNode, nodeIdFromIdentity, makeDhtHandler } from "./dht.js";
 import {
   buildSelfSnapshot,
@@ -294,7 +294,11 @@ export class AgentNode extends EventEmitter {
     if (event) {
       const local = this.tasks.get(task.id);
       const hasLocal = local != null;
-      const ev = validateTaskEvent(event, action, local || task, this.trust, { hasLocalRecord: hasLocal });
+      const ev = validateTaskEvent(event, action, local || task, this.trust, {
+        hasLocalRecord: hasLocal,
+        // v0.12.9 (审查 P0): 网络路径拒绝 V1/unversioned——只接受 v2
+        allowLegacy: false,
+      });
       if (!ev.ok) {
         console.warn(`🚫 任务事件被拒 (${packet.authorName}): ${ev.reason}`);
         if (packet.author) this.trust.markSuspicious(packet.author);
@@ -330,39 +334,90 @@ export class AgentNode extends EventEmitter {
         this.emit("task:forked", { taskId: task.id, fork: forkRecord, action, from: packet.author });
         return;
       }
-    } else {
-      // 旧版（无事件）：仅做去重
-      const dedupEvent = { eventId: `${packet.id}:${action}` };
-      const { duplicate } = this.tasks.upsert({ ...task }, dedupEvent);
-      if (duplicate) return;
+
+      // v0.12.9 (审查 P0): Event 是唯一 Runtime State Authority。
+      // packet.task 只是 transport representation——不能直接写库。
+      // 状态一律由 deriveNextState 从 event 推导，再应用（保留本地静态定义字段）。
+      const nextState = deriveNextState(
+        event.beforeState || { status: null, assigneeFingerprintActual: "", result: null },
+        event.action,
+        event.actor,
+        event.payload
+      );
+      const base = local || { ...task }; // 首见用 packet 静态字段初始化，后续保留本地
+      base.status = nextState.status;
+      base.assigneeFingerprintActual = nextState.assigneeFingerprintActual || "";
+      base.result = nextState.result ?? null;
+      if (event.action === "claim") base.claimedAt = event.ts;
+      if (event.action === "complete") base.completedAt = event.ts;
+      if (event.action === "cancel") base.cancelledAt = event.ts;
+      this.tasks.upsert(base, event);
+      if (action === "publish") {
+        // 首见：用 packet 的静态定义字段初始化（title/publisher/等）
+        // 但 runtime state（status/assignee/result）只来自 event
+        const existing = this.tasks.get(task.id);
+        if (existing) {
+          existing.title = task.title || existing.title;
+          existing.description = task.description ?? existing.description;
+          existing.publisherFingerprint = task.publisherFingerprint || existing.publisherFingerprint || event.actor;
+          existing.publisherName = task.publisherName || existing.publisherName;
+          existing.requiredCapabilities = task.requiredCapabilities || existing.requiredCapabilities || [];
+          existing.policy = task.policy || existing.policy;
+          existing.assigneeFingerprint = task.assigneeFingerprint || existing.assigneeFingerprint || "";
+          this.tasks.upsert(existing);
+        }
+        this.memory.append("task_published_received", { id: task.id, title: task.title, from: packet.author });
+        this.emit("task:published", { task, from: packet.author, fromName: packet.authorName });
+      } else if (action === "claim") {
+        this.emit("task:claimed", { task, from: packet.author, fromName: packet.authorName });
+      } else if (action === "complete") {
+        this.emit("task:completed", { task, from: packet.author, fromName: packet.authorName });
+      }
+      this.emit("task:update", { action, task, from: packet.author });
+      return;
     }
 
-    // 记录任务到本地仓库（事件去重）——新版事件路径已在上面验证+记录，此处跳过
-    const { duplicate } = this.tasks.upsert({ ...task }, event || undefined);
-    if (duplicate && !event) return; // 旧版走这里，新版已在上面处理
-
-    if (action === "publish") {
+    // v0.12.9 (审查 P0): 无 event 的旧包——transport task 不可信。
+    // packet.task 的 runtime state（status/assignee/result）一律不写库；
+    // 仅可用于首次创建的静态定义字段 + open 初始态。
+    const local = this.tasks.get(task.id);
+    if (action === "publish" && !local) {
+      // 首见旧格式发布：接受静态定义，runtime 初始化为协议规定的 open 空态
+      const fresh = {
+        id: task.id,
+        title: task.title || "未命名任务",
+        description: task.description ?? null,
+        publisherFingerprint: task.publisherFingerprint || packet.author,
+        publisherName: task.publisherName || packet.authorName || "",
+        requiredCapabilities: task.requiredCapabilities || [],
+        policy: task.policy || undefined,
+        assigneeFingerprint: "",
+        status: "open",
+        assigneeFingerprintActual: "",
+        result: null,
+        claimedAt: null,
+        completedAt: null,
+        cancelledAt: null,
+        lastEventHash: null,
+        createdAt: task.createdAt || Date.now(),
+      };
+      this.tasks.upsert(fresh, undefined);
       this.memory.append("task_published_received", { id: task.id, title: task.title, from: packet.author });
       this.emit("task:published", { task, from: packet.author, fromName: packet.authorName });
-    } else if (action === "claim") {
-      const local = this.tasks.get(task.id);
-      if (local) {
-        local.status = task.status;
-        local.assigneeFingerprintActual = task.assigneeFingerprintActual;
-        this.tasks.upsert(local, event || undefined);
-      }
-      this.emit("task:claimed", { task, from: packet.author, fromName: packet.authorName });
-    } else if (action === "complete") {
-      const local = this.tasks.get(task.id);
-      if (local) {
-        local.status = task.status;
-        local.result = task.result;
-        local.completedAt = task.completedAt;
-        this.tasks.upsert(local, event || undefined);
-      }
-      this.emit("task:completed", { task, from: packet.author, fromName: packet.authorName });
+      this.emit("task:update", { action, task, from: packet.author });
+      return;
     }
-    this.emit("task:update", { action, task, from: packet.author });
+    if (local && action === "publish") {
+      // 已存在：仅静态字段可更新，runtime state 拒绝从 packet 覆盖
+      local.title = task.title || local.title;
+      local.description = task.description ?? local.description;
+      this.tasks.upsert(local, undefined);
+      this.emit("task:update", { action, task, from: packet.author });
+      return;
+    }
+    // 无 event 的 claim/complete/cancel 旧包：无法验证状态转移 → 拒绝（不产生状态变化）
+    console.warn(`🚫 无事件旧包无法验证状态转移 (${packet.authorName} ${action})——拒绝`);
+    this.emit("task:rejected", { action, task, event: null, reason: "legacy no-event packet cannot drive state transitions" });
   }
 
   /** 收到普通消息 → 记忆 + 事件 */

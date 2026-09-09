@@ -14,12 +14,13 @@ import { Registry, NodeServer } from "../src/network.js";
 import { loadOrCreateIdentity } from "../src/identity.js";
 import { createEnvelope, verifyEnvelope, acceptEnvelope, RECIPIENT_BROADCAST } from "../src/envelope.js";
 import { TrustedIdentityStore, ReplayCache } from "../src/trust.js";
-import { createTask, createTaskEvent, validateTaskEvent, checkTransition, TaskStore, TASK_STATUS, TASK_POLICIES } from "../src/tasks.js";
+import { createTask, createTaskEvent, validateTaskEvent, checkTransition, TaskStore, TASK_STATUS, TASK_POLICIES, hashEvent, deriveNextState } from "../src/tasks.js";
 import { createSelfState, validateSelfDeclaration } from "../src/self.js";
 import http from "node:http";
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import fs from "node:fs";
 
 const tmp = path.join(os.tmpdir(), "ai_hardening_test_" + Date.now());
 
@@ -135,7 +136,7 @@ describe("v0.10.1: task_* RPC 走 Task State Machine", () => {
     const task = createTask({ title: "rpc 任务", requiredCapabilities: ["knowledge"] });
     task.publisherFingerprint = pub.identity.fingerprint;
     task.publisherName = pub.name;
-    const event = createTaskEvent(pub.identity, "publish", task);
+    const event = createTaskEvent(pub.identity, "publish", null, task);
     pub.tasks.upsert(task, event);
 
     const res = await pub.sendRpc(sub.address, "task_publish", { task, event, fromName: pub.name });
@@ -498,8 +499,10 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     const sharedTs = Date.now();
     const e2a = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
     e2a.ts = sharedTs;
+    e2a.eventHash = hashEvent(e2a); // ts 是签名域 → 改后重算 hash 保持自洽
     const e2b = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
     e2b.ts = sharedTs;
+    e2b.eventHash = hashEvent(e2b);
 
     // a 先成为主链
     ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2a.eventHash }, e2a);
@@ -750,5 +753,113 @@ describe("v0.12.0: SelfState（自我从叙事升级为结构化状态）", () =
     assert.deepEqual(s.goals, []);
     assert.deepEqual(s.uncertainties, []);
     assert.ok(s.updatedAt);
+  });
+});
+
+describe("v0.12.9: 审查 P0 针对性测试", () => {
+  const tmp = path.join(fs.realpathSync(os.tmpdir()), "hard_v0129");
+
+  function freshStore() {
+    return new TaskStore(path.join(tmp, `ts_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`));
+  }
+
+  // P0-① Event 唯一状态权威：事件外部 packet.task 快照不应成为 runtime state
+  it("P0-① 事件外部 task 快照不注入 runtime state（deriveNextState 覆盖状态）", () => {
+    const alice = loadOrCreateIdentity(path.join(tmp, "alice_p0a"), "alice");
+    const store = new TrustedIdentityStore();
+    store.learn(alice.fingerprint, alice.publicKey, { source: "registry" });
+
+    const task = createTask({ title: "测试", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+
+    // 正常 v2 publish event
+    const event = createTaskEvent(alice, "publish", null, task);
+
+    // 模拟恶意 packet：task 带有伪造 runtime state（COMPLETED）
+    const maliciousTask = { ...task, status: "completed", assigneeFingerprintActual: "attacker" };
+
+    // validate 通过 → deriveNextState → base = maliciousTask → base.status = nextState.status = OPEN
+    const base = task; // 模拟无 local 时用 packet.task
+    const ev = validateTaskEvent(event, "publish", base, store, { hasLocalRecord: false, allowLegacy: false });
+    assert.equal(ev.ok, true, "合法 v2 publish 应通过验证");
+
+    // 模拟 _handleTaskMessage 内的 deriveNextState 逻辑
+    const nextState = deriveNextState(
+      event.beforeState || { status: null, assigneeFingerprintActual: "", result: null },
+      event.action,
+      event.actor,
+      event.payload
+    );
+    const stored = { ...maliciousTask };
+    stored.status = nextState.status;
+    stored.assigneeFingerprintActual = nextState.assigneeFingerprintActual || "";
+    stored.result = nextState.result ?? null;
+
+    assert.equal(stored.status, "open", "恶意快照的 completed 被 deriveNextState 覆盖为 open");
+    assert.equal(stored.assigneeFingerprintActual, "", "恶意 assignee 被覆盖为空");
+  });
+
+  // P0-② V1/unversioned 网络路径→必须被拒
+  it("P0-② allowLegacy=false 时 V1/unversioned 事件必须被拒", () => {
+    const alice = loadOrCreateIdentity(path.join(tmp, "alice_p0b"), "alice");
+    const store = new TrustedIdentityStore();
+    store.learn(alice.fingerprint, alice.publicKey, { source: "registry" });
+
+    const task = createTask({ title: "版本测试", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+
+    // 3-arg v1 publish 事件
+    const v1Event = createTaskEvent(alice, "publish", task);
+    assert.equal(v1Event.semanticVersion, 1, "3-arg 事件应为 semanticVersion=1");
+
+    // allowLegacy=true → 通过（本地 migration）
+    const okLocal = validateTaskEvent(v1Event, "publish", task, store, { hasLocalRecord: false, allowLegacy: true });
+    assert.equal(okLocal.ok, true, "allowLegacy=true 应接受 V1");
+
+    // allowLegacy=false → 必须拒绝（网络路径）
+    const bad = validateTaskEvent(v1Event, "publish", task, store, { hasLocalRecord: false, allowLegacy: false });
+    assert.equal(bad.ok, false, "allowLegacy=false 应拒绝 V1");
+    assert.ok(bad.reason.includes("v1"), `拒绝原因提及 v1: ${bad.reason}`);
+
+    // 缺失 semanticVersion 的事件
+    const unverEvent = { ...v1Event };
+    delete unverEvent.semanticVersion;
+    const badUnver = validateTaskEvent(unverEvent, "publish", task, store, { hasLocalRecord: false, allowLegacy: false });
+    assert.equal(badUnver.ok, false, "allowLegacy=false 应拒绝 unversioned 事件");
+    assert.ok(badUnver.reason.includes("unversioned"), `拒绝原因提及 unversioned: ${badUnver.reason}`);
+  });
+
+  // P0-③ eventId/eventHash 一致性约束
+  it("P0-③ TaskStore 拒绝 eventId 被不同 hash 复用", () => {
+    const alice = loadOrCreateIdentity(path.join(tmp, "alice_p0c"), "alice");
+    const store = new TrustedIdentityStore();
+    store.learn(alice.fingerprint, alice.publicKey, { source: "registry" });
+    const ts = freshStore();
+
+    const task = createTask({ title: "一致性测试", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+
+    const event = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, event); // first insert → OK
+
+    // 同 eventId + 不同 eventHash → must throw
+    const tampered = {
+      ...event,
+      eventHash: "FAKE_HASH_" + Date.now(), // 不同 hash → 与存储的 priorHash 冲突
+      afterState: { ...event.afterState, status: "claimed" }, // 改内容（hash 不匹配内容）
+    };
+    let shouldThrow = false;
+    try {
+      ts.upsert({ ...task }, tampered);
+    } catch (e) {
+      shouldThrow = true;
+      assert.ok(e.tamper || e.message.includes("eventId reuse with different content"), `tamper detected: ${e.message}`);
+    }
+    assert.equal(shouldThrow, true, "same eventId + different hash 必须 throw");
+
+    // 同 eventHash 但不同 eventId → duplicate（非 throw）
+    const duplicateEvent = { ...event, eventId: "dup-id-" + Date.now() };
+    const result = ts.upsert({ ...task }, duplicateEvent);
+    assert.equal(result.duplicate, true, "同 eventHash 不同 eventId 应 duplicate");
   });
 });

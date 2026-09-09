@@ -199,7 +199,7 @@ function canonicalizeEvent(ev) {
 }
 
 /** 计算事件的防篡改哈希（v0.10.1: 真哈希，不再是 eventId） */
-function hashEvent(ev) {
+export function hashEvent(ev) {
   return crypto.createHash("sha256").update(canonicalizeEvent(ev)).digest("hex");
 }
 
@@ -330,7 +330,7 @@ export function extractTaskFromPacket(packet) {
  *   首见（无本地记录）时不校验 previousHash 链——链从签名广播引导建立。
  * @returns {{ok: boolean, reason?: string}}
  */
-export function validateTaskEvent(event, action, task, trustedStore, { hasLocalRecord = true } = {}) {
+export function validateTaskEvent(event, action, task, trustedStore, { hasLocalRecord = true, allowLegacy = true } = {}) {
   if (!event || !event.signature || !event.actor || !event.taskId || !event.action) {
     return { ok: false, reason: "malformed task event" };
   }
@@ -373,6 +373,18 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
   if (event.semanticVersion !== undefined && event.semanticVersion !== null) {
     if (typeof event.semanticVersion !== "number" || !KNOWN_SEMANTIC_VERSIONS.has(event.semanticVersion)) {
       return { ok: false, reason: `unsupported semanticVersion: ${event.semanticVersion} (must be 1 or 2)` };
+    }
+  }
+  // v0.12.9 (审查 P0): 版本门控——allowLegacy=false（网络路径）只接受显式 v2；
+  //   semanticVersion=1 或缺失（unversioned）一律 REJECT。allowLegacy=true（本地
+  //   migration/replay）才允许 v1/unversioned 走 legacy 解码。
+  if (!allowLegacy) {
+    const isV2 = event.semanticVersion === 2;
+    if (!isV2) {
+      const reason = event.semanticVersion === 1
+        ? "semanticVersion=1 rejected on network path (v1 = local migration only)"
+        : "unversioned event rejected on network path (v2 required)";
+      return { ok: false, reason };
     }
   }
   // isLegacy 判定（v0.12.8 修正）：
@@ -573,6 +585,8 @@ export class TaskStore {
     this.tasks = new Map();       // id -> task (当前状态)
     this.events = new Map();      // id -> [events]（按 taskId 分组）
     this._seenEvents = new Set(); // eventId 去重
+    this._eventHashById = new Map(); // v0.12.9: eventId → eventHash（一致性约束）
+    this._seenEventHashes = new Set(); // v0.12.9: eventHash 去重（内容身份）
     this._taskFile = storageDir ? path.join(storageDir, "tasks", "tasks.jsonl") : null;
     this._eventFile = storageDir ? path.join(storageDir, "tasks", "events.jsonl") : null;
     // v0.12.3: 持久化健康状态——与 WorldModel 统一，不再静默吞异常
@@ -600,7 +614,11 @@ export class TaskStore {
         const text = fs.readFileSync(this._eventFile, "utf8");
         for (const line of text.trim().split("\n").filter(Boolean)) {
           const ev = JSON.parse(line);
-          if (ev.eventId) this._seenEvents.add(ev.eventId);
+          if (ev.eventId) {
+            this._seenEvents.add(ev.eventId);
+            if (ev.eventHash) this._eventHashById.set(ev.eventId, ev.eventHash);
+          }
+          if (ev.eventHash) this._seenEventHashes.add(ev.eventHash);
           if (ev.taskId) {
             if (!this.events.has(ev.taskId)) this.events.set(ev.taskId, []);
             this.events.get(ev.taskId).push(ev);
@@ -640,8 +658,29 @@ export class TaskStore {
    */
   upsert(task, event = null) {
     if (event && event.eventId) {
-      if (this._seenEvents.has(event.eventId)) return { task, duplicate: true };
+      // v0.12.9 (审查 P0): eventId/eventHash 一致性约束——内容身份不可被复用篡改。
+      //   same eventId + 不同 eventHash → 同一逻辑事件换了内容 = tamper，REJECT。
+      //   same eventHash + 不同 eventId → 相同内容重复出现 = duplicate。
+      const priorHash = this._eventHashById.get(event.eventId);
+      const thisHash = event.eventHash || null;
+      if (thisHash && priorHash && priorHash !== thisHash) {
+        const err = new Error(`eventId reuse with different content: ${event.eventId} (tamper detected)`);
+        err.tamper = true;
+        throw err;
+      }
+      if (this._seenEvents.has(event.eventId)) {
+        // 同 eventId 再投递：内容相同 = duplicate；内容不同已被上方拦截
+        return { task, duplicate: true };
+      }
+      if (thisHash && this._seenEventHashes.has(thisHash)) {
+        // 同内容但新 eventId：内容身份重复 → duplicate（同一事件被重新包装）
+        return { task, duplicate: true };
+      }
       this._seenEvents.add(event.eventId);
+      if (thisHash) {
+        this._seenEventHashes.add(thisHash);
+        this._eventHashById.set(event.eventId, thisHash);
+      }
       this._appendEvent(event);
       if (!this.events.has(task.id)) this.events.set(task.id, []);
       this.events.get(task.id).push(event);

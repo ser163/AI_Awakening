@@ -134,6 +134,7 @@ E:\pr\AI_Awakening\
 | 2026-09-08 | v0.12.6 | **State Transition Unification** | **128** | fork 不再免检 (forked=true 标记后继续完整语义验证), deriveNextState() 唯一状态转移来源 (live validate + replay 共用, 协议推导 expected 不信任声明), canonicalize 全字段连续性检查 (status+assignee+result 三字段), eventIndex 升级元数据索引 (hash→{eventId,parentHash,actor,action,ts,height}), fork+非法转移测试 |
 | 2026-09-08 | v0.12.7 | **no-op 无旁路** | **130** | semanticVersion 显式版本 (v2=4-arg 无条件 deriveNextState 含 no-op, v1=legacy), before=after 不再跳过验证 (修复状态机旁路), genesis 也走 deriveNextState (null→publish→open), deriveNextState 纯函数化 (删除 Date.now, 声明禁止非纯调用), no-op signed event 测试集 (claimed→complete→claimed / open→claim→open 均拒) |
 | 2026-09-08 | v0.12.8 | **版本签名完整性** | **132** | canonicalizeEvent 版本化 (V2 含 semanticVersion 签名域→防版本降级攻击, V1 旧格式向后兼容), semanticVersion 白名单 (已知 {1,2}, numeric 3≥/字符串/null 拒), v2→v1 downgrade attack 测试 (签名失效), v1 网络接收→拒绝策略 (local migration/read only), isLegacy 修正 (v1 显式 legacy, 缺失时启发式) |
+| 2026-09-09 | v0.12.9 | **Event 唯一状态权威** | **135** | _handleTaskMessage 不再 upsert(packet.task,event)——runtime state 一律 deriveNextState 推导后再写库 (packet.task 仅静态定义字段可初始化), allowLegacy 门控 (validateTaskEvent + {allowLegacy}; 网络路径=false→v1/unversioned REJECT, 本地 migration=true→v1 allowed), TaskStore eventId/eventHash 一致性 (同 eventId+异 hash→tamper throw; 同 hash 异 id→duplicate; _eventHashById+_seenEventHashes 索引), 无事件旧包 claim/complete→REJECT (无法验证转移), RPC 测试改 4-arg v2, hashEvent 导出, 3 个 P0 针对性测试 |
 
 > 2026-09-08 在同一天发布了 v0.8.0 和 v0.9.0，因为自我叩问完成后，审查反馈指出信任模型的安全缺陷，随即在同一天完成了信任层补完。
 
