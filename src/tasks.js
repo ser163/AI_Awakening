@@ -490,15 +490,13 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
       return { ok: false, reason };
     }
   }
-  // isLegacy 判定（v0.12.8 修正）：
-  //   semanticVersion===2 → v2 无条件 deriveNextState
-  //   semanticVersion===1 → v1 legacy（历史格式，显式声明）
-  //   缺失（旧磁盘事件）→ 启发式：无 beforeState/afterState 或 before≈after 视为 legacy
+  // isLegacy 判定（v0.12.22 审查 #②）：仅 explicit semanticVersion 定义版本。
+  //   2 → v2 无条件 deriveNextState；1 → v1 legacy（local migration only）。
+  //   undefined/null/0/3/... → 字段缺失不等于 legacy——malformed ≠ legacy，直接拒绝。
   let isLegacyEvent;
   if (event.semanticVersion === 1) isLegacyEvent = true;
   else if (event.semanticVersion === 2) isLegacyEvent = false;
-  else if (!event.beforeState || !event.afterState) isLegacyEvent = true;
-  else isLegacyEvent = event.beforeState.status === event.afterState.status && event.beforeState.assigneeFingerprintActual === event.afterState.assigneeFingerprintActual;
+  else return { ok: false, reason: `unsupported semanticVersion: ${event.semanticVersion} (must be 1 or 2)` };
   if (!isLegacyEvent) {
     // v2 事件（4-arg）：无条件验证状态机（含 no-op 也要经 deriveNextState）
     if (hasLocalRecord && !forked) {
@@ -857,6 +855,12 @@ export class TaskStore {
     for (const ev of chain) {
       const h = ev.eventHash || ev.eventId;
       try {
+        // v0.12.22 (审查 P0): **Legacy 不得参与 authoritative replay**。
+        // 只允许语义版本 explicit V2 事件进入权威状态推导；V1/无版本 只能用于只读迁移，
+        // 不能作为 canonical candidate（需由迁移工具先转换为 V2）。
+        if (ev.semanticVersion !== 2) {
+          return { ok: false, category: "legacy", reason: `legacy/unversioned event ${ev.eventId} cannot participate in authoritative replay` };
+        }
         // v0.12.18 (审查 P1): authorization gate —— live 与 replay 同一语义闭环。
         // 恶意节点用合法私钥签署无权限转移 → 在 replay 上同样被拒。
         const authz = checkEventAuthorization(task, ev);
@@ -1158,10 +1162,11 @@ export class TaskStore {
         isMainChain: true,
       }] : []),
     ];
-    // v0.12.18/19 (审查 P1): fork candidate 资格检测走**完整 Event Kernel**（_replayBranchToState），
+    // v0.12.18/22 (审查 P1/P0): fork candidate 资格检测走**完整 Event Kernel**（_replayBranchToState），
     // 与 _tryRebuildFromEvents 用同一套验证，杜绝半验证器漂移。
-    //   失败 category=authorization → 合法签名但无权限 → 分支无资格竞争 canonical，直接排除；
-    //   失败 category=semantic（integrity/状态机损坏）→ **不在此静默排除**——日志损坏应 fail-closed，
+    //   失败 category=authorization → 合法签名但无权限 → 分支无资格竞争 canonical，排除；
+    //   失败 category=legacy → legacy/unversioned 不得参与权威状态 → 排除（仅可只读迁移）；
+    //   失败 category=semantic（状态机损坏）→ **不在此静默排除**——日志损坏应 fail-closed，
     //   留给 canonicalizeTask 重放时 throw（冻结契约：损坏不得被悄悄忽略或降级）。
     if (candidates.length > 1) {
       const byHash = {};
@@ -1171,7 +1176,9 @@ export class TaskStore {
         const headEv = byHash[c.headEventHash];
         if (!headEv) return true; // 头事件不在日志中 → 由 canonicalizeTask 重放时暴露（fail-closed）
         const replay = this._replayBranchToState(task, headEv, byHash);
-        return !(replay.ok === false && replay.category === "authorization");
+        // authorization / legacy 失败 → 分支无资格成为 canonical（排除，不 throw）
+        if (replay.ok === false && (replay.category === "authorization" || replay.category === "legacy")) return false;
+        return true;
       });
     }
     if (candidates.length === 0) return null;
@@ -1294,46 +1301,31 @@ export class TaskStore {
       }
       // 用 deriveNextState 推导期望状态（v0.12.6/v0.12.7）
       if (ev.beforeState && ev.afterState && ev.action) {
-        // v0.12.7: 用 semanticVersion 判断 legacy（不再用 before≠after）。
-        //   semanticVersion===2 → v2 无条件验证（含 no-op）
-        //   semanticVersion===1 → legacy 直接应用
-        //   缺失（旧磁盘事件）→ 启发式：before===after 视为 legacy
-        const noExplicitVersion = ev.semanticVersion === undefined || ev.semanticVersion === null;
-        const heuristicLegacy = noExplicitVersion && ev.beforeState.status === ev.afterState.status && ev.beforeState.assigneeFingerprintActual === ev.afterState.assigneeFingerprintActual;
-        const isLegacyEv = ev.semanticVersion === 1 || heuristicLegacy;
-        if (isLegacyEv) {
-          // 3-arg 兼容（beforeState===afterState 或 semanticVersion=1）：直接应用 afterState
-          const state = ev.afterState || ev.payload?.state || {};
-          if (i === 0) {
-            currentState = { status: state.status || TASK_STATUS.OPEN, assigneeFingerprintActual: state.assigneeFingerprintActual || "", result: state.result ?? null };
-          } else {
-            currentState.status = state.status || ev.status || currentState.status;
-            if (state.assigneeFingerprintActual) currentState.assigneeFingerprintActual = state.assigneeFingerprintActual;
-            if (state.result !== undefined && state.result !== null) currentState.result = state.result;
-          }
-        } else {
-          // v2 事件（4-arg 显式转移）：用 deriveNextState 推导，不信任声明
-          // genesis（i===0）也走 deriveNextState——null→publish→open 是合法转移
-          try {
-            const beforeState = i === 0 ? { status: null, assigneeFingerprintActual: "", result: null } : currentState;
-            const expected = deriveNextState(beforeState, ev.action, ev.actor, ev.payload);
-            // 验证后状态与声明的 afterState 一致
-            const after = ev.afterState;
-            if (after.status !== expected.status) throw new Error(`afterState.status mismatch: declared=${after.status}, expected=${expected.status}`);
-            if ((after.assigneeFingerprintActual || "") !== (expected.assigneeFingerprintActual || "")) throw new Error(`afterState.assignee mismatch: declared=${after.assigneeFingerprintActual || ""}, expected=${expected.assigneeFingerprintActual || ""}`);
-            if (actionHasResult(ev.action) && (after.result ?? null) !== (expected.result ?? null)) throw new Error(`afterState.result mismatch: declared=${after.result ?? null}, expected=${expected.result ?? null}`);
-            // 应用推导的状态（不是 afterState）
-            currentState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
-          } catch (err) {
-            throw new Error(`canonicalizeTask: illegal state transition at ${ev.eventId}: ${err.message}`);
-          }
+        // v0.12.22 (审查 P0/#②): canonicalizeTask 是权威重放——只有 explicit v2 参与。
+        //   v1/unversioned/malformed 一律 throw（legacy 只能走独立 migration 工具，
+        //   生成 v2 事件后再重放；这里绝不静默直接应用 afterState）。
+        if (ev.semanticVersion !== 2) {
+          throw new Error(`canonicalizeTask: event ${ev.eventId} is semanticVersion ${ev.semanticVersion === undefined ? "(unversioned)" : String(ev.semanticVersion)} — legacy events cannot participate in authoritative replay (migrate to v2 first)`);
+        }
+        // v2 事件（4-arg 显式转移）：用 deriveNextState 推导，不信任声明
+        // genesis（i===0）也走 deriveNextState——null→publish→open 是合法转移
+        try {
+          const beforeState = i === 0 ? { status: null, assigneeFingerprintActual: "", result: null } : currentState;
+          const expected = deriveNextState(beforeState, ev.action, ev.actor, ev.payload);
+          // 验证后状态与声明的 afterState 一致
+          const after = ev.afterState;
+          if (after.status !== expected.status) throw new Error(`afterState.status mismatch: declared=${after.status}, expected=${expected.status}`);
+          if ((after.assigneeFingerprintActual || "") !== (expected.assigneeFingerprintActual || "")) throw new Error(`afterState.assignee mismatch: declared=${after.assigneeFingerprintActual || ""}, expected=${expected.assigneeFingerprintActual || ""}`);
+          if (actionHasResult(ev.action) && (after.result ?? null) !== (expected.result ?? null)) throw new Error(`afterState.result mismatch: declared=${after.result ?? null}, expected=${expected.result ?? null}`);
+          // 应用推导的状态（不是 afterState）
+          currentState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
+        } catch (err) {
+          throw new Error(`canonicalizeTask: illegal state transition at ${ev.eventId}: ${err.message}`);
         }
       } else {
-        // 极旧事件（无 beforeState/afterState）：fallback
-        const state = ev.payload?.state || {};
-        currentState.status = state.status || ev.status || currentState.status;
-        if (state.assigneeFingerprintActual) currentState.assigneeFingerprintActual = state.assigneeFingerprintActual;
-        if (state.result !== undefined && state.result !== null) currentState.result = state.result;
+        // v0.12.22 (审查 #②): 无 beforeState/afterState 的极旧事件 = malformed，不是 legacy。
+        // 唯一合法入口是显式 semanticVersion===1 且带 afterState 的上分支。
+        throw new Error(`canonicalizeTask: event ${ev.eventId} missing beforeState/afterState (unversioned malformed event cannot replay)`);
       }
       reconstructed.status = currentState.status;
       reconstructed.assigneeFingerprintActual = currentState.assigneeFingerprintActual;

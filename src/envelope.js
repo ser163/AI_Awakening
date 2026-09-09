@@ -92,6 +92,11 @@ export function verifyEnvelope(env, trustedStore, { clockSkewMs = ENVELOPE_CLOCK
   if (!env.type || !env.sender || !env.signature || !env.nonce) {
     return { ok: false, reason: "malformed envelope (missing type/sender/signature/nonce)" };
   }
+  // v0.12.22 (审查 P2): timestamp 类型严格校验——malformed timestamp 不得进入
+  // JS 隐式类型转换（NaN/string/null 会让时钟偏移检查变成无意义比较）
+  if (typeof env.timestamp !== "number" || !Number.isFinite(env.timestamp)) {
+    return { ok: false, reason: "invalid timestamp (must be finite number)" };
+  }
 
   // 1. 可信身份
   const publicKey = trustedStore.getPublicKey(env.sender);
@@ -129,6 +134,12 @@ export function verifyEnvelope(env, trustedStore, { clockSkewMs = ENVELOPE_CLOCK
  * @returns {{ok: boolean, reason?: string}}
  */
 export function acceptEnvelope(env, trustedStore, { localFingerprint, replayCache, clockSkewMs } = {}) {
+  // v0.12.22 (审查 P2): replayCache 是安全接收的强制组件，不是 optional。
+  // 无防重放需求的纯验签场景请用 verifyEnvelope()——acceptEnvelope 不提供"半安全"模式。
+  if (!replayCache) {
+    return { ok: false, reason: "replay cache required (acceptEnvelope is the full-security ingress)" };
+  }
+
   // 1. 加密 + 结构验证
   const v = verifyEnvelope(env, trustedStore, { clockSkewMs });
   if (!v.ok) return v;
@@ -139,11 +150,9 @@ export function acceptEnvelope(env, trustedStore, { localFingerprint, replayCach
   }
 
   // 3. 防重放
-  if (replayCache) {
-    const replay = replayCache.checkAndStore(`env:${env.sender}:${env.nonce}`, env.timestamp);
-    if (!replay.ok) {
-      return { ok: false, reason: replay.reason };
-    }
+  const replay = replayCache.checkAndStore(`env:${env.sender}:${env.nonce}`, env.timestamp);
+  if (!replay.ok) {
+    return { ok: false, reason: replay.reason };
   }
 
   return { ok: true };

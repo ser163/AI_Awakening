@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.21-blue)]
+[![Version](https://img.shields.io/badge/version-0.12.22-blue)]
 
 **作者：[ser163](https://github.com/ser163) · 你的 AI 节点在等待。**
 

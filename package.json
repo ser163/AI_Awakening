@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.21",
-      "description": "硅基协作网络 — World 事务状态机闭合(legacy 穿透 fail-closed), 181 tests",
+  "version": "0.12.22",
+      "description": "硅基协作网络 — Legacy 与权威状态彻底分离(V2-only replay) + World eventHash, 181 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

@@ -267,7 +267,7 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     const ts = new TaskStore();
     const task = createTask({ title: "线性任务" });
     task.publisherFingerprint = alice.fingerprint;
-    const e1 = createTaskEvent(alice, "publish", task);
+    const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
     assert.equal(ts.canonicalizeTask(task.id), null, "无 fork 不应重建");
   });
@@ -276,15 +276,22 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     const ts = new TaskStore();
     const task = createTask({ title: "分叉任务A" });
     task.publisherFingerprint = alice.fingerprint;
-    const e1 = createTaskEvent(alice, "publish", task);
+    const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
 
     // alice（publisher）先 claim —— 成为主链
-    const e2alice = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
-    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2alice.eventHash }, e2alice);
+    const aClaimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+    const e2alice = createTaskEvent(alice, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash }
+    );
+    ts.upsert(aClaimed, e2alice);
 
     // bob 也 claim —— 分叉被记录
-    const e2bob = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    const e2bob = createTaskEvent(bob, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash }
+    );
     const local = ts.get(task.id);
     local.forks = [{ headEventHash: e2bob.eventHash, actor: bob.fingerprint, ts: e2bob.ts, action: "claim" }];
     ts.upsert(local);
@@ -302,15 +309,22 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     const ts = new TaskStore();
     const task = createTask({ title: "分叉任务B" });
     task.publisherFingerprint = alice.fingerprint;
-    const e1 = createTaskEvent(alice, "publish", task);
+    const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
 
     // bob（非 publisher）先 claim —— 成为主链
-    const e2bob = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
-    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e2bob.eventHash }, e2bob);
+    const bobClaimed = { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash };
+    const e2bob = createTaskEvent(bob, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash }
+    );
+    ts.upsert(bobClaimed, e2bob);
 
     // alice（publisher）后 claim —— 分叉，但 publisher 事件应胜出
-    const e2alice = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    const e2alice = createTaskEvent(alice, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash }
+    );
     const local = ts.get(task.id);
     local.forks = [{ headEventHash: e2alice.eventHash, actor: alice.fingerprint, ts: e2alice.ts, action: "claim" }];
     ts.upsert(local);
@@ -328,15 +342,22 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     const ts = new TaskStore();
     const task = createTask({ title: "分叉任务C" });
     task.publisherFingerprint = alice.fingerprint;
-    const e1 = createTaskEvent(alice, "publish", task);
+    const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
 
     // bob（非 publisher）先 claim —— 成为主链
-    const e2bob = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
-    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e2bob.eventHash }, e2bob);
+    const bobClaimed = { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash };
+    const e2bob = createTaskEvent(bob, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash }
+    );
+    ts.upsert(bobClaimed, e2bob);
 
     // alice（publisher）后 claim —— 分叉，publisher 事件胜出
-    const e2alice = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    const e2alice = createTaskEvent(alice, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash }
+    );
     const local = ts.get(task.id);
     local.forks = [{ headEventHash: e2alice.eventHash, actor: alice.fingerprint, ts: e2alice.ts, action: "claim" }];
     ts.upsert(local);
@@ -358,13 +379,20 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     // COLLABORATIVE 策略：fork = newest（无 publisher 特权）
     const task = createTask({ title: "协作任务", policy: TASK_POLICIES.COLLABORATIVE });
     task.publisherFingerprint = alice.fingerprint;
-    const e1 = createTaskEvent(alice, "publish", task);
+    const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
 
     // alice 先 claim（成为主链），bob 后 claim（分叉）
-    const e2alice = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
-    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2alice.eventHash }, e2alice);
-    const e2bob = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    const aClaimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+    const e2alice = createTaskEvent(alice, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash }
+    );
+    ts.upsert(aClaimed, e2alice);
+    const e2bob = createTaskEvent(bob, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash }
+    );
     const local = ts.get(task.id);
     local.forks = [{ headEventHash: e2bob.eventHash, actor: bob.fingerprint, ts: e2bob.ts + 500, action: "claim" }]; // bob 更新
     ts.upsert(local);
@@ -492,15 +520,21 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     const ts = new TaskStore();
     const task = createTask({ title: "tie-break", policy: { ...TASK_POLICIES.COLLABORATIVE } }); // newest 规则
     task.publisherFingerprint = alice.fingerprint;
-    const e1 = createTaskEvent(alice, "publish", task);
+    const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
 
     // 两个 claim 用完全相同的 ts（手动构造平局）
     const sharedTs = Date.now();
-    const e2a = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    const e2a = createTaskEvent(alice, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash }
+    );
     e2a.ts = sharedTs;
     e2a.eventHash = hashEvent(e2a); // ts 是签名域 → 改后重算 hash 保持自洽
-    const e2b = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    const e2b = createTaskEvent(bob, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash }
+    );
     e2b.ts = sharedTs;
     e2b.eventHash = hashEvent(e2b);
 
@@ -534,13 +568,19 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
     const ts = new TaskStore();
     const task = createTask({ title: "stateHash 判等" });
     task.publisherFingerprint = alice.fingerprint;
-    const e1 = createTaskEvent(alice, "publish", task);
+    const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
 
-    const bobClaim = createTaskEvent(bob, "claim", { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash });
+    const bobClaim = createTaskEvent(bob, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash }
+    );
     ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: bobClaim.eventHash }, bobClaim);
 
-    const aliceClaim = createTaskEvent(alice, "claim", { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash });
+    const aliceClaim = createTaskEvent(alice, "claim",
+      { status: "open", assigneeFingerprintActual: "", result: null },
+      { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash }
+    );
     const local = ts.get(task.id);
     local.forks = [{ headEventHash: aliceClaim.eventHash, actor: alice.fingerprint, ts: aliceClaim.ts, action: "claim" }];
     ts.upsert(local);

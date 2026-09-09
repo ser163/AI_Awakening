@@ -70,7 +70,41 @@ export const SOURCE_TYPES = {
   NETWORK: "network",   // 网络拓扑观察
 };
 
-/** 来源陈述类型 */
+/** 权威记录类型：参与状态推导的 kind，不含 tx/event 标记 */
+const AUTHORITATIVE_KINDS = new Set(["entity", "agent", "evidence", "evidence_retracted", "claim_retracted", "relation"]);
+
+/**
+ * v0.12.22 (审查 P1 #④): 计算 World 权威记录的完整性哈希。
+ * 固定键序 JSON.stringify 规范——同内容在任何节点产生同 hash。
+ * 非权威记录（event/tx 标记）不计算 hash。
+ * @param {object} rec 记录对象（不含 txId/eventHash/schemaVersion）
+ * @returns {string|null} 24 hex chars，或 null（非权威类型或格式错误）
+ */
+function worldRecordHash(rec) {
+  if (!rec || !rec.kind || !AUTHORITATIVE_KINDS.has(rec.kind)) return null;
+  const canonical = JSON.stringify({
+    kind: rec.kind,
+    claimId: rec.claimId || null,
+    evidenceId: rec.evidenceId || null,
+    subject: rec.subject || null,
+    predicate: rec.predicate || null,
+    object: rec.object ?? null,
+    source: rec.source || null,
+    id: rec.id || null,
+    type: rec.type || null,
+    name: rec.name || null,
+    meta: rec.meta || null,
+    from: rec.from || null,
+    to: rec.to || null,
+    observedAt: rec.observedAt ?? null,
+    validFrom: rec.validFrom ?? null,
+    validUntil: rec.validUntil ?? null,
+    ts: rec.ts ?? null,
+    retractedBy: rec.retractedBy || null,
+    reason: rec.reason || null,
+  });
+  return crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 24);
+}
 export const SOURCE_KINDS = {
   ASSERTION: "assertion",   // "我认为 X"
   OBSERVATION: "observation", // "我观察到 X"
@@ -164,9 +198,25 @@ export class WorldModel {
           } else if (pendingTx.txId !== rec.txId) {
             if (txViolation(`tx_commit(${rec.txId}) inside open tx ${pendingTx.txId}`)) break;
           } else {
-            // 事务完整 → 按序应用全部记录
-            for (const r of pendingTx.records) this._replay(r);
-            pendingTx = null;
+            // 事务完整 → 逐条验证 eventHash → 按序应用全部记录
+            for (const r of pendingTx.records) {
+              // v0.12.22 (审查 P1 #④): 权威记录完整性校验——RECORD 本身不得被修改。
+              // 旧格式（无 eventHash，v0.12.21 之前）→ 跳过（迁移期兼容）；
+              // 新格式声明 eventHash → 必须与内容自洽，否则 fail-closed。
+              if (r.eventHash) {
+                const h = worldRecordHash({ ...r });
+                // 注意: r 含 eventHash 字段, worldRecordHash 只取固定键, 不受多余字段影响
+                if (!h || h !== r.eventHash) {
+                  this.persistentHealthy = false;
+                  this.persistenceError = `world log record integrity failed at line ${i + 1}: ${r.kind || "?"} eventHash mismatch (record modified)`;
+                  pendingTx = null;
+                  i = lines.length; // 终止整个循环
+                  break;
+                }
+              }
+              this._replay(r);
+            }
+            if (pendingTx) pendingTx = null; // 只有完整验证通过才关闭
           }
         } else {
           // 数据 record
@@ -269,7 +319,10 @@ export class WorldModel {
     const txId = crypto.randomUUID(); // 每操作唯一事务 ID（崩溃恢复用，不参与状态推导）
     const logLines = [
       JSON.stringify({ schemaVersion: 1, kind: "tx_begin", txId }),
-      ...arr.map((r) => JSON.stringify({ schemaVersion: 1, txId, ...r })),
+      ...arr.map((r) => {
+        const h = worldRecordHash(r);
+        return JSON.stringify({ schemaVersion: 1, txId, ...(h ? { eventHash: h } : {}), ...r });
+      }),
       JSON.stringify({ schemaVersion: 1, kind: "tx_commit", txId }),
     ];
     try {
