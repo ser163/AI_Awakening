@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.27",
-      "description": "硅基协作网络 — applyWorldTransition 纯函数(state-in/state-out) + 确定性 ts 禁止 Date.now 回退, 194 tests",
+  "version": "0.12.28",
+      "description": "硅基协作网络 — event data 引用隔离(structuredClone) + evidence 时间字段 ?? 取代 ||, 196 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

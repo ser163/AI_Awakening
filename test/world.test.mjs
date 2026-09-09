@@ -920,6 +920,39 @@ describe("world: applyWorldTransition 纯函数 & 确定性", () => {
     assert.equal(s1.entities.get("e:d1")?.name, "D1");
     assert.equal(s2.entities.get("e:d1")?.name, "D1");
   });
+
+  it("event data 深拷贝——外部修改 rec.data 不得影响 state（引用隔离）", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    const data = { kind: "entity_seen", id: "e:ref", type: "sensor", meta: { tag: "orig" } };
+    const s1 = applyWorldTransition(s0, { kind: "event", data, ts: 10 });
+    assert.equal(s1.events.length, 1, "state 含 1 条事件");
+    // 外部修改原 data 对象（深改嵌套字段）
+    data.meta.tag = "MUTATED";
+    data.kind = "hacked";
+    assert.notEqual(s1.events[0], data, "state 中的事件不是原对象引用");
+    assert.equal(s1.events[0].kind, "entity_seen", "state 事件不受外部修改影响");
+    assert.equal(s1.events[0].meta.tag, "orig", "嵌套字段同样隔离");
+  });
+
+  it("evidence 时间字段 falsy 值不丢失（0 是合法时间, ?? 而非 ||）", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    const rec = {
+      kind: "evidence",
+      subject: "agent:a", predicate: "located_at", object: "X",
+      ts: 100,
+      observedAt: 0,        // falsy 但合法（epoch 0）
+      validFrom: 0,
+      validUntil: 0,
+      source: { type: SOURCE_TYPES.SELF, id: "me" },
+    };
+    const s1 = applyWorldTransition(s0, rec);
+    const claim = s1.claims.get("agent:a|located_at|X");
+    assert.ok(claim, "claim 已建");
+    const ev = claim.evidence[0];
+    assert.equal(ev.observedAt, 0, "observedAt=0 不丢失");
+    assert.equal(ev.validFrom, 0, "validFrom=0 不丢失");
+    assert.equal(ev.validUntil, 0, "validUntil=0 不丢失");
+  });
 });
 
 // v0.12.23 (审查 P1/P2): eventHash 完整性——任意权威字段修改→hash 变化→fail-closed

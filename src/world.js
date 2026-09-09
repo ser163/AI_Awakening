@@ -403,7 +403,7 @@ export class WorldModel {
     if (!ev || !ev.subject || !ev.predicate) {
       throw new Error("evidence requires subject and predicate");
     }
-    const observedAt = ev.observedAt || Date.now();
+    const observedAt = ev.observedAt ?? Date.now();
     const source = {
       type: ev.source?.type || SOURCE_TYPES.AGENT,
       id: ev.source?.id || "",
@@ -439,8 +439,8 @@ export class WorldModel {
         object: ev.object,
         source,
         observedAt,
-        validFrom: ev.validFrom || null,   // v0.12.0: 时间三维分开
-        validUntil: ev.validUntil || null,
+        validFrom: ev.validFrom ?? null,   // v0.12.0: 时间三维分开
+        validUntil: ev.validUntil ?? null,
         ts,
       },
       { kind: "event", data: { kind: "evidence_ingested", claimId, subject: ev.subject, predicate: ev.predicate, object: ev.object, ts }, ts },
@@ -448,7 +448,7 @@ export class WorldModel {
 
     // 持久化成功 → 更新内存
     this._addEvidenceToClaim(
-      { claimId, evidenceId, subject: ev.subject, predicate: ev.predicate, object: ev.object, source, observedAt, validFrom: ev.validFrom || null, validUntil: ev.validUntil || null },
+      { claimId, evidenceId, subject: ev.subject, predicate: ev.predicate, object: ev.object, source, observedAt, validFrom: ev.validFrom ?? null, validUntil: ev.validUntil ?? null },
       ts
     );
     this._pushEvent({ kind: "evidence_ingested", claimId, subject: ev.subject, predicate: ev.predicate, object: ev.object, ts });
@@ -876,7 +876,7 @@ export function applyWorldTransition(state, rec) {
       next.events.push({ kind: "relation_added", from: rec.from, type: rec.type, to: rec.to, ts: now });
     }
   } else if (rec.kind === "event") {
-    next.events.push(rec.data);
+    next.events.push(structuredClone(rec.data));
   }
   return next;
 }
@@ -905,15 +905,15 @@ function addEvidenceToClaims(claims, rec, now) {
       observedAt: rec.observedAt ?? now,
       validFrom: rec.validFrom,
       validUntil: rec.validUntil,
-      observationId: rec.observationId || null,
+      observationId: rec.observationId ?? null,
     }),
     subject: rec.subject,
     predicate: rec.predicate,
     object: rec.object,
     source: rec.source || { type: "unknown", id: "", kind: SOURCE_KINDS.ASSERTION },
-    observedAt: rec.observedAt || now,
-    validFrom: rec.validFrom || null,   // v0.12.0: 三维时间
-    validUntil: rec.validUntil || null,
+    observedAt: rec.observedAt ?? now,
+    validFrom: rec.validFrom ?? null,   // v0.12.0: 三维时间
+    validUntil: rec.validUntil ?? null,
   };
   if (existing) {
     const evidence = [...existing.evidence, evidenceItem];
