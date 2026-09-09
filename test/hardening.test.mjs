@@ -902,7 +902,7 @@ describe("v0.12.9: 审查 P0 针对性测试", () => {
     const bob = loadOrCreateIdentity(path.join(tmp, "bob_p17"), "bob");
     const dir = path.join(tmp, `p17_${Date.now()}`);
     const ts1 = new TaskStore(dir);
-    const task = createTask({ title: "derived fork", policy: { ...TASK_POLICIES.COLLABORATIVE } });
+    const task = createTask({ title: "derived fork", policy: { fork: "publisher" } }); // publisher 规则：alice(发布者)的 claim 主链胜出
     task.publisherFingerprint = alice.fingerprint;
     const e1 = createTaskEvent(alice, "publish", null, task);
     ts1.upsert(task, e1);
@@ -1014,7 +1014,7 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
     const trust = makeStore(alice); trust.learn(bob.fingerprint, bob.publicKey, { source: "registry" });
     const dir = path.join(aliceStore, `i3_${Date.now()}`);
     const ts = new TaskStore(dir);
-    const task = createTask({ title: "i3", policy: { ...TASK_POLICIES.COLLABORATIVE } });
+    const task = createTask({ title: "i3", policy: { fork: "publisher" } }); // publisher 规则：alice 主链胜出
     task.publisherFingerprint = alice.fingerprint;
     const e1 = createTaskEvent(alice, "publish", null, task);
     ts.upsert(task, e1);
@@ -1065,5 +1065,97 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
     assert.equal(replayState.status, liveState.status, "replay status == live status");
     assert.equal(replayState.assigneeFingerprintActual, liveState.assigneeFingerprintActual, "replay assignee == live assignee");
     assert.equal(replayState.lastEventHash, liveState.lastEventHash, "replay lastEventHash == live lastEventHash");
+  });
+
+  // P0-②: 日志损坏 → 立即终止 rebuild，禁止 partial state 写回
+  it("P0-② 事件日志损坏 → 不写 partial snapshot, 标记 unhealthy", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, "p0b2_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "p0b2", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash, claimedAt: Date.now() };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    ts.upsert(claimed, e2);
+    // 篡改 events.jsonl 中 e2 的 afterState（模拟日志损坏）
+    const evFile = path.join(dir, "tasks", "events.jsonl");
+    const lines = fs.readFileSync(evFile, "utf8").trim().split("\n").map(JSON.parse);
+    const e2Line = lines.find(x => x.eventHash === e2.eventHash || x.eventId === e2.eventId);
+    if (e2Line) { e2Line.afterState = { status: "completed", assigneeFingerprintActual: alice.fingerprint, result: "evil" }; }
+    fs.writeFileSync(evFile, lines.map(JSON.stringify).join("\n"), "utf8");
+    // 重启 → 日志损坏 → 不应写回 partial state
+    const ts2 = new TaskStore(dir);
+    const rt = ts2.get(task.id);
+    assert.equal(rt.status, "claimed", "损坏日志不应覆盖 snapshot（partial 禁止写回）");
+    assert.ok(!ts2.isHealthy(), "日志损坏后系统标记 unhealthy");
+  });
+
+  // P0-①: 因果断裂（beforeState != 当前重建状态）→ replay 失败
+  it("P0-① 因果断裂 beforeState != currentState → replay 失败不写回", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, "p0b1_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "p0b1", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash, claimedAt: Date.now() };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    ts.upsert(claimed, e2);
+    // 篡改 e2 的 beforeState.assigneeFingerprintActual（因果断裂）
+    const evFile = path.join(dir, "tasks", "events.jsonl");
+    const lines = fs.readFileSync(evFile, "utf8").trim().split("\n").map(JSON.parse);
+    const e2Line = lines.find(x => x.eventHash === e2.eventHash);
+    if (e2Line && e2Line.beforeState) { e2Line.beforeState.assigneeFingerprintActual = "bob"; }
+    // 但这样 eventHash 就不匹配了 → 先修 eventHash（模拟攻击者重算 hash）
+    // 实际上攻击者会重签事件，这里直接篡改 eventHash 以跳过第 1 步的全量 hash 验证
+    // 更直接：篡改 events.jsonl 加一个因果断裂的恶意事件（不破坏 hash 链）
+    // 不如直接造一个 beforeState 不对的合法事件
+    // 简单：e2Line.beforeState 改为 bob，然后重算 eventHash 保持自洽
+    if (e2Line) {
+      e2Line.beforeState = { status: "open", assigneeFingerprintActual: "bob", result: null };
+      e2Line.eventHash = crypto.createHash("sha256").update(JSON.stringify({ eventId: e2Line.eventId, taskId: e2Line.taskId, action: e2Line.action, actor: e2Line.actor, previousHash: e2Line.previousHash, ts: e2Line.ts, nonce: e2Line.nonce, semanticVersion: 2, status: e2Line.status, beforeState: { status: "open", assigneeFingerprintActual: "bob", result: null }, afterState: e2Line.afterState, payload: e2Line.payload })).digest("hex");
+    }
+    fs.writeFileSync(evFile, lines.map(JSON.stringify).join("\n"), "utf8");
+    const ts2 = new TaskStore(dir);
+    const rt = ts2.get(task.id);
+    // 因果断裂 → applyEvent 检测到 beforeState != curState → throw → 不写回
+    assert.equal(rt.status, "claimed", "因果断裂不应覆盖 snapshot");
+    assert.ok(!ts2.isHealthy(), "因果断裂标记 unhealthy");
+    // 但 eventHash 自洽 → 第 1 步 hash 验证通过；第 5 步 applyEvent 才失败 → 不写回
+  });
+
+  // P0-③: snapshot.lastEventHash 被篡改指向 fork → canonical head 仍由 forkRule 决定
+  it("P0-③ snapshot.lastEventHash 篡改指向 attacker fork → forkRule 仍选正确 head", () => {
+    const alice = makeAlice();
+    const bob = loadOrCreateIdentity(path.join(aliceStore, "bob_p0c3"), "bob");
+    const trust = makeStore(alice); trust.learn(bob.fingerprint, bob.publicKey, { source: "registry" });
+    const dir = path.join(aliceStore, "p0c3_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "p0c3", policy: { fork: "publisher" } });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const aC = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+    const e2a = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, aC);
+    ts.upsert(aC, e2a);
+    const bC = { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash };
+    const e2b = createTaskEvent(bob, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, bC);
+    ts.upsert(ts.get(task.id), e2b, { fork: true });
+    // 篡改 snapshot.lastEventHash 指向攻击者分支（bob claim）
+    const taskFile = path.join(dir, "tasks", "tasks.jsonl");
+    const tlines = fs.readFileSync(taskFile, "utf8").trim().split("\n").map(JSON.parse);
+    const t = tlines.find(x => x.id === task.id);
+    t.lastEventHash = e2b.eventHash; // 指向 bob fork！
+    fs.writeFileSync(taskFile, tlines.map(JSON.stringify).join("\n"), "utf8");
+    // 重启 → forkRule(publisher) 应选 alice 的 e2a 为主链
+    const ts2 = new TaskStore(dir);
+    const rt = ts2.get(task.id);
+    assert.equal(rt.lastEventHash, e2a.eventHash, "snapshot 指向 fork 分支 → forkRule 应纠正为 alice 主链");
+    assert.equal(rt.assigneeFingerprintActual, alice.fingerprint, "publisher 规则选 alice 为主链");
+    const forkHashes = (rt.forks || []).map(f => f.headEventHash);
+    assert.ok(forkHashes.includes(e2b.eventHash), "bob 分支应作为 derived fork 记录");
   });
 });

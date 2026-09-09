@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.11",
-    "description": "硅基协作网络 — Event Sourcing 完成 (fork 入 log/eventIndex 全索引/INVARIANT 1-4)",
+  "version": "0.12.12",
+    "description": "硅基协作网络 — Event Sourcing Integrity (共享 applyEvent 管道/forks 纯推导/日志损坏止于健康), 144 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

@@ -237,6 +237,30 @@ export function canonicalizeTaskDefinition(task) {
     .digest("hex");
 }
 
+/**
+ * v0.12.12: fork 视图纯推导函数——eventIndex + canonicalHead → 分支头列表。
+ * 原则：forks = pure derived data，同一函数供 reconcile + live upsert 使用，
+ * 消除"运行时 push fork 而恢复时重算"的双语义。
+ */
+export function deriveForkView(eventIndex, canonicalHead) {
+  if (!eventIndex || !canonicalHead) return [];
+  // canonical 主链集合
+  const mainSet = new Set();
+  let cur = canonicalHead;
+  let guard = 0;
+  while (cur && guard++ < 10000) { mainSet.add(cur); cur = eventIndex[cur]?.parentHash || null; }
+  if (mainSet.size === 0) return [];
+  // 分支头：不在主链上，但其 parent 在主链上
+  const forks = [];
+  for (const [h, meta] of Object.entries(eventIndex)) {
+    if (mainSet.has(h)) continue;
+    if (meta.parentHash && mainSet.has(meta.parentHash)) {
+      forks.push({ headEventHash: h, actor: meta.actor, ts: meta.ts, action: meta.action });
+    }
+  }
+  return forks;
+}
+
 /** 生成唯一 ID */
 function genId(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
@@ -533,6 +557,34 @@ export function deriveNextState(beforeState, action, actor, payload = null) {
 }
 
 /**
+ * v0.12.12 (审查 P0): 共享 Event Apply Pipeline——live 与 replay 走完全相同的语义验证。
+ * 不变量：声明的 beforeState 必须 == 当前重建状态（不信任事件自带 beforeState）；
+ * expected = deriveNextState(currentState,...)；expected == afterState。
+ * @param {object} currentState 当前重建状态 {status, assigneeFingerprintActual, result}
+ * @param {object} event v2 事件
+ * @returns {object} 新状态
+ * @throws {Error} 任何不变量违反
+ */
+export function applyEvent(currentState, event) {
+  const before = event.beforeState;
+  if (before) {
+    const cur = { status: currentState.status, assigneeFingerprintActual: currentState.assigneeFingerprintActual || "", result: currentState.result ?? null };
+    const decl = { status: before.status, assigneeFingerprintActual: before.assigneeFingerprintActual || "", result: before.result ?? null };
+    if (cur.status !== decl.status || cur.assigneeFingerprintActual !== decl.assigneeFingerprintActual || (cur.result ?? null) !== (decl.result ?? null)) {
+      throw new Error(`beforeState != currentState: declared=${JSON.stringify(decl)}, current=${JSON.stringify(cur)}`);
+    }
+  }
+  const expected = deriveNextState(currentState, event.action, event.actor, event.payload);
+  const after = event.afterState;
+  if (after) {
+    if (after.status !== expected.status) throw new Error(`afterState.status mismatch: declared=${after.status}, expected=${expected.status}`);
+    if ((after.assigneeFingerprintActual || "") !== (expected.assigneeFingerprintActual || "")) throw new Error(`afterState.assignee mismatch: declared=${after.assigneeFingerprintActual || ""}, expected=${expected.assigneeFingerprintActual || ""}`);
+    if (actionHasResult(event.action) && (after.result ?? null) !== (expected.result ?? null)) throw new Error(`afterState.result mismatch: declared=${after.result ?? null}, expected=${expected.result ?? null}`);
+  }
+  return { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
+}
+
+/**
  * 验证状态转换语义（v0.12.5→v0.12.6）。
  * v0.12.6: 改为 deriveNextState() + compare——协议自己推导 expected，
  * 不再信任事件自报的 afterState；并完整比较状态字段（含 result）。
@@ -692,36 +744,48 @@ export class TaskStore {
     }
   }
 
-  /** 从 events 重建一个 task 的权威 runtime state（失败返回 false，保留旧 snapshot） */
+  /**
+   * v0.12.12 (审查 P0): 从 events 重建权威 runtime state（唯一来源是 Event Log）。
+   * - head 选择：只按 forkRule 从 DAG heads 池决策，snapshot.lastEventHash 不参与
+   *   （快照最多是 skip 加速，不能影响 canonical choice）
+   * - 每个 v2 事件走共享 applyEvent()（beforeState==currentState + derive + afterState）
+   * - 任何失败 → return false，不写回 partial snapshot（日志损坏 = 只读降级）
+   */
   _tryRebuildFromEvents(id, task, events) {
     const byHash = {};
     for (const ev of events) byHash[ev.eventHash || ev.eventId] = ev;
-    // 找全部 chain head（不被任何孩子的 previousHash 指向的事件）
+    // 1. 全部事件先做 eventHash 自洽验证（主链 + fork 分支都要验，不是只验主链）
+    for (const ev of events) {
+      if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
+        this.persistentHealthy = false;
+        this.persistenceError = `event ${ev.eventId} tampered (hash mismatch)`;
+        return false; // 损坏 → 不重建、不写回
+      }
+    }
+    // 2. 找全部 chain head（不被任何孩子的 previousHash 指向的事件）
     const hasChild = new Set();
     for (const ev of events) if (ev.previousHash) hasChild.add(ev.previousHash);
     const heads = events.filter(ev => !hasChild.has(ev.eventHash || ev.eventId));
     if (heads.length === 0) return false;
 
-    // 选择 canonical head：优先匹配 snapshot.lastEventHash；否则按 forkRule 选
-    let headEv = heads.find(h => (h.eventHash || h.eventId) === task.lastEventHash);
-    if (!headEv) {
-      const forkRule = (task.policy && task.policy.fork) || "publisher";
-      const sorted = heads.slice().sort((a, b) => {
-        if (forkRule === "publisher") {
-          const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
-          const bIsPub = b.actor === task.publisherFingerprint ? 1 : 0;
-          if (aIsPub !== bIsPub) return bIsPub - aIsPub;
-        } else if (forkRule === "assignee") {
-          const aIsAsgn = a.actor === task.assigneeFingerprintActual ? 1 : 0;
-          const bIsAsgn = b.actor === task.assigneeFingerprintActual ? 1 : 0;
-          if (aIsAsgn !== bIsAsgn) return bIsAsgn - aIsAsgn;
-        }
-        return (b.ts || 0) - (a.ts || 0) || String(a.eventHash || "").localeCompare(String(b.eventHash || ""));
-      });
-      headEv = sorted[0];
-    }
+    // 3. canonical head 只由 forkRule 决策（snapshot.lastEventHash 不参与！）
+    const forkRule = (task.policy && task.policy.fork) || "publisher";
+    const sorted = heads.slice().sort((a, b) => {
+      if (forkRule === "publisher") {
+        const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
+        const bIsPub = b.actor === task.publisherFingerprint ? 1 : 0;
+        if (aIsPub !== bIsPub) return bIsPub - aIsPub;
+      } else if (forkRule === "assignee") {
+        const aIsAsgn = a.actor === task.assigneeFingerprintActual ? 1 : 0;
+        const bIsAsgn = b.actor === task.assigneeFingerprintActual ? 1 : 0;
+        if (aIsAsgn !== bIsAsgn) return bIsAsgn - aIsAsgn;
+      }
+      return (b.ts || 0) - (a.ts || 0) || String(a.eventHash || "").localeCompare(String(b.eventHash || ""));
+    });
+    const headEv = sorted[0];
+    if (!headEv) return false;
 
-    // 回溯主链
+    // 4. 回溯主链
     const chain = [];
     let cur = headEv.eventHash || headEv.eventId;
     let guard = 0;
@@ -732,33 +796,24 @@ export class TaskStore {
     if (chain.length === 0) return false;
     const mainHashes = new Set(chain.map(ev => ev.eventHash || ev.eventId));
 
-    // Derived forks：非主链事件，其 previousHash 在主链上 = branch head
-    const derivedForks = [];
-    for (const ev of events) {
-      const h = ev.eventHash || ev.eventId;
-      if (mainHashes.has(h)) continue;
-      if (ev.previousHash && mainHashes.has(ev.previousHash)) {
-        derivedForks.push({ headEventHash: h, actor: ev.actor, ts: ev.ts, action: ev.action });
-      }
-    }
-
-    // 重建 runtime state（从 chain replay）
+    // 5. 重建 runtime state（共享 applyEvent 管道）
     const rebuilt = { ...task, status: null, assigneeFingerprintActual: "", result: null, claimedAt: null, completedAt: null, cancelledAt: null, lastEventHash: null, forks: [], eventIndex: {}, eventHeight: 0 };
     let curState = { status: null, assigneeFingerprintActual: "", result: null };
     for (const ev of chain) {
       const h = ev.eventHash || ev.eventId;
-      if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
-        this.persistentHealthy = false; this.persistenceError = `event ${ev.eventId} tampered (hash mismatch)`;
-        break;
-      }
-      if (ev.semanticVersion === 2) {
-        try {
-          const bf = ev.beforeState || { status: null, assigneeFingerprintActual: "", result: null };
-          const expected = deriveNextState(bf, ev.action, ev.actor, ev.payload);
-          curState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
-        } catch { break; }
-      } else if (ev.afterState) {
-        curState = { status: ev.afterState.status || curState.status, assigneeFingerprintActual: ev.afterState.assigneeFingerprintActual || curState.assigneeFingerprintActual, result: ev.afterState.result ?? curState.result };
+      try {
+        if (ev.semanticVersion === 2) {
+          // genesis（i===0）beforeState 是空 → currentState 也是空，applyEvent 全字段验证
+          curState = applyEvent(curState, ev);
+        } else if (ev.afterState) {
+          // legacy：直接应用声明状态（历史格式，语义自由度保留）
+          curState = { status: ev.afterState.status || curState.status, assigneeFingerprintActual: ev.afterState.assigneeFingerprintActual || curState.assigneeFingerprintActual, result: ev.afterState.result ?? curState.result };
+        }
+      } catch (err) {
+        // P0: 日志损坏/语义断裂 → 立即终止，禁止 partial state 写回
+        this.persistentHealthy = false;
+        this.persistenceError = `event ${ev.eventId} replay failed: ${err.message}`;
+        return false;
       }
       rebuilt.status = curState.status; rebuilt.assigneeFingerprintActual = curState.assigneeFingerprintActual; rebuilt.result = curState.result;
       rebuilt.lastEventHash = h; rebuilt.eventHeight++; rebuilt.eventIndex[h] = { eventId: ev.eventId, parentHash: ev.previousHash || null, actor: ev.actor, action: ev.action, ts: ev.ts, height: rebuilt.eventHeight };
@@ -766,12 +821,10 @@ export class TaskStore {
       if (ev.action === "complete") rebuilt.completedAt = ev.ts;
       if (ev.action === "cancel") rebuilt.cancelledAt = ev.ts;
     }
-    rebuilt.forks = derivedForks;
-    // v0.12.11 (审查 P0-2): eventIndex 必须是全部已知事件索引——重建后把非主链
-    // 事件（fork 分支全部事件）也补入索引，否则多级 fork 延伸会误判 broken chain。
+    // 6. eventIndex 全量索引（fork 分支事件也补入；hash 已在第 1 步全部验证过）
     for (const ev of events) {
       const h = ev.eventHash || ev.eventId;
-      if (rebuilt.eventIndex[h]) continue; // 主链已索引
+      if (rebuilt.eventIndex[h]) continue;
       const parentMeta = rebuilt.eventIndex[ev.previousHash];
       rebuilt.eventIndex[h] = {
         eventId: ev.eventId,
@@ -782,6 +835,8 @@ export class TaskStore {
         height: (parentMeta?.height ?? 0) + 1,
       };
     }
+    // 7. forks 纯 derived（与运行时同一推导函数）
+    rebuilt.forks = deriveForkView(rebuilt.eventIndex, rebuilt.lastEventHash);
     rebuilt.title = task.title; rebuilt.description = task.description;
     rebuilt.publisherFingerprint = task.publisherFingerprint; rebuilt.publisherName = task.publisherName;
     rebuilt.requiredCapabilities = task.requiredCapabilities; rebuilt.policy = task.policy;
@@ -859,34 +914,19 @@ export class TaskStore {
       };
       if (fork) {
         // v0.12.11 (审查 P0-1): fork 事件进 log+index，但不篡改 canonical head/height/status。
-        // 新 branch head 判定：parent 在 canonical 主链上 → 本事件即新分支头
-        if (this._isCanonicalParent(event.previousHash, task) && !task.forks?.some(f => f.headEventHash === hash)) {
-          if (!task.forks) task.forks = [];
-          task.forks.push({ headEventHash: hash, actor: event.actor, ts: event.ts, action: event.action });
-        }
+        // v0.12.12 (审查 P1-④): forks 是纯 derived view——事件入库后整体重算，
+        // 与 reconcile/_tryRebuildFromEvents 走同一推导函数，不再单独 push。
       } else {
         // canonical 事件：更新 head/height/status
         task.lastEventHash = hash;
         task.eventHeight = (task.eventHeight || 0) + 1;
       }
+      // forks 恒为 derived：canonical head 更新后（或 fork 入库后）重算整个视图
+      task.forks = deriveForkView(task.eventIndex, task.lastEventHash);
     }
     this.tasks.set(task.id, task);
     this._saveTasks();
     return { task, duplicate: false };
-  }
-
-  /** v0.12.11: parentHash 是否在 canonical 主链上（沿 lastEventHash→previousHash 回溯） */
-  _isCanonicalParent(parentHash, task) {
-    if (!parentHash || !task.eventIndex) return false;
-    let cur = task.lastEventHash;
-    let guard = 0;
-    while (cur && guard++ < 10000) {
-      if (cur === parentHash) return true;
-      const meta = task.eventIndex[cur];
-      if (!meta) return false;
-      cur = meta.parentHash || null;
-    }
-    return false;
   }
 
   /** 获取任务 */
