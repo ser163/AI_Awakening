@@ -673,6 +673,36 @@ describe("world: transaction commit 语义（P1）", () => {
       assert.deepEqual([...w2.agents.keys()].sort(), pre, "非法 record 不得影响世界");
     });
 
+    // v0.12.21 (审查 P1): legacy record 不得绕过 pendingTx 事务边界
+    it("legacy RECORD inside open tx → unhealthy, X 与 A 都不得进入 World", () => {
+      const d = path.join(strictDir, "legacy_pierce_" + Date.now());
+      const w = new WorldModel(d);
+      w.observeAgent("fp-alice", "alice");
+      const pre = [...w.agents.keys()].sort();
+      const logFile = path.join(d, "world", "world.jsonl");
+      // BEGIN A → RECORD A → legacy RECORD X（无 txId，伪装旧日志穿透）→ 无 COMMIT A
+      fs.appendFileSync(logFile, '{"schemaVersion":1,"kind":"tx_begin","txId":"tx-A"}\n', "utf8");
+      fs.appendFileSync(logFile, '{"schemaVersion":1,"txId":"tx-A","kind":"entity","id":"entity-A","type":"sensor","name":"A"}\n', "utf8");
+      fs.appendFileSync(logFile, '{"schemaVersion":1,"kind":"entity","id":"entity-X","type":"sensor","name":"X"}\n', "utf8");
+      const w2 = new WorldModel(d);
+      assert.ok(!w2.isHealthy(), "legacy record inside open tx → unhealthy（fail-closed）");
+      assert.equal(w2.entities.has("entity-A"), false, "未 commit 事务 A 不得进入 World");
+      assert.equal(w2.entities.has("entity-X"), false, "legacy X 不得绕过事务边界生效");
+      assert.deepEqual([...w2.agents.keys()].sort(), pre, "合法事务仍应应用，世界无脏数据");
+    });
+
+    it("IDLE 状态 legacy record 仍可直接应用（旧日志向后兼容不回归）", () => {
+      const d = path.join(strictDir, "legacy_ok_" + Date.now());
+      const w = new WorldModel(d);
+      // 直接以 legacy 格式（无 txId）写一行（模拟旧版本日志）
+      const logFile = path.join(d, "world", "world.jsonl");
+      w.observeAgent("fp-first", "first"); // 建立目录
+      fs.appendFileSync(logFile, '{"schemaVersion":1,"kind":"entity","id":"legacy-ok","type":"sensor","name":"Legacy"}\n', "utf8");
+      const w2 = new WorldModel(d);
+      assert.ok(w2.isHealthy(), "IDLE 下 legacy 行不破坏 healthy");
+      assert.equal(w2.entities.get("legacy-ok")?.name, "Legacy", "legacy 行在 IDLE 状态应正常应用");
+    });
+
     it("正常 BEGIN→RECORD×N→COMMIT 通过（状态机不误伤合法事务）", () => {
       const d = path.join(strictDir, "legal_" + Date.now());
       const w = new WorldModel(d);

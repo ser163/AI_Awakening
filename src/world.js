@@ -146,7 +146,10 @@ export class WorldModel {
           return true; // 已标记失败 → 上层 break
         };
         if (!rec.txId) {
-          // legacy 行（无事务标记）：直接应用，保持旧日志兼容
+          // legacy 行（无事务标记）：仅 IDLE 状态允许直接应用；OPEN(tx) 内出现 → 非法穿透
+          if (pendingTx) {
+            if (txViolation(`legacy record inside open tx ${pendingTx.txId} — 事务边界穿透`)) break;
+          }
           this._replay(rec);
           continue;
         }
