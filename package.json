@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.10",
-    "description": "硅基协作网络 — Task 层冻结 (定义绑定/白名单构造/immutable/Event Sourcing 重放)",
+  "version": "0.12.11",
+    "description": "硅基协作网络 — Event Sourcing 完成 (fork 入 log/eventIndex 全索引/INVARIANT 1-4)",
   "type": "module",
   "main": "index.js",
   "scripts": {

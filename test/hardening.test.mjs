@@ -934,3 +934,136 @@ describe("v0.12.9: 审查 P0 针对性测试", () => {
     assert.ok(forkHashes.includes(e2b.eventHash), `derived forks 应包含 bob 分支 ${e2b.eventHash}`);
   });
 });
+
+describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
+  const aliceStore = path.join(fs.realpathSync(os.tmpdir()), "hard_invariant");
+  function makeAlice() { return loadOrCreateIdentity(path.join(aliceStore, "ai"), "alice"); }
+  function makeStore(iden) {
+    const s = new TrustedIdentityStore();
+    s.learn(iden.fingerprint, iden.publicKey, { source: "registry" });
+    return s;
+  }
+  function freshTStore(dir) { return new TaskStore(path.join(aliceStore, `ts_${Date.now()}_${Math.random().toString(36).slice(2,5)}_${dir}`)); }
+
+  // INVARIANT 1: Every accepted event exists in Event Log (fork 事件也必须进 log)
+  it("INVARIANT 1: 所有 accepted 事件（含 fork）存在于 Event Log", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, `i1_${Date.now()}`);
+    fs.mkdirSync(path.join(dir, "tasks"), { recursive: true });
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "i1", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, claimedAt: Date.now(), lastEventHash: e1.eventHash };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    ts.upsert(claimed, e2);
+    // fork 事件（同一 prev hash，bob 认领）
+    const bob = loadOrCreateIdentity(path.join(aliceStore, "bob_i1"), "bob");
+    const trust = makeStore(alice); trust.learn(bob.fingerprint, bob.publicKey, { source: "registry" });
+    const bobClaimed = { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, claimedAt: Date.now(), lastEventHash: e1.eventHash };
+    const eFork = createTaskEvent(bob, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, bobClaimed);
+    const fkRes = ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2.eventHash, eventIndex: {} }, eFork, { fork: true });
+    assert.equal(fkRes.duplicate, false, "fork 事件不应被标记 duplicate");
+
+    // 重启后验证 event log 含 fork 事件
+    const ts2 = new TaskStore(dir);
+    const rt = ts2.get(task.id);
+    assert.ok(rt, "重启后任务存在");
+    const log = ts2.eventHistory(task.id);
+    const hashes = log.map(ev => ev.eventHash || ev.eventId);
+    assert.ok(hashes.includes(eFork.eventHash), `事件日志应含 fork 事件 (got ${hashes.length} events)`);
+    // canonical state 不应被 fork 篡改
+    assert.equal(rt.status, "claimed");
+    assert.equal(rt.assigneeFingerprintActual, alice.fingerprint);
+  });
+
+  // INVARIANT 2: Every Runtime State is derivable from Event Log
+  it("INVARIANT 2: Runtime State 可由 Event Log 重放推导（篡改 snapshot 后重启恢复）", () => {
+    const dir = path.join(aliceStore, `i2_${Date.now()}`);
+    const ts = new TaskStore(dir);
+    const alice = makeAlice();
+    const task = createTask({ title: "i2", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    ts.upsert(claimed, e2);
+    const completed = { ...claimed, status: "completed", result: "i2 done", completedAt: Date.now(), lastEventHash: e2.eventHash };
+    const e3 = createTaskEvent(alice, "complete", { status: "claimed", assigneeFingerprintActual: alice.fingerprint, result: null }, completed);
+    ts.upsert(completed, e3);
+
+    // 篡改 snapshot
+    const taskFile = path.join(dir, "tasks", "tasks.jsonl");
+    const lines = fs.readFileSync(taskFile, "utf8").trim().split("\n").map(JSON.parse);
+    const t = lines.find(x => x.id === task.id);
+    t.status = "open"; t.result = "damaged";
+    fs.writeFileSync(taskFile, lines.map(JSON.stringify).join("\n"), "utf8");
+
+    const ts2 = new TaskStore(dir);
+    const rt = ts2.get(task.id);
+    assert.equal(rt.status, "completed", "重放应恢复 completed");
+    assert.equal(rt.result, "i2 done", "重放应恢复正确 result");
+  });
+
+  // INVARIANT 3: Every fork event is persisted and recoverable after restart
+  it("INVARIANT 3: fork 事件重启后仍可从 event log 恢复（derived forks）", () => {
+    const alice = makeAlice();
+    const bob = loadOrCreateIdentity(path.join(aliceStore, "bob_i3"), "bob");
+    const trust = makeStore(alice); trust.learn(bob.fingerprint, bob.publicKey, { source: "registry" });
+    const dir = path.join(aliceStore, `i3_${Date.now()}`);
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "i3", policy: { ...TASK_POLICIES.COLLABORATIVE } });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const aC = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+    const e2a = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, aC);
+    ts.upsert(aC, e2a);
+    // bob fork
+    const bC = { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: e1.eventHash };
+    const e2b = createTaskEvent(bob, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, bC);
+    ts.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2a.eventHash, eventIndex: {} }, e2b, { fork: true });
+
+    // 验证重启前 event log 含 e2b
+    const h1 = ts.eventHistory(task.id);
+    assert.ok(h1.some(ev => (ev.eventHash || ev.eventId) === e2b.eventHash), "运行时 event log 含 fork");
+
+    // 重启后：event log 与 derived forks 恢复
+    const ts2 = new TaskStore(dir);
+    const rt = ts2.get(task.id);
+    const h2 = ts2.eventHistory(task.id);
+    assert.ok(h2.some(ev => (ev.eventHash || ev.eventId) === e2b.eventHash), "重启后 event log 仍含 fork");
+    const forkHashes = (rt.forks || []).map(f => f.headEventHash);
+    assert.ok(forkHashes.includes(e2b.eventHash), `derived forks 恢复: ${forkHashes.join(", ")}`);
+  });
+
+  // INVARIANT 4: Live apply == replay apply（同一任务集，live 与 reload 状态一致）
+  it("INVARIANT 4: Live apply == replay apply", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, `i4_${Date.now()}`);
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "i4", policy: { ...TASK_POLICIES.COLLABORATIVE } });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const aC = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, aC);
+    ts.upsert(aC, e2);
+
+    const liveState = ts.get(task.id);
+    // 篡改 snapshot 后重启 → replay 必须产出与 live 相同状态
+    const taskFile = path.join(dir, "tasks", "tasks.jsonl");
+    const lines = fs.readFileSync(taskFile, "utf8").trim().split("\n").map(JSON.parse);
+    const t = lines.find(x => x.id === task.id);
+    t.status = "open"; // 与 live 不一致
+    fs.writeFileSync(taskFile, lines.map(JSON.stringify).join("\n"), "utf8");
+
+    const ts2 = new TaskStore(dir);
+    const replayState = ts2.get(task.id);
+    assert.equal(replayState.status, liveState.status, "replay status == live status");
+    assert.equal(replayState.assigneeFingerprintActual, liveState.assigneeFingerprintActual, "replay assignee == live assignee");
+    assert.equal(replayState.lastEventHash, liveState.lastEventHash, "replay lastEventHash == live lastEventHash");
+  });
+});

@@ -315,7 +315,9 @@ export class AgentNode extends EventEmitter {
           return;
         }
       }
-      // v0.11.0: 检测到合法分叉——记录 fork，不覆盖主链状态，交给确定性冲突解决
+      // v0.11.0: 检测到合法分叉——v0.12.11 (审查 P0-1) fork 事件必须先进入 Event Log
+      //（upsert 第三参 fork:true → _appendEvent + events[] + eventIndex，不篡改 canonical head/status），
+      // 再形成 derived fork view。不再出现"事件验证通过却不落库"的特殊路径。
       if (ev.forked && hasLocal) {
         const forkRecord = {
           headEventHash: event.eventHash || null,
@@ -323,14 +325,11 @@ export class AgentNode extends EventEmitter {
           ts: event.ts,
           action: event.action,
         };
-        if (!local.forks) local.forks = [];
-        if (!local.forks.some((f) => f.headEventHash === forkRecord.headEventHash)) {
-          local.forks.push(forkRecord);
-          if (local.forks.length > 10) local.forks.splice(0, local.forks.length - 10);
-          this.tasks.upsert(local);
+        const res = this.tasks.upsert(local, event, { fork: true });
+        if (!res.duplicate) {
           this.memory.append("task_fork_detected", { taskId: task.id, actor: event.actor, action });
         }
-        console.warn(`🔀 任务 ${task.id.slice(0, 8)} 检测到分叉（${packet.authorName} ${action}）——记录等待仲裁`);
+        console.warn(`🔀 任务 ${task.id.slice(0, 8)} 检测到分叉（${packet.authorName} ${action}）——事件已入日志，等待确定性冲突解决`);
         this.emit("task:forked", { taskId: task.id, fork: forkRecord, action, from: packet.author });
         return;
       }
@@ -357,11 +356,16 @@ export class AgentNode extends EventEmitter {
         id: task.id,
         title: task.title || "未命名任务",
         description: task.description ?? null,
-        publisherFingerprint: task.publisherFingerprint || packet.author,
+        // v0.12.11 (审查 P0-③): genesis 身份禁止 || packet.author 兜底——publisher 只来自
+        // event.actor（v2 publish 已验证 actor===publisherFingerprint）或 task 声明。
+        publisherFingerprint: event.action === "publish"
+          ? (task.publisherFingerprint || event.actor)
+          : (task.publisherFingerprint || packet.author),
         publisherName: task.publisherName || packet.authorName || "",
         requiredCapabilities: task.requiredCapabilities || [],
         policy: task.policy || undefined,
-        assigneeFingerprint: "",
+        // assigneeFingerprint = 指定认领者（definition 字段）；assigneeFingerprintActual = 实际认领者（runtime 字段）
+        assigneeFingerprint: task.assigneeFingerprint || "",
         createdAt: task.createdAt || event.ts,
       };
       // Runtime 字段全部从 deriveNextState 推导，绝不从 packet.task 残留
@@ -412,7 +416,8 @@ export class AgentNode extends EventEmitter {
         publisherName: task.publisherName || packet.authorName || "",
         requiredCapabilities: task.requiredCapabilities || [],
         policy: task.policy || undefined,
-        assigneeFingerprint: "",
+        // assigneeFingerprint = 指定认领者（definition 字段）；assigneeFingerprintActual = 实际认领者（runtime 字段）
+        assigneeFingerprint: task.assigneeFingerprint || "",
         status: "open",
         assigneeFingerprintActual: "",
         result: null,

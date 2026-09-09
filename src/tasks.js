@@ -688,69 +688,106 @@ export class TaskStore {
     for (const [id, task] of this.tasks) {
       const events = this.events.get(id);
       if (!events || events.length === 0) continue;
-      const byHash = {};
-      for (const ev of events) byHash[ev.eventHash || ev.eventId] = ev;
-      // 找 chain head（不被任何孩子的 previousHash 指向的最后一个事件）
-      const hasChild = new Set();
-      for (const ev of events) if (ev.previousHash) hasChild.add(ev.previousHash);
-      const heads = events.filter(ev => !hasChild.has(ev.eventHash || ev.eventId));
-      if (heads.length === 0) continue;
-      const headEv = heads.find(h => (h.eventHash || h.eventId) === task.lastEventHash)
-        || heads.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0];
-      // 回溯收集主链
-      const chain = [];
-      let cur = headEv.eventHash || headEv.eventId;
-      let guard = 0;
-      while (cur && byHash[cur] && guard++ < 10000) {
-        chain.unshift(byHash[cur]);
-        cur = byHash[cur].previousHash || null;
-      }
-      const mainHashes = new Set(chain.map(ev => ev.eventHash || ev.eventId));
-      // P1-⑦: forks derived——非主链但 previousHash 在主链上的事件
-      const derivedForks = [];
-      for (const ev of events) {
-        const h = ev.eventHash || ev.eventId;
-        if (mainHashes.has(h)) continue;
-        if (ev.previousHash && mainHashes.has(ev.previousHash)) {
-          derivedForks.push({ headEventHash: h, actor: ev.actor, ts: ev.ts, action: ev.action });
-        }
-      }
-      const tailHash = chain.length > 0 ? (chain[chain.length - 1].eventHash || chain[chain.length - 1].eventId) : null;
-      // P1-⑥: snapshot 只是加速缓存——凡有事件链的任务一律从 events 重建权威 runtime。
-      //   （只比对 lastEventHash 不足以发现"status 被篡改但 hash 保留"的快照污染）
-      // v0.13.0: Event Sourcing 原则——events 权威，snapshot 只是启动缓存，始终从 log 推导。
-      // 重放主链重建 runtime state
-      const rebuilt = { ...task, status: null, assigneeFingerprintActual: "", result: null, claimedAt: null, completedAt: null, cancelledAt: null, lastEventHash: null, forks: [], eventIndex: {}, eventHeight: 0 };
-      let curState = { status: null, assigneeFingerprintActual: "", result: null };
-      for (const ev of chain) {
-        const h = ev.eventHash || ev.eventId;
-        if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
-          this.persistentHealthy = false; this.persistenceError = `event ${ev.eventId} tampered (hash mismatch)`;
-          break;
-        }
-        if (ev.semanticVersion === 2) {
-          try {
-            const bf = ev.beforeState || { status: null, assigneeFingerprintActual: "", result: null };
-            const expected = deriveNextState(bf, ev.action, ev.actor, ev.payload);
-            curState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
-          } catch { break; }
-        } else if (ev.afterState) {
-          curState = { status: ev.afterState.status || curState.status, assigneeFingerprintActual: ev.afterState.assigneeFingerprintActual || curState.assigneeFingerprintActual, result: ev.afterState.result ?? curState.result };
-        }
-        rebuilt.status = curState.status; rebuilt.assigneeFingerprintActual = curState.assigneeFingerprintActual; rebuilt.result = curState.result;
-        rebuilt.lastEventHash = h; rebuilt.eventHeight++; rebuilt.eventIndex[h] = { eventId: ev.eventId, parentHash: ev.previousHash || null, actor: ev.actor, action: ev.action, ts: ev.ts, height: rebuilt.eventHeight };
-        if (ev.action === "claim") rebuilt.claimedAt = ev.ts;
-        if (ev.action === "complete") rebuilt.completedAt = ev.ts;
-        if (ev.action === "cancel") rebuilt.cancelledAt = ev.ts;
-      }
-      rebuilt.forks = derivedForks;
-      // 保留静态定义字段（重建只覆盖 runtime state）
-      rebuilt.title = task.title; rebuilt.description = task.description;
-      rebuilt.publisherFingerprint = task.publisherFingerprint; rebuilt.publisherName = task.publisherName;
-      rebuilt.requiredCapabilities = task.requiredCapabilities; rebuilt.policy = task.policy;
-      this.tasks.set(id, rebuilt);
-      this._saveTasks();
+      if (!this._tryRebuildFromEvents(id, task, events)) continue;
     }
+  }
+
+  /** 从 events 重建一个 task 的权威 runtime state（失败返回 false，保留旧 snapshot） */
+  _tryRebuildFromEvents(id, task, events) {
+    const byHash = {};
+    for (const ev of events) byHash[ev.eventHash || ev.eventId] = ev;
+    // 找全部 chain head（不被任何孩子的 previousHash 指向的事件）
+    const hasChild = new Set();
+    for (const ev of events) if (ev.previousHash) hasChild.add(ev.previousHash);
+    const heads = events.filter(ev => !hasChild.has(ev.eventHash || ev.eventId));
+    if (heads.length === 0) return false;
+
+    // 选择 canonical head：优先匹配 snapshot.lastEventHash；否则按 forkRule 选
+    let headEv = heads.find(h => (h.eventHash || h.eventId) === task.lastEventHash);
+    if (!headEv) {
+      const forkRule = (task.policy && task.policy.fork) || "publisher";
+      const sorted = heads.slice().sort((a, b) => {
+        if (forkRule === "publisher") {
+          const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
+          const bIsPub = b.actor === task.publisherFingerprint ? 1 : 0;
+          if (aIsPub !== bIsPub) return bIsPub - aIsPub;
+        } else if (forkRule === "assignee") {
+          const aIsAsgn = a.actor === task.assigneeFingerprintActual ? 1 : 0;
+          const bIsAsgn = b.actor === task.assigneeFingerprintActual ? 1 : 0;
+          if (aIsAsgn !== bIsAsgn) return bIsAsgn - aIsAsgn;
+        }
+        return (b.ts || 0) - (a.ts || 0) || String(a.eventHash || "").localeCompare(String(b.eventHash || ""));
+      });
+      headEv = sorted[0];
+    }
+
+    // 回溯主链
+    const chain = [];
+    let cur = headEv.eventHash || headEv.eventId;
+    let guard = 0;
+    while (cur && byHash[cur] && guard++ < 10000) {
+      chain.unshift(byHash[cur]);
+      cur = byHash[cur].previousHash || null;
+    }
+    if (chain.length === 0) return false;
+    const mainHashes = new Set(chain.map(ev => ev.eventHash || ev.eventId));
+
+    // Derived forks：非主链事件，其 previousHash 在主链上 = branch head
+    const derivedForks = [];
+    for (const ev of events) {
+      const h = ev.eventHash || ev.eventId;
+      if (mainHashes.has(h)) continue;
+      if (ev.previousHash && mainHashes.has(ev.previousHash)) {
+        derivedForks.push({ headEventHash: h, actor: ev.actor, ts: ev.ts, action: ev.action });
+      }
+    }
+
+    // 重建 runtime state（从 chain replay）
+    const rebuilt = { ...task, status: null, assigneeFingerprintActual: "", result: null, claimedAt: null, completedAt: null, cancelledAt: null, lastEventHash: null, forks: [], eventIndex: {}, eventHeight: 0 };
+    let curState = { status: null, assigneeFingerprintActual: "", result: null };
+    for (const ev of chain) {
+      const h = ev.eventHash || ev.eventId;
+      if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
+        this.persistentHealthy = false; this.persistenceError = `event ${ev.eventId} tampered (hash mismatch)`;
+        break;
+      }
+      if (ev.semanticVersion === 2) {
+        try {
+          const bf = ev.beforeState || { status: null, assigneeFingerprintActual: "", result: null };
+          const expected = deriveNextState(bf, ev.action, ev.actor, ev.payload);
+          curState = { status: expected.status, assigneeFingerprintActual: expected.assigneeFingerprintActual || "", result: expected.result ?? null };
+        } catch { break; }
+      } else if (ev.afterState) {
+        curState = { status: ev.afterState.status || curState.status, assigneeFingerprintActual: ev.afterState.assigneeFingerprintActual || curState.assigneeFingerprintActual, result: ev.afterState.result ?? curState.result };
+      }
+      rebuilt.status = curState.status; rebuilt.assigneeFingerprintActual = curState.assigneeFingerprintActual; rebuilt.result = curState.result;
+      rebuilt.lastEventHash = h; rebuilt.eventHeight++; rebuilt.eventIndex[h] = { eventId: ev.eventId, parentHash: ev.previousHash || null, actor: ev.actor, action: ev.action, ts: ev.ts, height: rebuilt.eventHeight };
+      if (ev.action === "claim") rebuilt.claimedAt = ev.ts;
+      if (ev.action === "complete") rebuilt.completedAt = ev.ts;
+      if (ev.action === "cancel") rebuilt.cancelledAt = ev.ts;
+    }
+    rebuilt.forks = derivedForks;
+    // v0.12.11 (审查 P0-2): eventIndex 必须是全部已知事件索引——重建后把非主链
+    // 事件（fork 分支全部事件）也补入索引，否则多级 fork 延伸会误判 broken chain。
+    for (const ev of events) {
+      const h = ev.eventHash || ev.eventId;
+      if (rebuilt.eventIndex[h]) continue; // 主链已索引
+      const parentMeta = rebuilt.eventIndex[ev.previousHash];
+      rebuilt.eventIndex[h] = {
+        eventId: ev.eventId,
+        parentHash: ev.previousHash ?? null,
+        actor: ev.actor,
+        action: ev.action,
+        ts: ev.ts,
+        height: (parentMeta?.height ?? 0) + 1,
+      };
+    }
+    rebuilt.title = task.title; rebuilt.description = task.description;
+    rebuilt.publisherFingerprint = task.publisherFingerprint; rebuilt.publisherName = task.publisherName;
+    rebuilt.requiredCapabilities = task.requiredCapabilities; rebuilt.policy = task.policy;
+    this.tasks.set(id, rebuilt);
+    this._saveTasks();
+    return true;
   }
 
   _saveTasks() {
@@ -781,7 +818,7 @@ export class TaskStore {
    * 记录任务当前状态（本地快照）。
    * @returns {{task: object, duplicate: boolean}}
    */
-  upsert(task, event = null) {
+  upsert(task, event = null, { fork = false } = {}) {
     if (event && event.eventId) {
       // v0.12.9 (审查 P0): eventId/eventHash 一致性约束——内容身份不可被复用篡改。
       //   same eventId + 不同 eventHash → 同一逻辑事件换了内容 = tamper，REJECT。
@@ -794,11 +831,9 @@ export class TaskStore {
         throw err;
       }
       if (this._seenEvents.has(event.eventId)) {
-        // 同 eventId 再投递：内容相同 = duplicate；内容不同已被上方拦截
         return { task, duplicate: true };
       }
       if (thisHash && this._seenEventHashes.has(thisHash)) {
-        // 同内容但新 eventId：内容身份重复 → duplicate（同一事件被重新包装）
         return { task, duplicate: true };
       }
       this._seenEvents.add(event.eventId);
@@ -809,22 +844,49 @@ export class TaskStore {
       this._appendEvent(event);
       if (!this.events.has(task.id)) this.events.set(task.id, []);
       this.events.get(task.id).push(event);
-      task.lastEventHash = event.eventHash || event.eventId; // v0.10.1: 真哈希链尾
-      // v0.12.6: eventIndex 升级为元数据索引（O(1) fork 检测 + 免扫描父事件查找）
+      // eventIndex 总是记录全部已知事件（含 fork——后续链检测依赖完整索引）
       if (!task.eventIndex) task.eventIndex = {};
-      task.eventHeight = (task.eventHeight || 0) + 1;
-      task.eventIndex[event.eventHash || event.eventId] = {
+      const hash = event.eventHash || event.eventId;
+      const parentMeta = task.eventIndex[event.previousHash];
+      const parentHeight = parentMeta?.height ?? 0;
+      task.eventIndex[hash] = {
         eventId: event.eventId,
-        parentHash: event.previousHash || null,
+        parentHash: event.previousHash ?? null,
         actor: event.actor,
         action: event.action,
         ts: event.ts,
-        height: task.eventHeight,
+        height: parentHeight + 1, // branch height（parent.height+1），不是 canonical count
       };
+      if (fork) {
+        // v0.12.11 (审查 P0-1): fork 事件进 log+index，但不篡改 canonical head/height/status。
+        // 新 branch head 判定：parent 在 canonical 主链上 → 本事件即新分支头
+        if (this._isCanonicalParent(event.previousHash, task) && !task.forks?.some(f => f.headEventHash === hash)) {
+          if (!task.forks) task.forks = [];
+          task.forks.push({ headEventHash: hash, actor: event.actor, ts: event.ts, action: event.action });
+        }
+      } else {
+        // canonical 事件：更新 head/height/status
+        task.lastEventHash = hash;
+        task.eventHeight = (task.eventHeight || 0) + 1;
+      }
     }
     this.tasks.set(task.id, task);
     this._saveTasks();
     return { task, duplicate: false };
+  }
+
+  /** v0.12.11: parentHash 是否在 canonical 主链上（沿 lastEventHash→previousHash 回溯） */
+  _isCanonicalParent(parentHash, task) {
+    if (!parentHash || !task.eventIndex) return false;
+    let cur = task.lastEventHash;
+    let guard = 0;
+    while (cur && guard++ < 10000) {
+      if (cur === parentHash) return true;
+      const meta = task.eventIndex[cur];
+      if (!meta) return false;
+      cur = meta.parentHash || null;
+    }
+    return false;
   }
 
   /** 获取任务 */

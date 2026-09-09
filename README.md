@@ -6,7 +6,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.10-blue)]
+[![Version](https://img.shields.io/badge/version-0.12.11-blue)]
 
 **Built by [ser163](https://github.com/ser163) · Your AI node is waiting.**
 
@@ -307,6 +307,7 @@ E:\pr\AI_Awakening\
 | **v0.12.8** | **版本签名完整性** — canonicalizeEvent 版本化 (V2 含 semanticVersion 签名防降级), semanticVersion 白名单 (3≥/字符串/null 拒), 版本降级 attack (v2→v1) 签名失效, v1 网络接收→REJECT (仅 local migration), 132 tests | ✅ |
 | **v0.12.9** | **Event 唯一状态权威** — packet.task 仅 transport (runtime state 一律 deriveNextState 推导，不再 upsert(packet.task))、allowLegacy 门控 (网络=v2 only/本地 migration=v1 allowed)、eventId/eventHash 一致性 (同 id 异 hash→tamper 拒)、无事件旧包 claim/complete→拒、135 tests | ✅ |
 | **v0.12.10** | **Task 层冻结** — 首次白名单构造 base(不再 {...task} spread)、Genesis 绑定 TaskDefinitionHash(防 relay 改写定义)、publish actor==publisher 强制、Task Definition immutable(不再被重复 publish 覆写 title)、emit 只发 canonical task、snapshot 一致性重放(Event Sourcing:events wins)→_reconcileFromEvents、forks derived view(不从快照信任)、137 tests | ✅ |
+| **v0.12.11** | **Event Sourcing 完成** — P0-1 fork 事件先进 Event Log 再 derived fork view (upsert {fork:true} → _appendEvent+events[]+eventIndex, canonical 不动)、P0-2 eventIndex 全量索引(重启后 fork 事件补入索引→多级 fork 链延伸不误判 broken chain)、genesis publisher 身份禁止 || packet.author 兜底、INVARIANT 1-4 测试(accepted→log/runtime derivable/fork 重启可恢复/live==replay)、141 tests | ✅ |
 | v0.10 | Memory Kernel — SQLite/WAL, event store, index, knowledge graph | 🗺 VISION |
 | v0.11 | Autonomous Loop — Goal Engine, Planner, Observer, Reflect/Learn | 🗺 VISION |
 | v0.12 | Agent Society — Reputation, Capability Market, Dispute Resolution | 🗺 VISION |
