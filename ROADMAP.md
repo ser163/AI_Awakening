@@ -30,7 +30,8 @@
 | **v0.12.10** | **Task 层冻结** — 首次白名单构造 base(不再 {...task} spread), Genesis 绑定 TaskDefinitionHash(防 relay 改写定义), publish actor==publisher 强制, Task Definition immutable(不再被重复 publish 覆写 title), emit 只发 canonical task, snapshot 一致性重放(Event Sourcing:events wins)→_reconcileFromEvents, forks derived view(不从快照信任), 137 tests | ✅ |
 | **v0.12.11** | **Event Sourcing 完成** — P0-1 fork 事件先进 Event Log 再 derived fork view (upsert {fork:true} → _appendEvent+events[]+eventIndex, canonical 不动), P0-2 eventIndex 全量索引(重启后 fork 事件补入索引→多级 fork 链延伸不误判 broken chain), genesis publisher 身份禁止 || packet.author 兜底, INVARIANT 1-4 测试(accepted→log/runtime derivable/fork 重启可恢复/live==replay), 141 tests | ✅ |
 | **v0.12.12** | **Event Sourcing Integrity** — 共享 applyEvent 管道(live/replay/fork 同一语义验证), forks 纯 deriveForkView 单函数, 日志损坏原子止不写 partial, snapshot 不参与 canonical head 决策, 144 tests | ✅ |
-| **v0.12.13** | **事务安全收口** — _load 事务性加载(损坏日志 0 事件加载+unhealthy), deriveForkView 多级 fork leaf 语义, forkRule fail-closed (unknown→拒), 147 tests | ✅ |
+| **v0.12.13** | **事务安全收口** — _load 事务性加载(损坏日志 0 事件加载+unhealthy)、deriveForkView 多级 fork leaf 语义、forkRule fail-closed (unknown→拒)、147 tests | ✅ |
+| **v0.12.14** | **DAG 完整性收口** — previousHash 父节点完整性验证(孤儿事件→unhealthy 不 canonicalize)、V2 eventHash 必填 fail-closed、151 tests | ✅ |
 
 ## Vision
 

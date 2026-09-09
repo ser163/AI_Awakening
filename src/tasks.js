@@ -786,12 +786,29 @@ export class TaskStore {
   _tryRebuildFromEvents(id, task, events) {
     const byHash = {};
     for (const ev of events) byHash[ev.eventHash || ev.eventId] = ev;
+    // v0.12.14 (审查 P0-1): V2 事件缺 eventHash → fail-closed（V2 integrity boundary 内不许逃逸）
+    for (const ev of events) {
+      if (ev.semanticVersion === 2 && !ev.eventHash) {
+        this.persistentHealthy = false;
+        this.persistenceError = `event ${ev.eventId} missing eventHash (v2 requires eventHash)`;
+        return false;
+      }
+    }
     // 1. 全部事件先做 eventHash 自洽验证（主链 + fork 分支都要验，不是只验主链）
     for (const ev of events) {
       if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
         this.persistentHealthy = false;
         this.persistenceError = `event ${ev.eventId} tampered (hash mismatch)`;
         return false; // 损坏 → 不重建、不写回
+      }
+    }
+    // v0.12.14 (审查 P0-1): DAG 父节点完整性——previousHash !== null 必须存在于 byHash。
+    //   孤儿事件（父不存在）不得脱离真实 DAG 被当成合法 genesis/fork head。
+    for (const ev of events) {
+      if (ev.previousHash && !byHash[ev.previousHash]) {
+        this.persistentHealthy = false;
+        this.persistenceError = `event ${ev.eventId} has dangling previousHash (${String(ev.previousHash).slice(0, 8)}...)`;
+        return false;
       }
     }
     // 2. 找全部 chain head（不被任何孩子的 previousHash 指向的事件）

@@ -1289,4 +1289,51 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
     const after = fs.readFileSync(taskFile, "utf8");
     assert.equal(after, before, "损坏日志后磁盘 snapshot 不允许被重写");
   });
+
+  // P0-1: previousHash 指向不存在的节点 → fail-closed
+  it("孤儿事件 previousHash 指向不存在节点 → unhealthy, 不参与 canonicalization", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, "orphan_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "orphan", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    // 构造孤儿事件：复制 e1 改成 complete 并指向不存在的 previousHash
+    const orphan = { ...e1, eventId: "orphan-evt", action: "complete", previousHash: "NONEXISTENT_HASH_12345", afterState: { status: "completed", assigneeFingerprintActual: alice.fingerprint, result: "orphan" } };
+    // 重算 eventHash 以通过 hash 自洽验证（让 _tryRebuildFromEvents 能走到 DAG 完整性检查）
+    const canon = JSON.stringify({ eventId: orphan.eventId, taskId: orphan.taskId, action: orphan.action, actor: orphan.actor, previousHash: orphan.previousHash, ts: orphan.ts, nonce: orphan.nonce, semanticVersion: orphan.semanticVersion, status: orphan.status, beforeState: orphan.beforeState, afterState: orphan.afterState, payload: orphan.payload });
+    orphan.eventHash = crypto.createHash("sha256").update(canon).digest("hex");
+    // 追加到 events.jsonl
+    const evFile = path.join(dir, "tasks", "events.jsonl");
+    fs.appendFileSync(evFile, JSON.stringify(orphan) + "\n", "utf8");
+    // 重启 → 父节点验证失败 → unhealthy
+    const ts2 = new TaskStore(dir);
+    assert.ok(!ts2.isHealthy(), "孤儿事件 → unhealthy");
+    // canonical state 不变（snapshot 不被覆盖）
+    const rt = ts2.get(task.id);
+    assert.equal(rt.status, "open", "孤儿事件不应篡改 canonical state");
+  });
+
+  // P1-2: V2 事件缺 eventHash → fail-closed
+  it("V2 缺 eventHash → unhealthy, 不 replay", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, "v2nohash_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "v2nohash", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    // 构造 V2 事件但删掉 eventHash
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    delete e2.eventHash; // 移除 hash 但保留 semanticVersion=2
+    const evFile = path.join(dir, "tasks", "events.jsonl");
+    fs.appendFileSync(evFile, JSON.stringify(e2) + "\n", "utf8");
+    // 重启 → V2 缺 eventHash → unhealthy
+    const ts2 = new TaskStore(dir);
+    assert.ok(!ts2.isHealthy(), "V2 缺 eventHash → unhealthy");
+    const rt = ts2.get(task.id);
+    assert.equal(rt.status, "open", "V2 缺 hash 事件不应篡改 canonical state");
+  });
 });

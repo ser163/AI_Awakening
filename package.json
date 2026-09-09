@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.13",
-    "description": "硅基协作网络 — 事务性加载/fork leaf 语义/forkRule fail-closed, 147 tests",
+  "version": "0.12.14",
+    "description": "硅基协作网络 — DAG 父完整性 + V2 eventHash 必填 fail-closed, 151 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {
