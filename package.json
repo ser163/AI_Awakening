@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.7",
-  "description": "硅基协作网络 — Semantic Versioning 状态机 (no-op 无旁路/semanticVersion/纯函数转移)",
+  "version": "0.12.8",
+    "description": "硅基协作网络 — Protocol Version Integrity (签名版本/v1只读/downgrade attack 拒)",
   "type": "module",
   "main": "index.js",
   "scripts": {

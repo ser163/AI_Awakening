@@ -686,6 +686,33 @@ describe("v0.12.5: 恶意合法签名（加密完整 ≠ 状态机完整）", ()
     const v = validateTaskEvent(ev, "claim", { id: "x", status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
     assert.equal(v.ok, false, "no-op claim 必须被拒");
   });
+
+  it("11. v0.12.8: downgrade attack——v2 事件改 semanticVersion=1 后签名必须失效", () => {
+    // 正常 v2 complete 事件
+    const before = { id: "x", status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, result: null };
+    const after = { id: "x", status: TASK_STATUS.COMPLETED, assigneeFingerprintActual: alice.fingerprint, result: "ok" };
+    const ev = createTaskEvent(alice, "complete", before, after);
+    // 正常验证通过
+    const ok = validateTaskEvent(ev, "complete", { id: "x", status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+    assert.equal(ok.ok, true, "合法 v2 事件应先通过");
+    // 攻击者降级版本号（不修改其他字段）
+    const downgraded = { ...ev, semanticVersion: 1 };
+    // semanticVersion 进 canonicalization → 签名覆盖版本 → 降级后 V1 canonical 不匹配 → 拒绝
+    const bad = validateTaskEvent(downgraded, "complete", { id: "x", status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+    assert.equal(bad.ok, false, "downgrade (v2→v1) 必须使签名失效");
+    assert.ok(!bad.forked);
+  });
+
+  it("12. v0.12.8: invalid semanticVersion（3/'2'/null 字符串）→ 拒绝", () => {
+    const before = { id: "x", status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
+    const after = { id: "x", status: TASK_STATUS.CLAIMED, assigneeFingerprintActual: alice.fingerprint, result: null };
+    for (const badVer of [3, 99, "2", "legacy"]) {
+      const ev = createTaskEvent(alice, "claim", before, after);
+      ev.semanticVersion = badVer; // 篡改版本号 → 签名应失效（canonical V2 含版本）
+      const v = validateTaskEvent(ev, "claim", { id: "x", status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", lastEventHash: null, eventIndex: {} }, store, { hasLocalRecord: false });
+      assert.equal(v.ok, false, `semanticVersion=${JSON.stringify(badVer)} 必须被拒`);
+    }
+  });
 });
 
 describe("v0.12.0: SelfState（自我从叙事升级为结构化状态）", () => {

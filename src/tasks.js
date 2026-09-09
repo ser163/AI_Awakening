@@ -148,7 +148,11 @@ function resolveAuthority(policy, action) {
  * 规范化事件（签名覆盖的字段，固定键序）。
  * 注意：signature 与 eventHash 都不参与规范化（eventHash 是 canonical 的哈希）。
  */
-function canonicalizeEvent(ev) {
+/** 合法语义版本白名单（v0.12.8）——不存在的版本直接拒绝 */
+const KNOWN_SEMANTIC_VERSIONS = new Set([1, 2]);
+
+/** V1 canonical（v0.12.8）：旧格式/无 semanticVersion 事件——向后兼容历史签名 */
+function canonicalizeEventV1(ev) {
   return JSON.stringify({
     eventId: ev.eventId,
     taskId: ev.taskId,
@@ -158,11 +162,40 @@ function canonicalizeEvent(ev) {
     ts: ev.ts,
     nonce: ev.nonce,
     status: ev.status,
-    // v0.12.4: beforeState/afterState 纳入签名域（防篡改）
     beforeState: ev.beforeState || null,
     afterState: ev.afterState || null,
     payload: ev.payload || null,
   });
+}
+
+/** V2 canonical（v0.12.8）：semanticVersion 纳入签名域（防版本降级攻击） */
+function canonicalizeEventV2(ev) {
+  return JSON.stringify({
+    eventId: ev.eventId,
+    taskId: ev.taskId,
+    action: ev.action,
+    actor: ev.actor,
+    previousHash: ev.previousHash ?? null,
+    ts: ev.ts,
+    nonce: ev.nonce,
+    semanticVersion: ev.semanticVersion ?? 2, // v0.12.7+: 版本是安全边界，必须签名
+    status: ev.status,
+    beforeState: ev.beforeState || null,
+    afterState: ev.afterState || null,
+    payload: ev.payload || null,
+  });
+}
+
+/**
+ * 版本化 canonicalization（v0.12.8）：
+ *   semanticVersion === 2 → V2 canonical（含版本字段）
+ *   其他（1 / 缺失 / 旧事件）→ V1 canonical（不含——历史签名仍可验证）
+ * 注意：V2 事件把 semanticVersion 降为 1 后，签名会失效（V2 签名覆盖版本字段，
+ * 降级后用 V1 canonical 验证不匹配）。
+ */
+function canonicalizeEvent(ev) {
+  if (ev.semanticVersion === 2) return canonicalizeEventV2(ev);
+  return canonicalizeEventV1(ev);
 }
 
 /** 计算事件的防篡改哈希（v0.10.1: 真哈希，不再是 eventId） */
@@ -335,11 +368,22 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
     // 不提前 return——继续 afterState 语义验证
   }
 
-  // v0.12.5 (审查 P0): 加密完整性 ≠ 状态机完整性。
-  // v0.12.7 (审查 P0): "before == after" 不再是跳过验证的依据——no-op 事件也必须验证。
-  //   恶意 4-arg 伪造 complete claimed→claimed（before=after）不再能绕过。
-  //   isLegacy 判定只看显式 semanticVersion（v1）或缺失 beforeState/afterState。
-  const isLegacyEvent = event.semanticVersion === 1 || !event.beforeState || !event.afterState;
+  // v0.12.7 (审查 P0): 加密完整性 ≠ 状态机完整性。
+  // v0.12.8 (审查 P0): 版本号是安全边界，必须被签名。semanticVersion 白名单拒绝未知版本。
+  if (event.semanticVersion !== undefined && event.semanticVersion !== null) {
+    if (typeof event.semanticVersion !== "number" || !KNOWN_SEMANTIC_VERSIONS.has(event.semanticVersion)) {
+      return { ok: false, reason: `unsupported semanticVersion: ${event.semanticVersion} (must be 1 or 2)` };
+    }
+  }
+  // isLegacy 判定（v0.12.8 修正）：
+  //   semanticVersion===2 → v2 无条件 deriveNextState
+  //   semanticVersion===1 → v1 legacy（历史格式，显式声明）
+  //   缺失（旧磁盘事件）→ 启发式：无 beforeState/afterState 或 before≈after 视为 legacy
+  let isLegacyEvent;
+  if (event.semanticVersion === 1) isLegacyEvent = true;
+  else if (event.semanticVersion === 2) isLegacyEvent = false;
+  else if (!event.beforeState || !event.afterState) isLegacyEvent = true;
+  else isLegacyEvent = event.beforeState.status === event.afterState.status && event.beforeState.assigneeFingerprintActual === event.afterState.assigneeFingerprintActual;
   if (!isLegacyEvent) {
     // v2 事件（4-arg）：无条件验证状态机（含 no-op 也要经 deriveNextState）
     if (hasLocalRecord && !forked) {

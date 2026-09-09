@@ -133,6 +133,7 @@ E:\pr\AI_Awakening\
 | 2026-09-08 | v0.12.5 | **Task Semantic Integrity** | **127** | validateStateTransition (加密完整≠状态机完整, 推导 afterState 不信任声明), beforeState 匹配本地 head, claim assignee=actor 强制, canonicalizeTask 重放验证状态机 (相邻事件连续性+单事件转移), eventIndex 对象映射替代 eventHashes 数组 (O(1) fork 检测), 恶意合法签名测试集 7 场景 |
 | 2026-09-08 | v0.12.6 | **State Transition Unification** | **128** | fork 不再免检 (forked=true 标记后继续完整语义验证), deriveNextState() 唯一状态转移来源 (live validate + replay 共用, 协议推导 expected 不信任声明), canonicalize 全字段连续性检查 (status+assignee+result 三字段), eventIndex 升级元数据索引 (hash→{eventId,parentHash,actor,action,ts,height}), fork+非法转移测试 |
 | 2026-09-08 | v0.12.7 | **no-op 无旁路** | **130** | semanticVersion 显式版本 (v2=4-arg 无条件 deriveNextState 含 no-op, v1=legacy), before=after 不再跳过验证 (修复状态机旁路), genesis 也走 deriveNextState (null→publish→open), deriveNextState 纯函数化 (删除 Date.now, 声明禁止非纯调用), no-op signed event 测试集 (claimed→complete→claimed / open→claim→open 均拒) |
+| 2026-09-08 | v0.12.8 | **版本签名完整性** | **132** | canonicalizeEvent 版本化 (V2 含 semanticVersion 签名域→防版本降级攻击, V1 旧格式向后兼容), semanticVersion 白名单 (已知 {1,2}, numeric 3≥/字符串/null 拒), v2→v1 downgrade attack 测试 (签名失效), v1 网络接收→拒绝策略 (local migration/read only), isLegacy 修正 (v1 显式 legacy, 缺失时启发式) |
 
 > 2026-09-08 在同一天发布了 v0.8.0 和 v0.9.0，因为自我叩问完成后，审查反馈指出信任模型的安全缺陷，随即在同一天完成了信任层补完。
 
