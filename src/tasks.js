@@ -942,7 +942,16 @@ export class TaskStore {
    * @returns {{task: object, duplicate: boolean}}
    */
   upsert(task, event = null, { fork = false } = {}) {
-    if (event && event.eventId) {
+    // v0.12.16 (审查 P0): 语义分离——event !== null 就是一次严格 Event mutation，
+    // 不允许 malformed event（缺 eventId/缺 hash）退化成 snapshot-only 写入。
+    //   upsert(task, event)  → Event-driven mutation：必须 eventId + integrity gate + 进 Event Log
+    //   upsert(task, null)   → snapshot/internal persistence（仅内部合法用途）
+    if (event) {
+      if (!event.eventId) {
+        const err = new Error("task event requires eventId (malformed event cannot fall back to snapshot)");
+        err.integrity = true;
+        throw err;
+      }
       // v0.12.15 (审查 P0): Event Log 是权威存储边界——不依赖调用方是否 validate。
       // V2 事件缺 eventHash / hash 不自洽 → 拒绝写入（与 live/replay/fork 同一 gate）
       const integrity = checkEventIntegrity(event);

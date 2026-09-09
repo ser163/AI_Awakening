@@ -1438,4 +1438,51 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
       // ④ replay: 拒绝（V2 无 hash 写盘后重启 unhealthy）——已有独立测试覆盖
     });
   });
+
+  // v0.12.16 (审查 P0): upsert 语义边界——event != null 必须严格 Event mutation
+  describe("upsert malformed event 不降级 snapshot", () => {
+    const aliceStore3 = path.join(fs.realpathSync(os.tmpdir()), "hard_v01216");
+    function mkAlice() { return loadOrCreateIdentity(path.join(aliceStore3, "alice"), "alice"); }
+
+    function setup(prefix) {
+      const alice = mkAlice();
+      const dir = path.join(aliceStore3, prefix + "_" + Date.now());
+      const ts = new TaskStore(dir);
+      const task = createTask({ title: prefix, requiredCapabilities: [] });
+      task.publisherFingerprint = alice.fingerprint;
+      const e1 = createTaskEvent(alice, "publish", null, task);
+      ts.upsert(task, e1);
+      return { alice, dir, ts, task };
+    }
+
+    it("① V2 无 eventId → throw, Event Log 不增加", () => {
+      const { alice, ts, task } = setup("v2noeid");
+      const malformed = { semanticVersion: 2, eventHash: undefined, action: "claim", actor: alice.fingerprint, beforeState: { status: "open" }, afterState: { status: "claimed" } };
+      assert.throws(() => ts.upsert({ ...task, status: "claimed" }, malformed), /eventId/, "V2 无 eventId 必须 throw");
+      const log = ts.eventHistory(task.id);
+      assert.equal(log.length, 1, "非法事件不得进入 Event Log");
+      assert.equal(ts.get(task.id).status, "open", "snapshot 不得被修改");
+    });
+
+    it("② malformed event 不能降级成 snapshot (status 保持 open)", () => {
+      const { ts, task } = setup("malformed");
+      // before: open；试图用 {semanticVersion:2} 直接写 completed snapshot
+      const evil = { ...task, status: "completed", assigneeFingerprintActual: "attacker", result: "hacked" };
+      assert.throws(() => ts.upsert(evil, { semanticVersion: 2 }), /eventId|integrity/, "malformed event 必须 throw");
+      const rt = ts.get(task.id);
+      assert.equal(rt.status, "open", "不允许无事件直接改 snapshot status");
+      assert.notEqual(rt.assigneeFingerprintActual, "attacker");
+    });
+
+    it("③ live reject → snapshot 不变 → restart replay 一致 (live==replay)", () => {
+      const { dir, ts, task } = setup("liverr");
+      const before = ts.get(task.id).status; // open
+      // live: 非法调用被拒
+      assert.throws(() => ts.upsert({ ...task, status: "completed" }, {}), /eventId|integrity/, "live reject");
+      assert.equal(ts.get(task.id).status, before, "live reject 后 snapshot 不变");
+      // restart: replay state == 原状态
+      const ts2 = new TaskStore(dir);
+      assert.equal(ts2.get(task.id).status, before, "restart replay == live 原状态");
+    });
+  });
 });

@@ -33,6 +33,7 @@
 | **v0.12.13** | **事务安全收口** — _load 事务性加载(损坏日志 0 事件加载+unhealthy)、deriveForkView 多级 fork leaf 语义、forkRule fail-closed (unknown→拒)、147 tests | ✅ |
 | **v0.12.14** | **DAG 完整性收口** — previousHash 父节点完整性验证(孤儿事件→unhealthy 不 canonicalize)、V2 eventHash 必填 fail-closed、151 tests | ✅ |
 | **v0.12.15** | **V2 Integrity 三路径统一** — checkEventIntegrity 共享 gate (validateTaskEvent/upsert/canonicalizeTask/_tryRebuildFromEvents 同规则)、live==fork==replay 一致、155 tests | ✅ |
+| **v0.12.16** | **upsert 语义分离** — event != null 必为严格 Event mutation (eventId 必填 + integrity gate, malformed 拒绝降级 snapshot)、Event Log 唯一权威、158 tests | ✅ |
 
 ## 未来规划
 
