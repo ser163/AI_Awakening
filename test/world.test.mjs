@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { WorldModel, SOURCE_TYPES, SOURCE_KINDS } from "../src/world.js";
 import os from "node:os";
 import path from "node:path";
+import fs from "node:fs";
 
 const tmp = path.join(os.tmpdir(), "ai_world_test_" + Date.now());
 
@@ -418,5 +419,124 @@ describe("world: World 是推导产物，不是 LLM 记事本", () => {
     assert.equal(ev.reason, "source compromised");
     // 信念消失（retracted 证据不参与推导）
     assert.equal(w.deriveBelief("agent:x", "score"), null);
+  });
+});
+
+// v0.12.18 (审查 P0): World append-first 原子性——每类 mutation 异常后零状态变更
+describe("world: append-first 原子性（P0）", () => {
+  const dir = path.join(tmp, "af_atomic_" + Date.now());
+
+  function setupWorld(wm) {
+    wm.observeAgent("fp-alice", "alice", ["knowledge"]);
+    wm.observeEntity("device:01", "sensor", "Temp-1");
+    wm.addRelation("fp-alice", "monitors", "device:01");
+    wm.ingestEvidence({
+      subject: "device:01", predicate: "temperature", object: "36.5",
+      source: { type: SOURCE_TYPES.SENSOR, id: "fp-alice", kind: SOURCE_KINDS.MEASUREMENT },
+    });
+    return wm; // 已有 1 agent, 1 entity, 1 relation, 1 claim (= claim objects with evidence)
+  }
+
+  function snapshot(wm) {
+    return {
+      agents: Array.from(wm.agents.keys()).sort(),
+      entities: Array.from(wm.entities.keys()).sort(),
+      relations: Array.from(wm.relations.keys()).sort(),
+      claims: Array.from(wm.claims.keys()).sort(),
+    };
+  }
+
+  function blockLog(dir) {
+    const logFile = path.join(dir, "world", "world.jsonl");
+    const bak = logFile + ".bak";
+    if (fs.existsSync(logFile)) fs.cpSync(logFile, bak);
+    fs.rmSync(logFile, { force: true });
+    fs.mkdirSync(logFile, { recursive: true }); // 目录同名占位 → append 抛 ENOTDIR
+  }
+  function unblockLog(dir) {
+    const logFile = path.join(dir, "world", "world.jsonl");
+    const bak = logFile + ".bak";
+    fs.rmSync(logFile, { recursive: true, force: true }); // 恢复
+    if (fs.existsSync(bak)) { fs.cpSync(bak, logFile); fs.rmSync(bak); }
+  }
+
+  it("evidence append failure → throw, 状态不变, 重启恢复", () => {
+    const d = path.join(dir + "_ev");
+    const w = new WorldModel(d);
+    setupWorld(w);
+    const pre = snapshot(w);
+    blockLog(d);
+    assert.throws(() => w.ingestEvidence({
+      subject: "device:01", predicate: "pressure", object: "1.2",
+      source: { type: SOURCE_TYPES.SENSOR, id: "fp-alice", kind: SOURCE_KINDS.MEASUREMENT },
+    }), /persistence failed/, "evidence 必须 throw");
+    assert.deepEqual(snapshot(w), pre, "append 失败不得修改 claims");
+    assert.equal(w.isHealthy(), false, "persistentHealthy 为 false");
+    unblockLog(d);
+    const w2 = new WorldModel(d);
+    assert.deepEqual(snapshot(w2), pre, "重启 replay == 原状态");
+    assert.ok(w2.isHealthy(), "重启后 healthy");
+  });
+
+  it("entity append failure → throw, 状态不变, 重启恢复", () => {
+    const d = path.join(dir + "_en");
+    const w = new WorldModel(d);
+    setupWorld(w);
+    const pre = snapshot(w);
+    blockLog(d);
+    assert.throws(() => w.observeEntity("device:99", "actuator", "Valve-1"), /persistence failed/, "entity 必须 throw");
+    assert.deepEqual(snapshot(w), pre, "append 失败不得添加 entity");
+    assert.equal(w.isHealthy(), false);
+    unblockLog(d);
+    const w2 = new WorldModel(d);
+    assert.deepEqual(snapshot(w2), pre, "重启 replay == 原状态");
+    assert.ok(w2.isHealthy());
+  });
+
+  it("agent append failure → throw, 状态不变, 重启恢复", () => {
+    const d = path.join(dir + "_ag");
+    const w = new WorldModel(d);
+    setupWorld(w);
+    const pre = snapshot(w);
+    blockLog(d);
+    assert.throws(() => w.observeAgent("fp-eve", "eve"), /persistence failed/, "agent 必须 throw");
+    assert.deepEqual(snapshot(w), pre, "append 失败不得添加 agent");
+    assert.equal(w.isHealthy(), false);
+    unblockLog(d);
+    const w2 = new WorldModel(d);
+    assert.deepEqual(snapshot(w2), pre, "重启 replay == 原状态");
+    assert.ok(w2.isHealthy());
+  });
+
+  it("relation append failure → throw, 状态不变, 重启恢复", () => {
+    const d = path.join(dir + "_rl");
+    const w = new WorldModel(d);
+    setupWorld(w);
+    const pre = snapshot(w);
+    blockLog(d);
+    assert.throws(() => w.addRelation("fp-alice", "knows", "entity:nonexistent"), /persistence failed/, "relation 必须 throw");
+    assert.deepEqual(snapshot(w), pre, "append 失败不得添加 relation");
+    assert.equal(w.isHealthy(), false);
+    unblockLog(d);
+    const w2 = new WorldModel(d);
+    assert.deepEqual(snapshot(w2), pre, "重启 replay == 原状态");
+    assert.ok(w2.isHealthy());
+  });
+
+  it("retraction append failure → throw, 状态不变, 重启恢复", () => {
+    const d = path.join(dir + "_re");
+    const w = new WorldModel(d);
+    setupWorld(w);
+    const claim = w.queryClaims("device:01", "temperature");
+    const evId = claim[0].evidence[0].evidenceId;
+    const pre = snapshot(w);
+    blockLog(d);
+    assert.throws(() => w.retractEvidence("device:01", "temperature", "36.5", evId, { retractedBy: "test" }), /persistence failed/, "retract 必须 throw");
+    assert.deepEqual(snapshot(w), pre, "append 失败不得撤销证据");
+    assert.equal(w.isHealthy(), false);
+    unblockLog(d);
+    const w2 = new WorldModel(d);
+    assert.deepEqual(snapshot(w2), pre, "重启 replay == 原状态");
+    assert.ok(w2.isHealthy());
   });
 });

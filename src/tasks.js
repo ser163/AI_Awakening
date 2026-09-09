@@ -686,6 +686,39 @@ export function checkTransition(task, action, actorFingerprint) {
 }
 
 /**
+ * v0.12.18 (审查 P1): 事件授权检查——LIVE 与 REPLAY 共享的 authorization gate。
+ * 不变量：授权基于事件自身的 beforeState（该事件父链状态）评估，而非当前 canonical 状态——
+ * fork 分支事件在其父状态上可能完全合法（如 open 状态下两个节点的竞争 claim）。
+ *
+ * 语义与 checkTransition 完全一致（policy 解析、quorum/未知 authority fail-closed），
+ * 只是把 task 的运行时字段替换为事件声明的前置状态。
+ *
+ * @param {object} task 任务静态字段（policy/publisherFingerprint 等；status 字段会被覆盖）
+ * @param {object} event 事件（semanticVersion===2 才检查；publish genesis 跳过）
+ * @returns {{ok: boolean, reason?: string}}
+ */
+export function checkEventAuthorization(task, event) {
+  // v1/legacy/unversioned：历史格式，签名域无 policy 语义可追溯 → 不追溯授权（迁移兼容）
+  if (event.semanticVersion !== 2) return { ok: true };
+  // publish = genesis：publisher 身份绑定由 taskDefinitionHash + actor===publisherFingerprint 覆盖，
+  // 不存在"前置状态上的授权规则"（TRANSITIONS 无 null→publish 条目）。
+  if (event.action === "publish") return { ok: true };
+  const pre = event.beforeState || { status: null, assigneeFingerprintActual: "", result: null };
+  const pseudoTask = {
+    ...task,
+    status: pre.status ?? null,
+    assigneeFingerprintActual: pre.assigneeFingerprintActual || "",
+    result: pre.result ?? null,
+  };
+  try {
+    return checkTransition(pseudoTask, event.action, event.actor);
+  } catch (err) {
+    // quorum 未实现 / 未知 authority → fail-closed（与 live checkTransition 同一行为）
+    return { ok: false, reason: err?.message || String(err) };
+  }
+}
+
+/**
  * 计算任务"执行态"的确定性哈希（v0.12.2/v0.12.3）——用于 applyCanonicalState 判等。
  * 审查指出：名称"所有状态字段"不准确——只覆盖业务运行态字段
  * （status/assignee/result/三个时间戳/lastEventHash），
@@ -797,6 +830,75 @@ export class TaskStore {
   }
 
   /**
+   * v0.12.18 (审查 P1): 单分支全链重放——从 head 沿 previousHash 回溯到 genesis，
+   * 逐事件执行 shared gates：每个 v2 事件先 checkEventAuthorization（相对父状态），
+   * 再 applyEvent（beforeState==curState + derive + afterState）；v1/legacy 直接应用声明状态。
+   * 任一事件资格失败 → {ok:false, reason}（该分支整体不作为 canonical candidate）。
+   * @param {object} task 任务静态字段（policy/publisherFingerprint/assignee...）
+   * @param {object} headEv 分支头事件
+   * @param {object} byHash eventHash → event 映射（完整性已在调用方验证）
+   * @returns {{ok: boolean, rebuilt?: object, reason?: string}}
+   */
+  _replayBranchToState(task, headEv, byHash) {
+    // 回溯链（genesis 在前）
+    const chain = [];
+    let cur = headEv.eventHash || headEv.eventId;
+    let guard = 0;
+    while (cur && byHash[cur] && guard++ < 10000) {
+      chain.unshift(byHash[cur]);
+      cur = byHash[cur].previousHash || null;
+    }
+    if (chain.length === 0) return { ok: false, reason: "empty chain" };
+
+    const rebuilt = { ...task, status: null, assigneeFingerprintActual: "", result: null, claimedAt: null, completedAt: null, cancelledAt: null, lastEventHash: null, forks: [], eventIndex: {}, eventHeight: 0 };
+    let curState = { status: null, assigneeFingerprintActual: "", result: null };
+    for (const ev of chain) {
+      const h = ev.eventHash || ev.eventId;
+      try {
+        // v0.12.18 (审查 P1): authorization gate —— live 与 replay 同一语义闭环。
+        // 恶意节点用合法私钥签署无权限转移 → 在 replay 上同样被拒。
+        const authz = checkEventAuthorization(task, ev);
+        if (!authz.ok) return { ok: false, reason: `authorization rejected: ${ev.eventId} (${authz.reason})` };
+        if (ev.semanticVersion === 2) {
+          // genesis（i===0）beforeState 是空 → currentState 也是空，applyEvent 全字段验证
+          curState = applyEvent(curState, ev);
+        } else if (ev.afterState) {
+          // legacy：直接应用声明状态（历史格式，语义自由度保留）
+          curState = { status: ev.afterState.status || curState.status, assigneeFingerprintActual: ev.afterState.assigneeFingerprintActual || curState.assigneeFingerprintActual, result: ev.afterState.result ?? curState.result };
+        }
+      } catch (err) {
+        return { ok: false, reason: `replay failed: ${ev.eventId} (${err.message})` };
+      }
+      rebuilt.status = curState.status; rebuilt.assigneeFingerprintActual = curState.assigneeFingerprintActual; rebuilt.result = curState.result;
+      rebuilt.lastEventHash = h; rebuilt.eventHeight++; rebuilt.eventIndex[h] = { eventId: ev.eventId, parentHash: ev.previousHash || null, actor: ev.actor, action: ev.action, ts: ev.ts, height: rebuilt.eventHeight };
+      if (ev.action === "claim") rebuilt.claimedAt = ev.ts;
+      if (ev.action === "complete") rebuilt.completedAt = ev.ts;
+      if (ev.action === "cancel") rebuilt.cancelledAt = ev.ts;
+    }
+    return { ok: true, rebuilt };
+  }
+
+  /**
+   * v0.12.18 (审查 P1): 分支授权资格检测——沿 previousHash 回溯链中每个 v2 事件
+   * 都须通过 checkEventAuthorization（相对各自父状态）。
+   * @param {object} task 任务静态字段（policy/publisherFingerprint 等）
+   * @param {string} headHash 分支头事件 hash
+   * @param {object} byHash eventHash→event 映射
+   * @returns {boolean} true = 分支上所有 v2 事件均授权合法
+   */
+  _branchAuthorized(task, headHash, byHash) {
+    let cur = headHash;
+    let guard = 0;
+    while (cur && byHash[cur] && guard++ < 10000) {
+      const ev = byHash[cur];
+      const authz = checkEventAuthorization(task, ev);
+      if (!authz.ok) return false;
+      cur = ev.previousHash || null;
+    }
+    return true;
+  }
+
+  /**
    * v0.12.12 (审查 P0): 从 events 重建权威 runtime state（唯一来源是 Event Log）。
    * - head 选择：只按 forkRule 从 DAG heads 池决策，snapshot.lastEventHash 不参与
    *   （快照最多是 skip 加速，不能影响 canonical choice）
@@ -830,7 +932,7 @@ export class TaskStore {
     const heads = events.filter(ev => !hasChild.has(ev.eventHash || ev.eventId));
     if (heads.length === 0) return false;
 
-    // 3. canonical head 只由 forkRule 决策（snapshot.lastEventHash 不参与！）
+    // 3. canonical head = forkRule 排序下第一个**资格合格**的分支（snapshot.lastEventHash 不参与！）
     // v0.12.12 (审查 P1): forkRule 必须 fail-closed——未知规则直接拒绝，不 fallback 到 newest
     const forkRule = (task.policy && task.policy.fork) || "publisher";
     if (!KNOWN_FORK_RULES.has(forkRule)) {
@@ -850,45 +952,29 @@ export class TaskStore {
       }
       return (b.ts || 0) - (a.ts || 0) || String(a.eventHash || "").localeCompare(String(b.eventHash || ""));
     });
-    const headEv = sorted[0];
-    if (!headEv) return false;
 
-    // 4. 回溯主链
-    const chain = [];
-    let cur = headEv.eventHash || headEv.eventId;
-    let guard = 0;
-    while (cur && byHash[cur] && guard++ < 10000) {
-      chain.unshift(byHash[cur]);
-      cur = byHash[cur].previousHash || null;
-    }
-    if (chain.length === 0) return false;
-    const mainHashes = new Set(chain.map(ev => ev.eventHash || ev.eventId));
-
-    // 5. 重建 runtime state（共享 applyEvent 管道）
-    const rebuilt = { ...task, status: null, assigneeFingerprintActual: "", result: null, claimedAt: null, completedAt: null, cancelledAt: null, lastEventHash: null, forks: [], eventIndex: {}, eventHeight: 0 };
-    let curState = { status: null, assigneeFingerprintActual: "", result: null };
-    for (const ev of chain) {
-      const h = ev.eventHash || ev.eventId;
-      try {
-        if (ev.semanticVersion === 2) {
-          // genesis（i===0）beforeState 是空 → currentState 也是空，applyEvent 全字段验证
-          curState = applyEvent(curState, ev);
-        } else if (ev.afterState) {
-          // legacy：直接应用声明状态（历史格式，语义自由度保留）
-          curState = { status: ev.afterState.status || curState.status, assigneeFingerprintActual: ev.afterState.assigneeFingerprintActual || curState.assigneeFingerprintActual, result: ev.afterState.result ?? curState.result };
-        }
-      } catch (err) {
-        // P0: 日志损坏/语义断裂 → 立即终止，禁止 partial state 写回
-        this.persistentHealthy = false;
-        this.persistenceError = `event ${ev.eventId} replay failed: ${err.message}`;
-        return false;
+    // v0.12.18 (审查 P1): **分支资格 gate**——authorization-invalid 的分支不得成为 canonical。
+    // 逐候选按 forkRule 顺序尝试全链重放：每个 v2 事件先过 checkEventAuthorization
+    // （与 live/upsert 同一 gate，相对其父状态），再过共享 applyEvent 管道。
+    // 第一个资格合格的分支胜出；全部失败 → fail-closed（unhealthy，不写回）。
+    let rebuilt = null;
+    let branchFailures = [];
+    for (const candHead of sorted) {
+      const attempt = this._replayBranchToState(task, candHead, byHash);
+      if (!attempt.ok) {
+        branchFailures.push(`${String(candHead.eventId || candHead.eventHash).slice(0, 24)}: ${attempt.reason}`);
+        continue; // 该分支资格不合格 → 下一个候选
       }
-      rebuilt.status = curState.status; rebuilt.assigneeFingerprintActual = curState.assigneeFingerprintActual; rebuilt.result = curState.result;
-      rebuilt.lastEventHash = h; rebuilt.eventHeight++; rebuilt.eventIndex[h] = { eventId: ev.eventId, parentHash: ev.previousHash || null, actor: ev.actor, action: ev.action, ts: ev.ts, height: rebuilt.eventHeight };
-      if (ev.action === "claim") rebuilt.claimedAt = ev.ts;
-      if (ev.action === "complete") rebuilt.completedAt = ev.ts;
-      if (ev.action === "cancel") rebuilt.cancelledAt = ev.ts;
+      rebuilt = attempt.rebuilt;
+      break;
     }
+    if (!rebuilt) {
+      this.persistentHealthy = false;
+      this.persistenceError = `task ${id}: no eligible canonical branch — ${branchFailures.join(" | ") || "all branches failed"}`;
+      return false;
+    }
+    const mainHashes = new Set(Object.keys(rebuilt.eventIndex));
+
     // 6. eventIndex 全量索引（fork 分支事件也补入；hash 已在第 1 步全部验证过）
     for (const ev of events) {
       const h = ev.eventHash || ev.eventId;
@@ -978,6 +1064,20 @@ export class TaskStore {
       if (thisHash && this._seenEventHashes.has(thisHash)) {
         return { task, duplicate: true };
       }
+      // v0.12.18 (审查 P1): Authorization gate——canonical(非 fork) v2 事件必须通过
+      // 共享授权检查。live(node 已先查 checkTransition)与 store 直接写入路径共享同一 gate，
+      // 防"合法签名但无权限"的事件经任何旁路进入 Event Log 成为 canonical 状态。
+      // fork 事件（fork=true）不在此拒绝——它只是被记录的分支，能否 canonicalize 由
+      // resolveFork/_tryRebuildFromEvents 的 eligibility gate 决定。
+      if (!fork) {
+        const authz = checkEventAuthorization(task, event);
+        if (!authz.ok) {
+          const err = new Error(`event authorization failed: ${event.eventId} (${authz.reason})`);
+          err.authorization = true;
+          err.reason = authz.reason;
+          throw err;
+        }
+      }
       // v0.12.17 (审查 P0): **先持久化 Event Log，成功后才允许修改内存状态。**
       // append 失败 → 立即 throw，绝不进入 events/eventIndex/tasks/snapshot。
       const appended = this._appendEvent(event);
@@ -1066,7 +1166,7 @@ export class TaskStore {
     // 主链头候选：从事件日志查 lastEventHash 对应事件的 actor/ts
     const events = this.events.get(taskId) || [];
     const headEvent = events.find((ev) => (ev.eventHash || ev.eventId) === task.lastEventHash) || null;
-    const candidates = [
+    let candidates = [
       ...(task.forks || []),
       ...(headEvent ? [{
         headEventHash: headEvent.eventHash || headEvent.eventId,
@@ -1076,6 +1176,17 @@ export class TaskStore {
         isMainChain: true,
       }] : []),
     ];
+    // v0.12.18 (审查 P1): fork candidate 必须通过 authorization eligibility——
+    // 分支上任一 v2 事件无权限（合法签名但无资格）→ 该分支不得参与 canonical 竞争。
+    // 与 _tryRebuildFromEvents 的资格 gate 同一语义（相对各自父状态的 checkEventAuthorization）。
+    if (candidates.length > 1) {
+      const byHash = {};
+      for (const ev of events) byHash[ev.eventHash || ev.eventId] = ev;
+      candidates = candidates.filter((c) => {
+        if (c.isMainChain) return true; // 主链已是 canonical（live 授权过），无需重验
+        return this._branchAuthorized(task, c.headEventHash, byHash);
+      });
+    }
     if (candidates.length === 0) return null;
     const forkRule = (task.policy && task.policy.fork) || "publisher";
     // v0.12.4: fork rule 白名单——未知规则 throw，不静默 reinterpret 成 newest
@@ -1165,6 +1276,13 @@ export class TaskStore {
     let currentState = { status: TASK_STATUS.OPEN, assigneeFingerprintActual: "", result: null };
     for (let i = 0; i < chain.length; i++) {
       const ev = chain[i];
+      // v0.12.18 (审查 P1): authorization gate —— canonicalizeTask 重放与 live/upsert/
+      // _tryRebuildFromEvents 同一语义：fork 分支胜出后其每个 v2 事件仍须通过授权
+      // （相对各自父状态）。防"resolveFork 漏网的无权限分支经重放成为 canonical"。
+      const authz = checkEventAuthorization(task, ev);
+      if (!authz.ok) {
+        throw new Error(`canonicalizeTask: authorization failed at ${ev.eventId}: ${authz.reason}`);
+      }
       // v0.12.4 (审查 P1-④): replay 阶段重新验证 eventHash 自洽
       // v0.12.15 (审查 P0): 与 live/upsert/_tryRebuildFromEvents 共用同一 integrity gate
       const integrity = checkEventIntegrity(ev);

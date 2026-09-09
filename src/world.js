@@ -158,59 +158,96 @@ export class WorldModel {
     }
   }
 
-  _append(rec) {
-    if (!this.logFile) return;
+  /**
+   * v0.12.18 (审查 P0): 批量持久化（append-first 原子性）。
+   * 同一操作的**全部**日志记录一次性写入（单次 appendFileSync）——要么全成功、要么全失败。
+   * 失败 → 返回 false 并标记 unhealthy（调用方通过 _appendOrThrow 得到 throw）。
+   * @param {object|object[]} recs 单条或数组
+   * @returns {boolean} true = 全部落盘成功
+   */
+  _persist(recs) {
+    if (!this.logFile) return true; // 内存模式：无持久化目录视为成功
+    const arr = Array.isArray(recs) ? recs : [recs];
+    if (arr.length === 0) return true;
     try {
       fs.mkdirSync(path.dirname(this.logFile), { recursive: true });
       // v0.12.2 ⑧: 每条记录带 schemaVersion（为未来版本迁移做准备）
-      fs.appendFileSync(this.logFile, JSON.stringify({ schemaVersion: 1, ...rec }) + "\n", "utf8");
+      const lines = arr.map((r) => JSON.stringify({ schemaVersion: 1, ...r }) + "\n").join("");
+      fs.appendFileSync(this.logFile, lines, "utf8");
+      return true;
     } catch (err) {
       // v0.12.2 ⑨: 持久化失败 → 标记 unhealthy（不再静默吞掉）。
       // World Model 是权威状态——内存成功磁盘失败 = 重启后世界倒退。
       this.persistentHealthy = false;
       this.persistenceError = err?.message || String(err);
+      return false;
     }
   }
 
+  /**
+   * v0.12.18 (审查 P0): append-first 强制门——先持久化、失败立即 throw，
+   * 调用方不得继续修改内存（与 TaskStore v0.12.17 同一事务模型）。
+   * @param {object|object[]} recs 单条或数组
+   * @throws {Error} err.persistence = true 若落盘失败
+   */
+  _appendOrThrow(recs) {
+    if (!this._persist(recs)) {
+      const kinds = (Array.isArray(recs) ? recs : [recs]).map((r) => r.kind || "?").join(",");
+      const err = new Error(`world log persistence failed (${kinds}): ${this.persistenceError || "unknown"}`);
+      err.persistence = true;
+      throw err;
+    }
+  }
+
+  /** 仅内存事件环形缓冲（v0.12.18：写入日志由调用方在 _appendOrThrow batch 中统一完成） */
   _pushEvent(ev) {
     this.events.push(ev);
     if (this.events.length > this._eventCap) this.events.splice(0, this.events.length - this._eventCap);
-    this._append({ kind: "event", data: ev, ts: ev.ts || Date.now() });
   }
 
   /** 记录/更新一个实体（每次变更都持久化） */
   observeEntity(id, type, name, meta = {}, opts = {}) {
     const now = Date.now();
-    this._append({ kind: "entity", id, type, name, meta, ts: now, ...(opts.source ? { src: opts.source } : {}) });
     const existing = this.entities.get(id);
+    // v0.12.18 (审查 P0): append-first——本操作的全部记录（状态记录 + 事件记录）先一次性落盘
+    const eventEv = { kind: existing ? "entity_updated" : "entity_seen", id, type, ts: now };
+    this._appendOrThrow([
+      { kind: "entity", id, type, name, meta, ts: now, ...(opts.source ? { src: opts.source } : {}) },
+      { kind: "event", data: eventEv, ts: now },
+    ]);
+    // 持久化成功 → 才更新内存
     if (existing) {
       existing.lastSeen = now;
       existing.name = name || existing.name;
       existing.meta = { ...existing.meta, ...(meta || {}) };
-      this._pushEvent({ kind: "entity_updated", id, type, ts: now });
+      this._pushEvent(eventEv);
       return existing;
     }
     const entity = { id, type, name, meta: meta || {}, firstSeen: now, lastSeen: now };
     this.entities.set(id, entity);
-    this._pushEvent({ kind: "entity_seen", id, type, ts: now });
+    this._pushEvent(eventEv);
     return entity;
   }
 
   /** 记录/更新一个 Agent 节点（每次变更都持久化） */
   observeAgent(fingerprint, name, capabilities = [], trustHint = "learned") {
     const now = Date.now();
-    this._append({ kind: "agent", id: fingerprint, name, capabilities, trustHint, ts: now });
     const existing = this.agents.get(fingerprint);
+    const eventEv = { kind: existing ? "agent_updated" : "agent_observed", fingerprint, name, ts: now };
+    this._appendOrThrow([
+      { kind: "agent", id: fingerprint, name, capabilities, trustHint, ts: now },
+      { kind: "event", data: eventEv, ts: now },
+    ]);
     if (existing) {
       existing.lastSeen = now;
       existing.name = name || existing.name;
       if (capabilities.length) existing.capabilities = Array.from(new Set([...(existing.capabilities || []), ...capabilities]));
-      this._pushEvent({ kind: "agent_updated", fingerprint, ts: now });
+      this._pushEvent(eventEv);
       return existing;
     }
     const agent = { id: fingerprint, fingerprint, name, capabilities, trustHint, firstSeen: now, lastSeen: now };
     this.agents.set(fingerprint, agent);
-    this._pushEvent({ kind: "agent_observed", fingerprint, name, ts: now });
+    this._pushEvent(eventEv);
     return agent;
   }
 
@@ -249,28 +286,33 @@ export class WorldModel {
     };
     const evidenceId = `${observedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const claimId = `${ev.subject}|${ev.predicate}|${String(ev.object)}`;
+    const ts = Date.now();
 
-    // 持久化证据日志
-    this._append({
-      kind: "evidence",
-      claimId,
-      evidenceId,
-      subject: ev.subject,
-      predicate: ev.predicate,
-      object: ev.object,
-      source,
-      observedAt,
-      validFrom: ev.validFrom || null,   // v0.12.0: 时间三维分开
-      validUntil: ev.validUntil || null,
-      ts: Date.now(),
-    });
+    // v0.12.18 (审查 P0): append-first——evidence 记录 + ingested 事件记录一次性落盘。
+    // 失败 → throw，_addEvidenceToClaim/_pushEvent 一律不执行（零状态变更）。
+    this._appendOrThrow([
+      {
+        kind: "evidence",
+        claimId,
+        evidenceId,
+        subject: ev.subject,
+        predicate: ev.predicate,
+        object: ev.object,
+        source,
+        observedAt,
+        validFrom: ev.validFrom || null,   // v0.12.0: 时间三维分开
+        validUntil: ev.validUntil || null,
+        ts,
+      },
+      { kind: "event", data: { kind: "evidence_ingested", claimId, subject: ev.subject, predicate: ev.predicate, object: ev.object, ts }, ts },
+    ]);
 
-    // 更新内存
+    // 持久化成功 → 更新内存
     this._addEvidenceToClaim(
       { claimId, evidenceId, subject: ev.subject, predicate: ev.predicate, object: ev.object, source, observedAt, validFrom: ev.validFrom || null, validUntil: ev.validUntil || null },
-      Date.now()
+      ts
     );
-    this._pushEvent({ kind: "evidence_ingested", claimId, subject: ev.subject, predicate: ev.predicate, object: ev.object, ts: Date.now() });
+    this._pushEvent({ kind: "evidence_ingested", claimId, subject: ev.subject, predicate: ev.predicate, object: ev.object, ts });
     return this.claims.get(claimId);
   }
 
@@ -409,7 +451,11 @@ export class WorldModel {
       retractedBy: meta.retractedBy || "",
       reason: meta.reason || "",
     };
-    this._append(retraction);
+    // v0.12.18 (审查 P0): append-first——retraction 记录 + 事件记录一次性落盘，失败不碰内存
+    this._appendOrThrow([
+      retraction,
+      { kind: "event", data: { kind: "evidence_retracted", claimId, evidenceId: evidenceId || null, ts: now }, ts: now },
+    ]);
     this._replay(retraction); // v0.12.4: 非破坏性——标记 status=retracted，不物理删除
     this._pushEvent({ kind: "evidence_retracted", claimId, evidenceId, ts: now });
     return true;
@@ -594,13 +640,18 @@ export class WorldModel {
   addRelation(from, type, to) {
     const id = `${from}|${type}|${to}`;
     const now = Date.now();
-    if (this.relations.has(id)) {
-      const rel = this.relations.get(id);
-      rel.ts = now;
-      this._append({ kind: "relation", from, type, to, ts: now });
-      return rel;
+    const existing = this.relations.get(id);
+    if (existing) {
+      // v0.12.18 (审查 P0): append-first——更新记录先落盘，成功后才改内存 ts
+      this._appendOrThrow({ kind: "relation", from, type, to, ts: now });
+      existing.ts = now;
+      return existing;
     }
-    this._append({ kind: "relation", from, type, to, ts: now });
+    // v0.12.18 (审查 P0): append-first——relation 记录 + 事件记录一次性落盘
+    this._appendOrThrow([
+      { kind: "relation", from, type, to, ts: now },
+      { kind: "event", data: { kind: "relation_added", from, type, to, ts: now }, ts: now },
+    ]);
     const rel = { id, from, type, to, ts: now };
     this.relations.set(id, rel);
     this._pushEvent({ kind: "relation_added", from, type, to, ts: now });

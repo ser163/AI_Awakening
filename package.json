@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.17",
-    "description": "硅基协作网络 — Event Log 写入原子性 (append 失败零状态变更) + null 唯一 sentinel, 160 tests",
+  "version": "0.12.18",
+    "description": "硅基协作网络 — World append-first 原子性 + Authorization 进入 Event Kernel (Live==Replay), 167 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

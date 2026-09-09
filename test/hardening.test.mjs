@@ -1550,4 +1550,84 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
       assert.ok(ts.isHealthy(), "legal snapshot persistence → healthy");
     });
   });
+
+  // v0.12.18 (审查 P1): Live == Replay Authorization——合法签名 + 无权限 → 两条路径都拒
+  describe("Authorization: Live == Replay (P1)", () => {
+    const authStore = path.join(fs.realpathSync(os.tmpdir()), "hard_v01218_auth");
+    function mkAlice() { return loadOrCreateIdentity(path.join(authStore, "alice"), "alice"); }
+    function mkCharlie() { return loadOrCreateIdentity(path.join(authStore, "charlie"), "charlie"); }
+
+    it("Charlie(合法私钥, 无 cancel 权限) → live upsert 拒; 手工塞入日志 → replay 也拒", () => {
+      const alice = mkAlice();
+      const charlie = mkCharlie();
+      const dir = path.join(authStore, "lr_ae_" + Date.now());
+      const ts = new TaskStore(dir);
+      const task = createTask({ title: "auth_eq", requiredCapabilities: [] }); // 默认 policy: cancel → publisher
+      task.publisherFingerprint = alice.fingerprint;
+      const e1 = createTaskEvent(alice, "publish", null, task);
+      ts.upsert(task, e1);
+      const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+      const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+      ts.upsert(claimed, e2);
+      const before = ts.get(task.id).status; // claimed
+
+      // Charlie 伪造 cancel（合法签名+合法状态转移 open→cancel，但无 publisher 权限）
+      const evil = { ...task, status: "cancelled", assigneeFingerprintActual: "", lastEventHash: e2.eventHash };
+      const eEvil = createTaskEvent(charlie, "cancel", { status: "claimed", assigneeFingerprintActual: alice.fingerprint, result: null }, evil);
+
+      // 1) LIVE: store.upsert 直接拒绝（Authorization gate 在 Event Kernel 内）
+      assert.throws(
+        () => ts.upsert({ ...claimed, status: "cancelled", lastEventHash: eEvil.eventHash }, eEvil),
+        /authorization failed/,
+        "live upsert 必须拒绝无权限 cancel"
+      );
+      assert.equal(ts.get(task.id).status, before, "live reject 后状态不变");
+      // Event Log 没有 Charlie 的事件
+      const hashes = ts.eventHistory(task.id).map(ev => ev.eventId);
+      assert.ok(!hashes.includes(eEvil.eventId), "被拒事件不得进入 Event Log");
+
+      // 2) REPLAY: 绕过 live 直接把事件塞入磁盘日志（模拟旧日志/恶意注入）→ 重启 replay 拒绝
+      const evFile = path.join(dir, "tasks", "events.jsonl");
+      fs.appendFileSync(evFile, JSON.stringify(eEvil) + "\n", "utf8");
+      const ts2 = new TaskStore(dir);
+      // Charlie 分支无权限 → 不是 eligible canonical → 任务停在原状态（claimed, alice）
+      const rt = ts2.get(task.id);
+      assert.equal(rt.status, "claimed", "replay 不得接受无权限 cancel → 状态不回退");
+      assert.equal(rt.assigneeFingerprintActual, alice.fingerprint, "replay 不得接受 Charlie 的 cancelled");
+      assert.ok(!ts2.isHealthy(), "日志含 authorization-invalid 分支 → 标记 unhealthy（fail-closed）");
+    });
+
+    it("Charlie cancel 作为 fork 注入 → 不得成为 canonical candidate（forkRule=newest 也被排除）", () => {
+      const alice = mkAlice();
+      const charlie = mkCharlie();
+      const dir = path.join(authStore, "fk_ae_" + Date.now());
+      const ts = new TaskStore(dir);
+      // COLLABORATIVE: forkRule = newest → 若不过滤, Charlie 的较新 cancel 会赢
+      const task = createTask({ title: "fork_auth", policy: { ...TASK_POLICIES.COLLABORATIVE } });
+      task.publisherFingerprint = alice.fingerprint;
+      const e1 = createTaskEvent(alice, "publish", null, task);
+      ts.upsert(task, e1);
+      // 合法主链：bob claim（any 可 claim）
+      const bobClaimed = { ...task, status: "claimed", assigneeFingerprintActual: charlie.fingerprint, lastEventHash: e1.eventHash };
+      const eBob = createTaskEvent(charlie, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, bobClaimed);
+      ts.upsert(bobClaimed, eBob);
+      // Charlie 自己的 claim 分支是合法的；再伪造一个 cancel fork（无权限, 时间更新 → newest 会偏向他）
+      const evilCancel = { ...task, status: "cancelled", assigneeFingerprintActual: "", lastEventHash: e1.eventHash, cancelledAt: Date.now() };
+      const eCancelFork = createTaskEvent(charlie, "cancel", { status: "open", assigneeFingerprintActual: "", result: null }, evilCancel);
+      ts.upsert(ts.get(task.id), eCancelFork, { fork: true }); // fork 记录允许（观察），但不得 canonicalize
+
+      // resolveFork: Charlie 的 cancel fork 无权限 → 被排除 → 主链（bob claim）仍是 canonical
+      const winner = ts.resolveFork(task.id);
+      assert.equal(winner, null, "无权限 fork 不得成为 canonical candidate");
+      assert.equal(ts.get(task.id).status, "claimed", "canonical 状态保持合法分支");
+      // canonicalizeTask 也无切换
+      assert.equal(ts.canonicalizeTask(task.id), null, "无权限分支不触发重建");
+
+      // 重启后 replay 同样保持主链
+      const ts2 = new TaskStore(dir);
+      const rt = ts2.get(task.id);
+      assert.equal(rt.status, "claimed", "重启 replay: 无权限 cancel fork 不得胜出");
+      assert.ok(ts2.isHealthy(), "fork 观察记录本身不破坏 healthy（它只是不能 canonicalize）");
+    });
+  });
 });
