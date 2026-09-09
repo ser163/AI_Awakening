@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.25",
-      "description": "硅基协作网络 — 严格 validator ≠ 容错 loader 分离 + migration 语义验证复用 World transition, 191 tests",
+  "version": "0.12.26",
+      "description": "硅基协作网络 — applyWorldTransition 唯一纯状态转换函数 + 注释纯中文清理, 191 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

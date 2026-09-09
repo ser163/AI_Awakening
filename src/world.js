@@ -149,9 +149,10 @@ export class WorldModel {
       //   状态: IDLE → BEGIN(A) → OPEN(A) → COMMIT(A) → IDLE
       //   OPEN(A) 期间: RECORD(A) ✓ | COMMIT(A) ✓ | BEGIN(B)/COMMIT(B)/RECORD(B) → 非法
       //   IDLE 期间:   RECORD(txId)/COMMIT(txId)（无 BEGIN）→ 非法
-      //   非法 transition → fail-closed：persistentHealthy=false，非法记录绝不 _replay。
-      //   legacy 行（无 txId）→ 逐行直接应用（仅旧日志向后兼容）。
-      //   文件尾部未 commit 事务 / 半行 JSON（崩溃截断）→ 丢弃（crash recovery，见文件头语义）。
+      //   非法状态转换 → 故障即关闭（fail-closed）：persistentHealthy=false，非法记录绝不 _replay。
+      //   legacy 行（无 txId）→ v0.12.23 起 fail-closed：无 eventHash 不可参与权威重放，
+      //   必须经 migrateWorldLog() 显式迁移后才能启动。
+      //   文件尾部未提交事务 / 半行 JSON（崩溃截断）→ 丢弃（崩溃恢复，见文件头语义）。
       let pendingTx = null; // {txId, records: [{line, rec}]}
       let abortLoad = false; // 完整性/协议失败 → 终止整个加载
       for (let i = 0; i < lines.length && !abortLoad; i++) {
@@ -249,64 +250,9 @@ export class WorldModel {
     }
   }
 
-  /** 重放一条日志事件（幂等：append-only 日志 → 内存状态） */
+  /** 重放一条日志事件（幂等：追加式日志 → 内存状态）——仅委托纯状态转换函数 */
   _replay(rec) {
-    const now = rec.ts || Date.now();
-    if (rec.kind === "entity") {
-      const e = this.entities.get(rec.id);
-      if (!e) this.entities.set(rec.id, { id: rec.id, type: rec.type, name: rec.name, meta: rec.meta || {}, firstSeen: now, lastSeen: now });
-      else {
-        e.lastSeen = now;
-        if (rec.name) e.name = rec.name;
-        if (rec.meta) e.meta = { ...e.meta, ...rec.meta };
-      }
-    } else if (rec.kind === "agent") {
-      const a = this.agents.get(rec.id);
-      if (!a) this.agents.set(rec.id, { id: rec.id, fingerprint: rec.id, name: rec.name, capabilities: rec.capabilities || [], trustHint: rec.trustHint || "learned", firstSeen: now, lastSeen: now });
-      else {
-        a.lastSeen = now;
-        if (rec.name) a.name = rec.name;
-        if (rec.capabilities?.length) a.capabilities = Array.from(new Set([...(a.capabilities || []), ...rec.capabilities]));
-      }
-    } else if (rec.kind === "evidence") {
-      this._addEvidenceToClaim(rec, now);
-    } else if (rec.kind === "claim_retracted") {
-      // 撤销整个 claim（如发现原始证据系伪造）——标记而非删除（v0.12.4）
-      const c = this.claims.get(rec.id);
-      if (c) {
-        c.status = "retracted";
-        c.retractedAt = rec.ts || now;
-        c.retractedBy = rec.retractedBy || "";
-        c.reason = rec.reason || "";
-      }
-    } else if (rec.kind === "evidence_retracted") {
-      // v0.12.4: 非破坏性撤销——标记 status=retracted，保留历史（"有历史的世界不该忘记"）
-      const c = this.claims.get(rec.claimId);
-      if (c && rec.evidenceId) {
-        const ev = c.evidence.find((e) => e.evidenceId === rec.evidenceId);
-        if (ev) {
-          ev.status = "retracted";
-          ev.retractedAt = rec.ts || now;
-          ev.retractedBy = rec.retractedBy || "";
-          ev.reason = rec.reason || "";
-        }
-      }
-      // 整个 claim 撤销（evidenceId=null）
-      if (c && !rec.evidenceId) {
-        c.status = "retracted";
-        c.retractedAt = rec.ts || now;
-        c.retractedBy = rec.retractedBy || "";
-        c.reason = rec.reason || "";
-      }
-    } else if (rec.kind === "relation") {
-      const rid = `${rec.from}|${rec.type}|${rec.to}`;
-      if (!this.relations.has(rid)) {
-        this.relations.set(rid, { id: rid, from: rec.from, type: rec.type, to: rec.to, ts: now });
-        this.events.push({ kind: "relation_added", from: rec.from, type: rec.type, to: rec.to, ts: now });
-      }
-    } else if (rec.kind === "event") {
-      this.events.push(rec.data);
-    }
+    applyWorldTransition(this, rec);
   }
 
   /**
@@ -349,7 +295,7 @@ export class WorldModel {
   }
 
   /**
-   * v0.12.18 (审查 P0): append-first 强制门——先持久化、失败立即 throw，
+   * v0.12.18 (审查 P0): 先落盘强制门——先持久化、失败立即 throw，
    * 调用方不得继续修改内存（与 TaskStore v0.12.17 同一事务模型）。
    * @param {object|object[]} recs 单条或数组
    * @throws {Error} err.persistence = true 若落盘失败
@@ -373,7 +319,7 @@ export class WorldModel {
   observeEntity(id, type, name, meta = {}, opts = {}) {
     const now = Date.now();
     const existing = this.entities.get(id);
-    // v0.12.18 (审查 P0): append-first——本操作的全部记录（状态记录 + 事件记录）先一次性落盘
+    // v0.12.18 (审查 P0): 先落盘——本操作的全部记录（状态记录 + 事件记录）先一次性落盘
     const eventEv = { kind: existing ? "entity_updated" : "entity_seen", id, type, ts: now };
     this._appendOrThrow([
       { kind: "entity", id, type, name, meta, ts: now, ...(opts.source ? { src: opts.source } : {}) },
@@ -461,7 +407,7 @@ export class WorldModel {
     const claimId = `${ev.subject}|${ev.predicate}|${String(ev.object)}`;
     const ts = Date.now();
 
-    // v0.12.18 (审查 P0): append-first——evidence 记录 + ingested 事件记录一次性落盘。
+    // v0.12.18 (审查 P0): 先落盘——evidence 记录 + ingested 事件记录一次性落盘。
     // 失败 → throw，_addEvidenceToClaim/_pushEvent 一律不执行（零状态变更）。
     this._appendOrThrow([
       {
@@ -633,7 +579,7 @@ export class WorldModel {
       retractedBy: meta.retractedBy || "",
       reason: meta.reason || "",
     };
-    // v0.12.18 (审查 P0): append-first——retraction 记录 + 事件记录一次性落盘，失败不碰内存
+    // v0.12.18 (审查 P0): 先落盘——retraction 记录 + 事件记录一次性落盘，失败不碰内存
     this._appendOrThrow([
       retraction,
       { kind: "event", data: { kind: "evidence_retracted", claimId, evidenceId: evidenceId || null, ts: now }, ts: now },
@@ -824,12 +770,12 @@ export class WorldModel {
     const now = Date.now();
     const existing = this.relations.get(id);
     if (existing) {
-      // v0.12.18 (审查 P0): append-first——更新记录先落盘，成功后才改内存 ts
+      // v0.12.18 (审查 P0): 先落盘——更新记录先落盘，成功后才改内存 ts
       this._appendOrThrow({ kind: "relation", from, type, to, ts: now });
       existing.ts = now;
       return existing;
     }
-    // v0.12.18 (审查 P0): append-first——relation 记录 + 事件记录一次性落盘
+    // v0.12.18 (审查 P0): 先落盘——relation 记录 + 事件记录一次性落盘
     this._appendOrThrow([
       { kind: "relation", from, type, to, ts: now },
       { kind: "event", data: { kind: "relation_added", from, type, to, ts: now }, ts: now },
@@ -865,12 +811,78 @@ export class WorldModel {
 }
 
 /**
+ * v0.12.26 (审查 P2): 唯一纯状态转换函数——实时写入、重放、迁移验证共用。
+ * 从旧 _replay() 抽出。ctx 为持有 entities/agents/claims/relations/events 的世界容器
+ * （WorldModel 实例或等价的 dry-run 容器）。
+ * @param {object} ctx 世界状态容器
+ * @param {object} rec 一条权威/telemetry 记录（无 txId/eventHash 语义字段）
+ */
+function applyWorldTransition(ctx, rec) {
+  const now = rec.ts || Date.now();
+  if (rec.kind === "entity") {
+    const e = ctx.entities.get(rec.id);
+    if (!e) ctx.entities.set(rec.id, { id: rec.id, type: rec.type, name: rec.name, meta: rec.meta || {}, firstSeen: now, lastSeen: now });
+    else {
+      e.lastSeen = now;
+      if (rec.name) e.name = rec.name;
+      if (rec.meta) e.meta = { ...e.meta, ...rec.meta };
+    }
+  } else if (rec.kind === "agent") {
+    const a = ctx.agents.get(rec.id);
+    if (!a) ctx.agents.set(rec.id, { id: rec.id, fingerprint: rec.id, name: rec.name, capabilities: rec.capabilities || [], trustHint: rec.trustHint || "learned", firstSeen: now, lastSeen: now });
+    else {
+      a.lastSeen = now;
+      if (rec.name) a.name = rec.name;
+      if (rec.capabilities?.length) a.capabilities = Array.from(new Set([...(a.capabilities || []), ...rec.capabilities]));
+    }
+  } else if (rec.kind === "evidence") {
+    ctx._addEvidenceToClaim(rec, now);
+  } else if (rec.kind === "claim_retracted") {
+    // 撤销整个 claim（如发现原始证据系伪造）——标记而非删除（v0.12.4）
+    const c = ctx.claims.get(rec.id);
+    if (c) {
+      c.status = "retracted";
+      c.retractedAt = rec.ts || now;
+      c.retractedBy = rec.retractedBy || "";
+      c.reason = rec.reason || "";
+    }
+  } else if (rec.kind === "evidence_retracted") {
+    // v0.12.4: 非破坏性撤销——标记 status=retracted，保留历史（"有历史的世界不该忘记"）
+    const c = ctx.claims.get(rec.claimId);
+    if (c && rec.evidenceId) {
+      const ev = c.evidence.find((e) => e.evidenceId === rec.evidenceId);
+      if (ev) {
+        ev.status = "retracted";
+        ev.retractedAt = rec.ts || now;
+        ev.retractedBy = rec.retractedBy || "";
+        ev.reason = rec.reason || "";
+      }
+    }
+    // 整个 claim 撤销（evidenceId=null）
+    if (c && !rec.evidenceId) {
+      c.status = "retracted";
+      c.retractedAt = rec.ts || now;
+      c.retractedBy = rec.retractedBy || "";
+      c.reason = rec.reason || "";
+    }
+  } else if (rec.kind === "relation") {
+    const rid = `${rec.from}|${rec.type}|${rec.to}`;
+    if (!ctx.relations.has(rid)) {
+      ctx.relations.set(rid, { id: rid, from: rec.from, type: rec.type, to: rec.to, ts: now });
+      ctx.events.push({ kind: "relation_added", from: rec.from, type: rec.type, to: rec.to, ts: now });
+    }
+  } else if (rec.kind === "event") {
+    ctx.events.push(rec.data);
+  }
+}
+
+/**
  * v0.12.23 (审查 P1): World 旧日志显式迁移——读取 legacy 格式（无 txId/无 eventHash）的
  * world.jsonl，逐行验证并转换为当前事务格式（BEGIN→RECORD(txId+eventHash)→COMMIT）。
  * 原始文件被备份为 world.jsonl.bak.v1，迁移后可被 WorldModel 正常加载。
  *
- * 设计：这是将 Legacy ≠ authoritative 原则落地的唯一入口。
- * 非权威 event 记录（kind:"event"）不计算 hash，仅包裹事务标记保留 telemetry。
+ * 设计：这是"旧日志 ≠ 权威状态"原则落地的唯一入口。
+ * 非权威 event 记录（kind:"event"）不计算 hash，仅包裹事务标记保留遥测数据。
  *
  * @param {string} storageDir 持久化目录（与 WorldModel 构造函数同语义）
  * @returns {{ok: boolean, migrated: number, reason?: string}}
@@ -886,7 +898,7 @@ export function migrateWorldLog(storageDir) {
     if (err?.code === "ENOENT") return { ok: true, migrated: 0 };
     return { ok: false, migrated: 0, reason: `read failed: ${err.message}` };
   }
-  // Step 1 — 完整解析每一行。坏 JSON：仅容忍尾部截断行（与 _load 的 crash-residue 语义一致），
+  // Step 1 — 完整解析每一行。坏 JSON：仅容忍尾部截断行（与 _load 的崩溃残留语义一致），
   // 其余位置 → 拒绝迁移（不允许"带坏数据的日志"被短路或被打上 hash 印章）。
   const recs = [];
   for (let i = 0; i < lines.length; i++) {
@@ -900,9 +912,9 @@ export function migrateWorldLog(storageDir) {
   if (recs.length === 0) return { ok: true, migrated: 0 };
 
   // Step 2 — 格式判定：出现任何事务标记（tx_begin/tx_commit/txId 字段）→ 文件声明为 transactional。
-  // 用容错检测（匹配 _load 语义）：容忍尾部未闭合事务作为 crash 残留；
+  // 用容错检测（匹配 _load 语义）：容忍尾部未闭合事务作为崩溃残留；
   // 但拒绝所有其他协议违规（legacy 混排、nested tx、orphan record 等）。
-  // 这与 validateTransactionalLog()（严格，拒绝尾部未闭合）语义分离。（v0.12.25 审查 P1-1）
+  // 这与 validateTransactionalLog()（严格，拒绝尾部未闭合）语义分离。
   const hasTxMarkers = recs.some((r) => r && (r.kind === "tx_begin" || r.kind === "tx_commit" || r.txId));
   if (hasTxMarkers) {
     const v = checkTolerantTransactional(recs);
@@ -1089,10 +1101,11 @@ function checkTolerantTransactional(recs) {
 }
 
 /**
- * v0.12.25 (审查 P1-2): legacy 记录语义完整性验证——复用 WorldModel._replay 作为 transition
- * validator（不维护第二套 migration 专用语义规则）。对每条记录做 dry-run replay 并检查：
+ * v0.12.26 (审查 P2): 旧日志语义完整性验证——复用唯一纯状态转换函数
+ * applyWorldTransition()（不依赖 _replay() 内部实现，不维护第二套迁移语义规则）。
+ * 对每条记录做试运行重放并检查：
  * - claim_retracted / evidence_retracted 必须引用已存在的 claim（与正常 API retractEvidence 对齐）
- * - relation forward-reference 允许（World 允许先有关系后创实体）
+ * - relation 前向引用允许（世界允许先有关系后建实体）
  * @param {object[]} recs legacy 记录数组
  * @returns {string|null} 错误消息或 null（合法）
  */
@@ -1116,8 +1129,8 @@ function validateLegacySemantics(recs) {
         if (!found) return `evidence_retracted at position ${i}: evidence "${rec.evidenceId}" not found in claim "${rec.claimId}"`;
       }
     }
-    // 用 WorldModel._replay 作为 transition 规则（幂等 upsert）
-    w._replay(rec);
+    // 与重放完全相同的状态转换规则（幂等追加合并）
+    applyWorldTransition(w, rec);
   }
   return null;
 }
