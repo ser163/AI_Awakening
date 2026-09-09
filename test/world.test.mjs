@@ -8,7 +8,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { WorldModel, SOURCE_TYPES, SOURCE_KINDS, migrateWorldLog } from "../src/world.js";
+import { WorldModel, SOURCE_TYPES, SOURCE_KINDS, migrateWorldLog, applyWorldTransition } from "../src/world.js";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
@@ -881,6 +881,44 @@ describe("world: transaction commit 语义（P1）", () => {
       const evIdN2 = n2.evidence[n2.evidence.length - 1];
       assert.notEqual(evIdN1, evIdN2, "不同 observationId 应不同 ID");
     });
+  });
+});
+
+// v0.12.27 (审查 P1): applyWorldTransition 纯函数 + deterministic ts
+describe("world: applyWorldTransition 纯函数 & 确定性", () => {
+  it("state-in/state-out：入参 state 不被修改", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    const s1 = applyWorldTransition(s0, { kind: "entity", id: "e:pure", type: "sensor", name: "P", ts: 100 });
+    assert.notEqual(s1, s0, "返回新对象");
+    assert.equal(s0.entities.size, 0, "旧 state 未改变");
+    assert.equal(s1.entities.size, 1, "新 state 含 entity");
+  });
+
+  it("ts 缺失 → throw（禁止 Date.now 回退）", () => {
+    const s = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    assert.throws(() => applyWorldTransition(s, { kind: "entity", id: "e:bad", type: "sensor", name: "B" }), /valid ts/);
+    assert.throws(() => applyWorldTransition(s, { kind: "entity", id: "e:bad", type: "sensor", name: "B", ts: null }), /valid ts/);
+    assert.throws(() => applyWorldTransition(s, { kind: "entity", id: "e:bad", type: "sensor", name: "B", ts: "abc" }), /valid ts/);
+  });
+
+  it("相同初态 + 相同事件序列 → 相同终态（确定性重放）", () => {
+    const events = [
+      { kind: "entity", id: "e:d1", type: "sensor", name: "D1", ts: 1 },
+      { kind: "entity", id: "e:d2", type: "sensor", name: "D2", ts: 2 },
+      { kind: "agent", id: "fp:d", name: "agent-d", capabilities: ["speak"], ts: 3 },
+    ];
+    let s1 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    let s2 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    for (const ev of events) {
+      s1 = applyWorldTransition(s1, ev);
+      s2 = applyWorldTransition(s2, ev);
+    }
+    assert.equal(s1.entities.size, 2);
+    assert.equal(s2.entities.size, 2);
+    assert.equal(s1.agents.size, 1);
+    assert.equal(s2.agents.size, 1);
+    assert.equal(s1.entities.get("e:d1")?.name, "D1");
+    assert.equal(s2.entities.get("e:d1")?.name, "D1");
   });
 });
 

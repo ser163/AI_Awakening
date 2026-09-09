@@ -221,7 +221,13 @@ export class WorldModel {
             }
             // 全部验证通过 → 才应用（任一 fail → abortLoad=true，事务零应用）
             if (!abortLoad) {
-              for (const { rec: r } of pendingTx.records) this._replay(r);
+              try {
+                for (const { rec: r } of pendingTx.records) this._replay(r);
+              } catch (err) {
+                this.persistentHealthy = false;
+                this.persistenceError = `world log replay failed: ${err.message}`;
+                abortLoad = true;
+              }
             }
             pendingTx = null;
           }
@@ -250,9 +256,23 @@ export class WorldModel {
     }
   }
 
-  /** 重放一条日志事件（幂等：追加式日志 → 内存状态）——仅委托纯状态转换函数 */
+  /** 重放一条日志事件（幂等：追加式日志 → 内存状态）——通过 state-in/state-out 纯态转换桥接 */
   _replay(rec) {
-    applyWorldTransition(this, rec);
+    this._stateRestore(applyWorldTransition(this._stateSnapshot(), rec));
+  }
+
+  /** 将 WorldModel 运行时状态导出为纯 state 对象（由 applyWorldTransition 消费） */
+  _stateSnapshot() {
+    return { entities: this.entities, agents: this.agents, claims: this.claims, relations: this.relations, events: this.events };
+  }
+
+  /** 将纯 state 对象写回 WorldModel 运行时状态 */
+  _stateRestore(state) {
+    this.entities = state.entities;
+    this.agents = state.agents;
+    this.claims = state.claims;
+    this.relations = state.relations;
+    this.events = state.events;
   }
 
   /**
@@ -436,49 +456,7 @@ export class WorldModel {
   }
 
   _addEvidenceToClaim(rec, now) {
-    const claimId = rec.claimId || `${rec.subject}|${rec.predicate}|${String(rec.object)}`;
-    const existing = this.claims.get(claimId);
-    const evidenceItem = {
-      evidenceId: rec.evidenceId || deterministicEvidenceId({
-        subject: rec.subject,
-        predicate: rec.predicate,
-        object: rec.object,
-        source: rec.source,
-        observedAt: rec.observedAt ?? now,
-        validFrom: rec.validFrom,
-        validUntil: rec.validUntil,
-        observationId: rec.observationId || null,
-      }),
-      subject: rec.subject,
-      predicate: rec.predicate,
-      object: rec.object,
-      source: rec.source || { type: "unknown", id: "", kind: SOURCE_KINDS.ASSERTION },
-      observedAt: rec.observedAt || now,
-      validFrom: rec.validFrom || null,   // v0.12.0: 三维时间
-      validUntil: rec.validUntil || null,
-    };
-    if (existing) {
-      existing.evidence.push(evidenceItem);
-      if (existing.evidence.length > 200) existing.evidence.splice(0, 50); // 防无限膨胀
-    } else {
-      this.claims.set(claimId, {
-        id: claimId,
-        // v0.12.0: Claim 一等公民字段
-        claimId,                                  // 可追踪标识（= id，供引用/撤销/修订）
-        // v0.12.4 (审查 P1-⑥): Proposition 身份与 Claim 身份显式分离。
-        //   propositionId = subject|predicate|object（世界主张本身）
-        //   claimId       = 该主张的可追踪容器（含证据/修订历史）
-        //   Evidence      = 单条观察（时间窗独立）
-        //   四层：Proposition ≠ Claim ≠ Evidence ≠ Belief
-        propositionId: claimId,
-        subject: rec.subject,
-        predicate: rec.predicate,
-        object: rec.object,
-        createdAt: now,                           // 主张首次成立时间（区别于证据时间）
-        revisions: [],                            // v0.12.4: 修订历史（回填自证据时间窗；见 claimAt）
-        evidence: [evidenceItem],
-      });
-    }
+    addEvidenceToClaims(this.claims, rec, now);
   }
 
   /**
@@ -811,68 +789,154 @@ export class WorldModel {
 }
 
 /**
- * v0.12.26 (审查 P2): 唯一纯状态转换函数——实时写入、重放、迁移验证共用。
- * 从旧 _replay() 抽出。ctx 为持有 entities/agents/claims/relations/events 的世界容器
- * （WorldModel 实例或等价的 dry-run 容器）。
- * @param {object} ctx 世界状态容器
+ * v0.12.27 (审查 P1): 纯状态转换函数——state-in/state-out，返回新状态，不修改入参 state。
+ * 实时写入、重放、迁移验证共用同一转换规则。
+ * @param {object} state 世界状态容器 {entities, agents, claims, relations, events}
  * @param {object} rec 一条权威/telemetry 记录（无 txId/eventHash 语义字段）
+ * @returns {object} 新世界状态容器
+ * @throws {Error} 若 rec.ts 缺失或非法（authoritative transition 禁止回退到当前时间）
  */
-function applyWorldTransition(ctx, rec) {
-  const now = rec.ts || Date.now();
+export function applyWorldTransition(state, rec) {
+  // 确定性：authoritative transition 要求记录自带有效时间戳——绝不回退 Date.now()
+  if (!Number.isFinite(rec.ts)) {
+    throw new Error(`authoritative record requires valid ts (got: ${rec.ts})`);
+  }
+  const now = rec.ts;
+  // 浅克隆容器（entries 按需克隆——clone-on-write，旧 state 的对象不被修改）
+  const next = {
+    entities: new Map(state.entities),
+    agents: new Map(state.agents),
+    claims: new Map(state.claims),
+    relations: new Map(state.relations),
+    events: [...state.events],
+  };
   if (rec.kind === "entity") {
-    const e = ctx.entities.get(rec.id);
-    if (!e) ctx.entities.set(rec.id, { id: rec.id, type: rec.type, name: rec.name, meta: rec.meta || {}, firstSeen: now, lastSeen: now });
+    const e = next.entities.get(rec.id);
+    if (!e) next.entities.set(rec.id, { id: rec.id, type: rec.type, name: rec.name, meta: rec.meta || {}, firstSeen: now, lastSeen: now });
     else {
-      e.lastSeen = now;
-      if (rec.name) e.name = rec.name;
-      if (rec.meta) e.meta = { ...e.meta, ...rec.meta };
+      next.entities.set(rec.id, {
+        ...e,
+        lastSeen: now,
+        name: rec.name || e.name,
+        meta: rec.meta ? { ...e.meta, ...rec.meta } : e.meta,
+      });
     }
   } else if (rec.kind === "agent") {
-    const a = ctx.agents.get(rec.id);
-    if (!a) ctx.agents.set(rec.id, { id: rec.id, fingerprint: rec.id, name: rec.name, capabilities: rec.capabilities || [], trustHint: rec.trustHint || "learned", firstSeen: now, lastSeen: now });
+    const a = next.agents.get(rec.id);
+    if (!a) next.agents.set(rec.id, { id: rec.id, fingerprint: rec.id, name: rec.name, capabilities: rec.capabilities || [], trustHint: rec.trustHint || "learned", firstSeen: now, lastSeen: now });
     else {
-      a.lastSeen = now;
-      if (rec.name) a.name = rec.name;
-      if (rec.capabilities?.length) a.capabilities = Array.from(new Set([...(a.capabilities || []), ...rec.capabilities]));
+      next.agents.set(rec.id, {
+        ...a,
+        lastSeen: now,
+        name: rec.name || a.name,
+        capabilities: rec.capabilities?.length ? Array.from(new Set([...(a.capabilities || []), ...rec.capabilities])) : a.capabilities,
+      });
     }
   } else if (rec.kind === "evidence") {
-    ctx._addEvidenceToClaim(rec, now);
+    addEvidenceToClaims(next.claims, rec, now);
   } else if (rec.kind === "claim_retracted") {
     // 撤销整个 claim（如发现原始证据系伪造）——标记而非删除（v0.12.4）
-    const c = ctx.claims.get(rec.id);
+    const c = next.claims.get(rec.id);
     if (c) {
-      c.status = "retracted";
-      c.retractedAt = rec.ts || now;
-      c.retractedBy = rec.retractedBy || "";
-      c.reason = rec.reason || "";
+      next.claims.set(rec.id, {
+        ...c,
+        status: "retracted",
+        retractedAt: rec.ts,
+        retractedBy: rec.retractedBy || "",
+        reason: rec.reason || "",
+      });
     }
   } else if (rec.kind === "evidence_retracted") {
     // v0.12.4: 非破坏性撤销——标记 status=retracted，保留历史（"有历史的世界不该忘记"）
-    const c = ctx.claims.get(rec.claimId);
-    if (c && rec.evidenceId) {
-      const ev = c.evidence.find((e) => e.evidenceId === rec.evidenceId);
-      if (ev) {
-        ev.status = "retracted";
-        ev.retractedAt = rec.ts || now;
-        ev.retractedBy = rec.retractedBy || "";
-        ev.reason = rec.reason || "";
+    const c = next.claims.get(rec.claimId);
+    if (c) {
+      const updated = { ...c, evidence: c.evidence.map((ev) => ev) };
+      if (rec.evidenceId) {
+        const ev = updated.evidence.find((e) => e.evidenceId === rec.evidenceId);
+        if (ev) {
+          updated.evidence = updated.evidence.map((e) =>
+            e.evidenceId === rec.evidenceId
+              ? { ...e, status: "retracted", retractedAt: rec.ts, retractedBy: rec.retractedBy || "", reason: rec.reason || "" }
+              : e
+          );
+        }
+      } else {
+        // 整个 claim 撤销（evidenceId=null）
+        updated.status = "retracted";
+        updated.retractedAt = rec.ts;
+        updated.retractedBy = rec.retractedBy || "";
+        updated.reason = rec.reason || "";
       }
-    }
-    // 整个 claim 撤销（evidenceId=null）
-    if (c && !rec.evidenceId) {
-      c.status = "retracted";
-      c.retractedAt = rec.ts || now;
-      c.retractedBy = rec.retractedBy || "";
-      c.reason = rec.reason || "";
+      next.claims.set(rec.claimId, updated);
     }
   } else if (rec.kind === "relation") {
     const rid = `${rec.from}|${rec.type}|${rec.to}`;
-    if (!ctx.relations.has(rid)) {
-      ctx.relations.set(rid, { id: rid, from: rec.from, type: rec.type, to: rec.to, ts: now });
-      ctx.events.push({ kind: "relation_added", from: rec.from, type: rec.type, to: rec.to, ts: now });
+    if (!next.relations.has(rid)) {
+      next.relations.set(rid, { id: rid, from: rec.from, type: rec.type, to: rec.to, ts: now });
+      next.events.push({ kind: "relation_added", from: rec.from, type: rec.type, to: rec.to, ts: now });
     }
   } else if (rec.kind === "event") {
-    ctx.events.push(rec.data);
+    next.events.push(rec.data);
+  }
+  return next;
+}
+
+/** 初始空世界状态（用于纯函数 dry-run / migration 验证） */
+function initWorldState() {
+  return { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+}
+
+/**
+ * v0.12.27 (审查 P1): evidence → claim 的纯转换（clone-on-write）。
+ * 被 applyWorldTransition()（重放/迁移）与 WorldModel._addEvidenceToClaim()（实时写入）共用。
+ * @param {Map} claims claim 容器
+ * @param {object} rec evidence 记录
+ * @param {number} now 确定时间戳（来自 rec.ts，不取当前时间）
+ */
+function addEvidenceToClaims(claims, rec, now) {
+  const claimId = rec.claimId || `${rec.subject}|${rec.predicate}|${String(rec.object)}`;
+  const existing = claims.get(claimId);
+  const evidenceItem = {
+    evidenceId: rec.evidenceId || deterministicEvidenceId({
+      subject: rec.subject,
+      predicate: rec.predicate,
+      object: rec.object,
+      source: rec.source,
+      observedAt: rec.observedAt ?? now,
+      validFrom: rec.validFrom,
+      validUntil: rec.validUntil,
+      observationId: rec.observationId || null,
+    }),
+    subject: rec.subject,
+    predicate: rec.predicate,
+    object: rec.object,
+    source: rec.source || { type: "unknown", id: "", kind: SOURCE_KINDS.ASSERTION },
+    observedAt: rec.observedAt || now,
+    validFrom: rec.validFrom || null,   // v0.12.0: 三维时间
+    validUntil: rec.validUntil || null,
+  };
+  if (existing) {
+    const evidence = [...existing.evidence, evidenceItem];
+    if (evidence.length > 200) evidence.splice(0, 50); // 防无限膨胀
+    claims.set(claimId, { ...existing, evidence });
+  } else {
+    claims.set(claimId, {
+      id: claimId,
+      // v0.12.0: Claim 一等公民字段
+      claimId,                                  // 可追踪标识（= id，供引用/撤销/修订）
+      // v0.12.4 (审查 P1-⑥): Proposition 身份与 Claim 身份显式分离。
+      //   propositionId = subject|predicate|object（世界主张本身）
+      //   claimId       = 该主张的可追踪容器（含证据/修订历史）
+      //   Evidence      = 单条观察（时间窗独立）
+      //   四层：Proposition ≠ Claim ≠ Evidence ≠ Belief
+      propositionId: claimId,
+      subject: rec.subject,
+      predicate: rec.predicate,
+      object: rec.object,
+      createdAt: now,                           // 主张首次成立时间（区别于证据时间）
+      revisions: [],                            // v0.12.4: 修订历史（回填自证据时间窗；见 claimAt）
+      evidence: [evidenceItem],
+    });
   }
 }
 
@@ -1101,26 +1165,30 @@ function checkTolerantTransactional(recs) {
 }
 
 /**
- * v0.12.26 (审查 P2): 旧日志语义完整性验证——复用唯一纯状态转换函数
- * applyWorldTransition()（不依赖 _replay() 内部实现，不维护第二套迁移语义规则）。
+ * v0.12.27 (审查 P1): 旧日志语义完整性验证——纯 state-in/state-out（不依赖 WorldModel 实例），
+ * 复用唯一纯状态转换函数 applyWorldTransition()。
  * 对每条记录做试运行重放并检查：
  * - claim_retracted / evidence_retracted 必须引用已存在的 claim（与正常 API retractEvidence 对齐）
  * - relation 前向引用允许（世界允许先有关系后建实体）
+ * - 记录 ts 必须为有限数值（确定性：禁止回退到当前时间）
  * @param {object[]} recs legacy 记录数组
  * @returns {string|null} 错误消息或 null（合法）
  */
 function validateLegacySemantics(recs) {
-  const w = new WorldModel(); // 内存模式（无 logFile），不落盘
+  let state = initWorldState();
   for (let i = 0; i < recs.length; i++) {
     const rec = recs[i];
+    if (!Number.isFinite(rec.ts)) {
+      return `record at position ${i}: ts must be a finite number (got: ${rec.ts}) — 确定性重放要求权威记录自带时间戳`;
+    }
     // 仅必要检查：retraction 必须引用已有 claim（正常 API retractEvidence 无 claim → return false，不写盘）
     if (rec.kind === "claim_retracted") {
-      if (!w.claims.has(rec.id)) {
+      if (!state.claims.has(rec.id)) {
         return `claim_retracted at position ${i}: claim "${rec.id}" does not exist in world`;
       }
     }
     if (rec.kind === "evidence_retracted") {
-      const c = w.claims.get(rec.claimId);
+      const c = state.claims.get(rec.claimId);
       if (!c) {
         return `evidence_retracted at position ${i}: claim "${rec.claimId}" does not exist in world`;
       }
@@ -1130,7 +1198,7 @@ function validateLegacySemantics(recs) {
       }
     }
     // 与重放完全相同的状态转换规则（幂等追加合并）
-    applyWorldTransition(w, rec);
+    state = applyWorldTransition(state, rec);
   }
   return null;
 }
