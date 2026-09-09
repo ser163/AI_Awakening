@@ -548,8 +548,9 @@ describe("v0.12.0: Task canonicalizeTask（fork 状态重建）", () => {
 
     // 第一次 canonicalize
     const canon1 = ts.canonicalizeTask(task.id);
-    // 第二次：用新 TaskStore 但相同事件集（交换 fork 记录顺序）
+    // 第二次：用新 TaskStore 但相同事件集（v2 链语义要求 genesis 存在，事件集与 ts1 一致）
     const ts2 = new TaskStore();
+    ts2.upsert({ ...task }, { ...e1 });
     ts2.upsert({ ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e2a.eventHash }, { ...e2a });
     const local2 = ts2.get(task.id);
     local2.forks = [{ headEventHash: e2b.eventHash, actor: bob.fingerprint, ts: sharedTs, action: "claim" }];

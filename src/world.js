@@ -74,36 +74,31 @@ export const SOURCE_TYPES = {
 const AUTHORITATIVE_KINDS = new Set(["entity", "agent", "evidence", "evidence_retracted", "claim_retracted", "relation"]);
 
 /**
- * v0.12.22 (审查 P1 #④): 计算 World 权威记录的完整性哈希。
- * 固定键序 JSON.stringify 规范——同内容在任何节点产生同 hash。
- * 非权威记录（event/tx 标记）不计算 hash。
- * @param {object} rec 记录对象（不含 txId/eventHash/schemaVersion）
- * @returns {string|null} 24 hex chars，或 null（非权威类型或格式错误）
+ * v0.12.23 (审查 P1/P2): 确定性深排序 canonicalization——任意字段修改→hash 变化。
+ * 排除仅 txId（事务随机 ID）和 eventHash（自指），保留 schemaVersion（防版本降级）。
+ * 不再维护人工字段白名单。
+ */
+function sortedCanonical(obj) {
+  if (obj === null || obj === undefined) return JSON.stringify(obj);
+  if (typeof obj !== "object" || Array.isArray(obj)) return JSON.stringify(obj);
+  const keys = Object.keys(obj).sort();
+  const pairs = keys.map((k) => JSON.stringify(k) + ":" + sortedCanonical(obj[k]));
+  return "{" + pairs.join(",") + "}";
+}
+
+/**
+ * v0.12.23 (审查 P1/P2): 计算 World 权威记录的完整性哈希。
+ *   — canonical = sortedCanonical(rec 排除 txId,eventHash) → 全字段受保护
+ *   — 满 256 bit (64 hex)，不截断
+ *   — 自动排除 eventHash(自指) + txId(事务随机 ID，非语义)
+ *   — 保留 schemaVersion → 版本降级被检测
+ * @param {object} rec 记录（可含 schemaVersion/txId/eventHash）
+ * @returns {string|null} 64 hex SHA-256，或 null（非权威类型）
  */
 function worldRecordHash(rec) {
   if (!rec || !rec.kind || !AUTHORITATIVE_KINDS.has(rec.kind)) return null;
-  const canonical = JSON.stringify({
-    kind: rec.kind,
-    claimId: rec.claimId || null,
-    evidenceId: rec.evidenceId || null,
-    subject: rec.subject || null,
-    predicate: rec.predicate || null,
-    object: rec.object ?? null,
-    source: rec.source || null,
-    id: rec.id || null,
-    type: rec.type || null,
-    name: rec.name || null,
-    meta: rec.meta || null,
-    from: rec.from || null,
-    to: rec.to || null,
-    observedAt: rec.observedAt ?? null,
-    validFrom: rec.validFrom ?? null,
-    validUntil: rec.validUntil ?? null,
-    ts: rec.ts ?? null,
-    retractedBy: rec.retractedBy || null,
-    reason: rec.reason || null,
-  });
-  return crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 24);
+  const { txId, eventHash, ...semantic } = rec;
+  return crypto.createHash("sha256").update(sortedCanonical(semantic)).digest("hex");
 }
 export const SOURCE_KINDS = {
   ASSERTION: "assertion",   // "我认为 X"
@@ -157,8 +152,9 @@ export class WorldModel {
       //   非法 transition → fail-closed：persistentHealthy=false，非法记录绝不 _replay。
       //   legacy 行（无 txId）→ 逐行直接应用（仅旧日志向后兼容）。
       //   文件尾部未 commit 事务 / 半行 JSON（崩溃截断）→ 丢弃（crash recovery，见文件头语义）。
-      let pendingTx = null; // {txId, records: []}
-      for (let i = 0; i < lines.length; i++) {
+      let pendingTx = null; // {txId, records: [{line, rec}]}
+      let abortLoad = false; // 完整性/协议失败 → 终止整个加载
+      for (let i = 0; i < lines.length && !abortLoad; i++) {
         let rec;
         try {
           rec = JSON.parse(lines[i]);
@@ -177,57 +173,70 @@ export class WorldModel {
         const txViolation = (msg) => {
           this.persistentHealthy = false;
           this.persistenceError = `world log tx protocol violation at line ${i + 1}: ${msg}`;
-          return true; // 已标记失败 → 上层 break
+          abortLoad = true;
         };
         if (!rec.txId) {
-          // legacy 行（无事务标记）：仅 IDLE 状态允许直接应用；OPEN(tx) 内出现 → 非法穿透
-          if (pendingTx) {
-            if (txViolation(`legacy record inside open tx ${pendingTx.txId} — 事务边界穿透`)) break;
-          }
-          this._replay(rec);
-          continue;
+          // legacy 行（无事务标记）：v0.12.23 仅迁移路径允许——正常启动下 legacy 记录
+          // 无 eventHash 不可直接参与权威重放（Legacy ≠ authoritative）。
+          // 若确实有旧日志，使用 migrateWorldLog() 显式迁移后启动。
+          this.persistentHealthy = false;
+          this.persistenceError = `world log: legacy record (no txId) at line ${i + 1} — must migrate via migrateWorldLog()`;
+          break;
         }
         if (rec.kind === "tx_begin") {
           if (pendingTx) {
-            if (txViolation(`tx_begin(${rec.txId}) while tx ${pendingTx.txId} still open`)) break;
+            txViolation(`tx_begin(${rec.txId}) while tx ${pendingTx.txId} still open`);
+            break;
           }
           pendingTx = { txId: rec.txId, records: [] };
         } else if (rec.kind === "tx_commit") {
           if (!pendingTx) {
-            if (txViolation(`tx_commit(${rec.txId}) without tx_begin`)) break;
+            txViolation(`tx_commit(${rec.txId}) without tx_begin`);
+            break;
           } else if (pendingTx.txId !== rec.txId) {
-            if (txViolation(`tx_commit(${rec.txId}) inside open tx ${pendingTx.txId}`)) break;
+            txViolation(`tx_commit(${rec.txId}) inside open tx ${pendingTx.txId}`);
+            break;
           } else {
-            // 事务完整 → 逐条验证 eventHash → 按序应用全部记录
-            for (const r of pendingTx.records) {
-              // v0.12.22 (审查 P1 #④): 权威记录完整性校验——RECORD 本身不得被修改。
-              // 旧格式（无 eventHash，v0.12.21 之前）→ 跳过（迁移期兼容）；
-              // 新格式声明 eventHash → 必须与内容自洽，否则 fail-closed。
-              if (r.eventHash) {
-                const h = worldRecordHash({ ...r });
-                // 注意: r 含 eventHash 字段, worldRecordHash 只取固定键, 不受多余字段影响
+            // 事务完整 → **先逐条验证 eventHash，全部通过后再按序应用**
+            // （验证与应用分离：任一条 fail → 整个事务零应用，保持原子性）
+            for (const { line, rec: r } of pendingTx.records) {
+              // v0.12.23 (审查 P1): 权威记录必须带 eventHash 验证完整性——
+              // 无 hash 的旧格式记录不得参与 authoritative replay（仅迁移路径补 hash）
+              if (AUTHORITATIVE_KINDS.has(r.kind)) {
+                if (!r.eventHash) {
+                  this.persistentHealthy = false;
+                  this.persistenceError = `world log: authoritative ${r.kind} record at line ${line} missing eventHash — must migrate via migrateWorldLog()`;
+                  abortLoad = true;
+                  break;
+                }
+                const h = worldRecordHash(r);
                 if (!h || h !== r.eventHash) {
                   this.persistentHealthy = false;
-                  this.persistenceError = `world log record integrity failed at line ${i + 1}: ${r.kind || "?"} eventHash mismatch (record modified)`;
-                  pendingTx = null;
-                  i = lines.length; // 终止整个循环
+                  this.persistenceError = `world log record integrity failed at line ${line}: ${r.kind} eventHash mismatch (record modified)`;
+                  abortLoad = true;
                   break;
                 }
               }
-              this._replay(r);
             }
-            if (pendingTx) pendingTx = null; // 只有完整验证通过才关闭
+            // 全部验证通过 → 才应用（任一 fail → abortLoad=true，事务零应用）
+            if (!abortLoad) {
+              for (const { rec: r } of pendingTx.records) this._replay(r);
+            }
+            pendingTx = null;
           }
         } else {
           // 数据 record
           if (!pendingTx) {
-            if (txViolation(`record(${rec.kind || "?"}) with txId ${rec.txId} without tx_begin — 拒绝直接执行`)) break;
+            txViolation(`record(${rec.kind || "?"}) with txId ${rec.txId} without tx_begin — 拒绝直接执行`);
+            break;
           } else if (pendingTx.txId !== rec.txId) {
-            if (txViolation(`record txId ${rec.txId} inside open tx ${pendingTx.txId}`)) break;
+            txViolation(`record txId ${rec.txId} inside open tx ${pendingTx.txId}`);
+            break;
           } else {
-            pendingTx.records.push(rec);
+            pendingTx.records.push({ line: i + 1, rec });
           }
         }
+        if (abortLoad) break; // 协议违规 → 立即终止（保留已 flush 的完整事务）
       }
       // 尾部未 commit 事务 = 崩溃残留 → 丢弃（transaction boundary 保证不产生半事务状态）
       // pendingTx 不 flush，这里不做任何事
@@ -320,8 +329,11 @@ export class WorldModel {
     const logLines = [
       JSON.stringify({ schemaVersion: 1, kind: "tx_begin", txId }),
       ...arr.map((r) => {
-        const h = worldRecordHash(r);
-        return JSON.stringify({ schemaVersion: 1, txId, ...(h ? { eventHash: h } : {}), ...r });
+        // 与落盘行一致的语义对象（含 schemaVersion，不含 txId——txId 非语义字段不参与 hash）
+        const full = { schemaVersion: 1, ...r };
+        const h = worldRecordHash(full);
+        // 落盘行带 txId（事务分组用）+ eventHash（完整性用）；两者均不参与 hash 计算
+        return JSON.stringify({ ...full, txId, ...(h ? { eventHash: h } : {}) });
       }),
       JSON.stringify({ schemaVersion: 1, kind: "tx_commit", txId }),
     ];
@@ -850,6 +862,64 @@ export class WorldModel {
       events: this.events.length,
     };
   }
+}
+
+/**
+ * v0.12.23 (审查 P1): World 旧日志显式迁移——读取 legacy 格式（无 txId/无 eventHash）的
+ * world.jsonl，逐行验证并转换为当前事务格式（BEGIN→RECORD(txId+eventHash)→COMMIT）。
+ * 原始文件被备份为 world.jsonl.bak.v1，迁移后可被 WorldModel 正常加载。
+ *
+ * 设计：这是将 Legacy ≠ authoritative 原则落地的唯一入口。
+ * 非权威 event 记录（kind:"event"）不计算 hash，仅包裹事务标记保留 telemetry。
+ *
+ * @param {string} storageDir 持久化目录（与 WorldModel 构造函数同语义）
+ * @returns {{ok: boolean, migrated: number, reason?: string}}
+ */
+export function migrateWorldLog(storageDir) {
+  const logFile = path.join(storageDir, "world", "world.jsonl");
+  let lines;
+  try {
+    const text = fs.readFileSync(logFile, "utf8").trim();
+    if (!text) return { ok: true, migrated: 0 };
+    lines = text.split("\n").filter(Boolean);
+  } catch (err) {
+    if (err?.code === "ENOENT") return { ok: true, migrated: 0 };
+    return { ok: false, migrated: 0, reason: `read failed: ${err.message}` };
+  }
+  // 检测是否已迁移（含事务标记）
+  if (lines.some((l) => l.includes('"kind":"tx_begin"'))) {
+    return { ok: true, migrated: 0, reason: "already transactional" };
+  }
+  const outLines = [];
+  let migrated = 0;
+  for (const line of lines) {
+    let rec;
+    try { rec = JSON.parse(line); } catch {
+      return { ok: false, migrated, reason: `invalid JSON: ${line.slice(0, 64)}...` };
+    }
+    const txId = crypto.randomUUID();
+    outLines.push(JSON.stringify({ schemaVersion: 1, kind: "tx_begin", txId }));
+    if (AUTHORITATIVE_KINDS.has(rec.kind)) {
+      const full = { schemaVersion: 1, ...rec };
+      const h = worldRecordHash(full);
+      outLines.push(JSON.stringify({ ...full, txId, eventHash: h }));
+      migrated++;
+    } else {
+      outLines.push(JSON.stringify({ schemaVersion: 1, txId, ...rec }));
+    }
+    outLines.push(JSON.stringify({ schemaVersion: 1, kind: "tx_commit", txId }));
+  }
+  // 原子替换：写临时文件 → rename 覆盖（备份原文件）
+  const bakFile = logFile + ".bak.v1";
+  const tmpFile = logFile + ".migrating";
+  try {
+    fs.writeFileSync(tmpFile, outLines.join("\n") + "\n", "utf8");
+    fs.renameSync(logFile, bakFile);
+    fs.renameSync(tmpFile, logFile);
+  } catch (err) {
+    return { ok: false, migrated, reason: `write failed: ${err.message}` };
+  }
+  return { ok: true, migrated };
 }
 
 /**

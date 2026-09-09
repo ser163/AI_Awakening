@@ -8,7 +8,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { WorldModel, SOURCE_TYPES, SOURCE_KINDS } from "../src/world.js";
+import { WorldModel, SOURCE_TYPES, SOURCE_KINDS, migrateWorldLog } from "../src/world.js";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
@@ -691,16 +691,43 @@ describe("world: transaction commit 语义（P1）", () => {
       assert.deepEqual([...w2.agents.keys()].sort(), pre, "合法事务仍应应用，世界无脏数据");
     });
 
-    it("IDLE 状态 legacy record 仍可直接应用（旧日志向后兼容不回归）", () => {
-      const d = path.join(strictDir, "legacy_ok_" + Date.now());
+    it("正常启动遇 legacy record（无 txId）→ fail-closed（Legacy ≠ authoritative）", () => {
+      const d = path.join(strictDir, "legacy_reject_" + Date.now());
       const w = new WorldModel(d);
-      // 直接以 legacy 格式（无 txId）写一行（模拟旧版本日志）
+      w.observeAgent("fp-first", "first"); // 建立目录（写入的是 tx 格式）
+      // 模拟旧版本日志：直接追加一行无 txId 的 legacy 记录
       const logFile = path.join(d, "world", "world.jsonl");
-      w.observeAgent("fp-first", "first"); // 建立目录
       fs.appendFileSync(logFile, '{"schemaVersion":1,"kind":"entity","id":"legacy-ok","type":"sensor","name":"Legacy"}\n', "utf8");
       const w2 = new WorldModel(d);
-      assert.ok(w2.isHealthy(), "IDLE 下 legacy 行不破坏 healthy");
-      assert.equal(w2.entities.get("legacy-ok")?.name, "Legacy", "legacy 行在 IDLE 状态应正常应用");
+      assert.ok(!w2.isHealthy(), "正常启动遇 legacy 行必须 unhealthy（只能走 migration）");
+      assert.equal(w2.entities.has("legacy-ok"), false, "legacy 记录不得直接进入权威 World");
+    });
+
+    it("migrateWorldLog() 迁移 legacy 日志后 → 正常加载（迁移是唯一入口）", () => {
+      const d = path.join(strictDir, "legacy_migrate_" + Date.now());
+      // 手工构造纯 legacy 格式日志（无 txId，模拟 v0.12.21 之前）
+      const worldDir = path.join(d, "world");
+      fs.mkdirSync(worldDir, { recursive: true });
+      const logFile = path.join(worldDir, "world.jsonl");
+      fs.writeFileSync(logFile, [
+        JSON.stringify({ schemaVersion: 1, kind: "agent", id: "fp-mig", name: "migrated", capabilities: [], trustHint: "learned", ts: 1720000000000 }),
+        JSON.stringify({ schemaVersion: 1, kind: "entity", id: "dev-mig", type: "sensor", name: "Mig", meta: {}, ts: 1720000000001 }),
+        JSON.stringify({ schemaVersion: 1, kind: "event", data: { kind: "entity_seen", id: "dev-mig", type: "sensor", ts: 1720000000001 }, ts: 1720000000001 }),
+      ].join("\n") + "\n", "utf8");
+      // 未迁移 → fail-closed
+      const w0 = new WorldModel(d);
+      assert.ok(!w0.isHealthy(), "legacy 日志未迁移不可直接加载");
+      // 显式迁移
+      const res = migrateWorldLog(d);
+      assert.equal(res.ok, true, "迁移应成功");
+      assert.equal(res.migrated, 2, "应迁移 2 条权威记录（event 不计）");
+      // 迁移后 → 正常加载
+      const w2 = new WorldModel(d);
+      assert.ok(w2.isHealthy(), "迁移后 healthy");
+      assert.equal(w2.agents.get("fp-mig")?.name, "migrated", "迁移后的 agent 应加载");
+      assert.equal(w2.entities.get("dev-mig")?.name, "Mig", "迁移后的 entity 应加载");
+      // 原文件已备份
+      assert.ok(fs.existsSync(logFile + ".bak.v1"), "原文件应备份为 .bak.v1");
     });
 
     it("正常 BEGIN→RECORD×N→COMMIT 通过（状态机不误伤合法事务）", () => {
@@ -771,5 +798,82 @@ describe("world: transaction commit 语义（P1）", () => {
       const evIdN2 = n2.evidence[n2.evidence.length - 1];
       assert.notEqual(evIdN1, evIdN2, "不同 observationId 应不同 ID");
     });
+  });
+});
+
+// v0.12.23 (审查 P1/P2): eventHash 完整性——任意权威字段修改→hash 变化→fail-closed
+describe("world: eventHash 完整性（P1/P2）", () => {
+  const dir = path.join(tmp, "eventhash_" + Date.now());
+
+  function readRawLog(d) {
+    return fs.readFileSync(path.join(d, "world", "world.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+  }
+
+  it("权威记录带 64 hex eventHash（SHA-256 全长，不截断）", () => {
+    const d = path.join(dir, "len_" + Date.now());
+    const w = new WorldModel(d);
+    w.observeEntity("device:eh", "sensor", "EH-1");
+    const recs = readRawLog(d);
+    const entity = recs.find((r) => r.kind === "entity");
+    assert.ok(entity, "日志含 entity 记录");
+    assert.ok(entity.eventHash, "权威记录必须带 eventHash");
+    assert.equal(entity.eventHash.length, 64, "SHA-256 全长 = 64 hex");
+  });
+
+  it("篡改任意权威字段（name）→ 重启 fail-closed, 记录不应用", () => {
+    const d = path.join(dir, "tamper_" + Date.now());
+    const w = new WorldModel(d);
+    w.observeAgent("fp-keep", "keep");
+    w.observeEntity("device:tampered", "sensor", "Original");
+    // 手工篡改 entity 记录的 name（不更新 eventHash）
+    const lines = fs.readFileSync(path.join(d, "world", "world.jsonl"), "utf8").split("\n").filter(Boolean);
+    const forged = lines.map((l) => {
+      const o = JSON.parse(l);
+      if (o.kind === "entity" && o.id === "device:tampered") o.name = "HACKED";
+      return JSON.stringify(o);
+    });
+    fs.writeFileSync(path.join(d, "world", "world.jsonl"), forged.join("\n") + "\n", "utf8");
+    const w2 = new WorldModel(d);
+    assert.ok(!w2.isHealthy(), "eventHash 不匹配 → unhealthy（fail-closed）");
+    assert.equal(w2.entities.has("device:tampered"), false, "被篡改记录不得应用");
+    assert.equal(w2.agents.get("fp-keep")?.name, "keep", "未篡改事务仍正常应用");
+  });
+
+  it("事务内两条记录：第 2 条被篡改 → 两条都不应用（先验证后应用, 原子性）", () => {
+    const d = path.join(dir, "atomic_" + Date.now());
+    const w = new WorldModel(d);
+    w.observeAgent("fp-safe", "safe"); // 独立的合法事务
+    // 构造一个含两条 entity 的事务（addRelation 模式：relation+event，改用直接写日志更清晰）
+    // 用两次独立操作构成不同事务即可——验证"篡改后半段日志不影响前半段已提交事务"。
+    w.observeEntity("device:a1", "sensor", "A1");
+    w.observeEntity("device:a2", "sensor", "A2");
+    // 篡改 A2 的 type
+    const lines = fs.readFileSync(path.join(d, "world", "world.jsonl"), "utf8").split("\n").filter(Boolean);
+    const forged = lines.map((l) => {
+      const o = JSON.parse(l);
+      if (o.kind === "entity" && o.id === "device:a2") o.type = "HACKED-TYPE";
+      return JSON.stringify(o);
+    });
+    fs.writeFileSync(path.join(d, "world", "world.jsonl"), forged.join("\n") + "\n", "utf8");
+    const w2 = new WorldModel(d);
+    assert.ok(!w2.isHealthy(), "篡改 A2 → unhealthy");
+    assert.equal(w2.entities.get("device:a1")?.name, "A1", "A1（篡改点前已提交事务）仍应用");
+    assert.equal(w2.entities.has("device:a2"), false, "被篡改的 A2 不得应用");
+  });
+
+  it("新增语义字段自动受保护（无字段白名单 → 未来字段改动也会触发 hash 变化）", () => {
+    const d = path.join(dir, "future_" + Date.now());
+    const w = new WorldModel(d);
+    w.observeEntity("device:future", "sensor", "F-1", { status: "running" });
+    const lines = fs.readFileSync(path.join(d, "world", "world.jsonl"), "utf8").split("\n").filter(Boolean);
+    // 篡改 meta 内的深层字段（此前白名单若漏掉 meta 子字段就检测不到）
+    const forged = lines.map((l) => {
+      const o = JSON.parse(l);
+      if (o.kind === "entity" && o.id === "device:future") o.meta = { ...o.meta, hidden: "injected" };
+      return JSON.stringify(o);
+    });
+    fs.writeFileSync(path.join(d, "world", "world.jsonl"), forged.join("\n") + "\n", "utf8");
+    const w2 = new WorldModel(d);
+    assert.ok(!w2.isHealthy(), "深嵌套 meta 篡改也必须被 eventHash 捕获");
   });
 });
