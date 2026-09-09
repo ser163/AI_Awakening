@@ -712,14 +712,22 @@ export class TaskStore {
 
   _load() {
     if (!this._taskFile) return;
+    // v0.12.13 (审查 P0): tasks.jsonl 也事务性加载——与 events.jsonl 统一原子性
     try {
       fs.mkdirSync(path.dirname(this._taskFile), { recursive: true });
       const text = fs.readFileSync(this._taskFile, "utf8");
+      const parsedTasks = [];
       for (const line of text.trim().split("\n").filter(Boolean)) {
-        const t = JSON.parse(line);
-        this.tasks.set(t.id, t);
+        parsedTasks.push(JSON.parse(line));
       }
-    } catch { /* 首次运行 */ }
+      for (const t of parsedTasks) this.tasks.set(t.id, t);
+    } catch (e) {
+      // ENOENT = 首次运行；其他 = snapshot 损坏 → 标记 unhealthy，不清空 tasks（保留）
+      if (e?.code !== "ENOENT") {
+        this.persistentHealthy = false;
+        this.persistenceError = `task snapshot corrupt: ${e.message}`;
+      }
+    }
     // v0.12.12 (审查 P0): 事务性加载——先全部解析到临时数组，任何一行失败
     // 就标记 unhealthy 且不修改内存事件状态，避免 partial event log 被 reconcile。
     if (this._eventFile) {

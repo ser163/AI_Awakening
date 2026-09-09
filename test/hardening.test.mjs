@@ -1245,4 +1245,48 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
     // resolveFork 在有 fork 时也会 fail-closed（已知 KNOWN_FORK_RULES 白名单已在 resolveFork 内）
     // 当前 task 无 fork → resolveFork 返回 null（不抛异常）
   });
+
+  // P0-③: tasks.jsonl 损坏（snapshot 原子性——本次补的统一缺口）
+  it("tasks.jsonl 损坏 → unhealthy + snapshot 不进入内存", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, "tsnap_corrupt_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "tsnap", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    // 篡改 tasks.jsonl：插入损坏行
+    const taskFile = path.join(dir, "tasks", "tasks.jsonl");
+    fs.appendFileSync(taskFile, "{broken snapshot\n", "utf8");
+    // 重启 → 事务性失败
+    const ts2 = new TaskStore(dir);
+    assert.ok(!ts2.isHealthy(), "task snapshot 损坏 → unhealthy");
+    // events 仍然完整加载（events 文件没坏），但 snapshot 解析失败不应致命阻塞
+    const log = ts2.eventHistory(task.id);
+    assert.equal(log.length, 1, "events 仍应完整加载（与损坏 snapshot 分离）");
+  });
+
+  // P0 综述: corrupted log 后禁止 replay/reconcile 产生 partial snapshot 覆盖
+  it("损坏日志 → 磁盘 tasks.jsonl 不被重写（无 partial snapshot 落盘）", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, "nooverwrite_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "noow", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash, claimedAt: Date.now() };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    ts.upsert(claimed, e2);
+    // 记录磁盘 snapshot 内容（含 claimed 状态）
+    const taskFile = path.join(dir, "tasks", "tasks.jsonl");
+    const before = fs.readFileSync(taskFile, "utf8");
+    // 往 events.jsonl 尾部塞损坏行
+    fs.appendFileSync(path.join(dir, "tasks", "events.jsonl"), "garbage!!!\n", "utf8");
+    // 重启 → unhealthy；tasks.jsonl 内容必须不变（没被 partial rebuild 覆盖）
+    const ts2 = new TaskStore(dir);
+    assert.ok(!ts2.isHealthy(), "日志损坏 → unhealthy");
+    const after = fs.readFileSync(taskFile, "utf8");
+    assert.equal(after, before, "损坏日志后磁盘 snapshot 不允许被重写");
+  });
 });
