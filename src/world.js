@@ -22,8 +22,38 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
-/** 来源类型 */
+/**
+ * v0.12.19 (审查 P2): 确定性 evidenceId——SHA256(canonical content)，
+ * 不再用 Math.random()。相同输入（subject/predicate/object/source/时间窗/observationId）
+ * 在任何节点产生相同 evidenceId（确定性状态推导前提）。
+ * 如需记录同内容的不同次观察，调用方通过 ev.observationId（signed nonce）加入哈希区分。
+ * @param {object} params evidence 字段
+ * @param {string} params.subject
+ * @param {string} params.predicate
+ * @param {*} params.object
+ * @param {object} [params.source]
+ * @param {number|string|null} [params.observedAt]
+ * @param {number|string|null} [params.validFrom]
+ * @param {number|string|null} [params.validUntil]
+ * @param {string|null} [params.observationId] 调用方可选的 signed nonce（区分同内容多次观察）
+ * @returns {string} 24 hex chars
+ */
+function deterministicEvidenceId({ subject, predicate, object, source, observedAt, validFrom, validUntil, observationId }) {
+  const canonical = JSON.stringify({
+    subject,
+    predicate,
+    object: String(object),
+    srcIdentity: source?.identity || source?.id || "",
+    srcEventId: source?.eventId || null,
+    observedAt: observedAt ?? null,
+    validFrom: validFrom ?? null,
+    validUntil: validUntil ?? null,
+    observationId: observationId ?? null,
+  });
+  return crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 24);
+}
 export const SOURCE_TYPES = {
   AGENT: "agent",       // 另一节点断言
   SELF: "self",         // 本节点自身
@@ -78,17 +108,50 @@ export class WorldModel {
       const text = fs.readFileSync(this.logFile, "utf8");
       if (!text.trim()) return;
       const lines = text.trim().split("\n").filter(Boolean);
+      // v0.12.19 (审查 P1): 事务感知重放——只应用 BEGIN→RECORDS→COMMIT 完整的 transaction。
+      //   - 无 tx 标记的旧日志行（legacy 格式）→ 逐行直接应用（向后兼容）
+      //   - 文件尾部存在未 commit 的事务 / 半行 JSON（崩溃截断）→ 整体丢弃，不产生半事务状态
+      //   - 非尾部 JSON 损坏 → 标记 unhealthy 并停止（中部损坏 fail-closed，v0.12.4 语义）
+      let pendingTx = null; // {txId, records: []}
       for (let i = 0; i < lines.length; i++) {
+        let rec;
         try {
-          this._replay(JSON.parse(lines[i]));
+          rec = JSON.parse(lines[i]);
         } catch (err) {
-          // v0.12.4 (审查 P1-⑤): 区分"首次启动"与"日志损坏"。
-          // 已运行半年、第 N 行 JSON 坏掉 ≠ 第一次启动。
+          const isTail = i === lines.length - 1;
+          if (isTail) {
+            // 尾部半行 JSON = 崩溃/截断残留：丢弃（pendingTx 不 flush），
+            // 不标记 unhealthy——事务边界保证世界停在最后一个 COMMIT。
+            break;
+          }
           this.persistentHealthy = false;
           this.persistenceError = `world log corrupted at line ${i + 1}: ${err?.message || err}`;
           break; // 停止重放——损坏后继续读取会让世界建立在不一致状态上
         }
+        if (rec.txId) {
+          if (rec.kind === "tx_begin") {
+            pendingTx = { txId: rec.txId, records: [] };
+          } else if (rec.kind === "tx_commit") {
+            if (pendingTx && pendingTx.txId === rec.txId) {
+              // 事务完整 → 按序应用全部记录
+              for (const r of pendingTx.records) this._replay(r);
+              pendingTx = null;
+            }
+            // 孤儿 commit（无对应 begin）→ 忽略
+          } else if (pendingTx && pendingTx.txId === rec.txId) {
+            pendingTx.records.push(rec);
+          } else if (!pendingTx) {
+            // 带 txId 但无 begin 的记录（异常中段）→ 视为单条直接应用（幂等安全）
+            this._replay(rec);
+          }
+          // txId 不匹配的悬空记录 → 丢弃（属于未 commit 的事务）
+        } else {
+          // legacy 行（无事务标记）：直接应用，保持旧日志兼容
+          this._replay(rec);
+        }
       }
+      // 尾部未 commit 事务 = 崩溃残留 → 丢弃（transaction boundary 保证不产生半事务状态）
+      // pendingTx 不 flush，这里不做任何事
     } catch (err) {
       // ENOENT → 首次运行（静默）；其他 IO 错误 → 暴露
       if (err?.code !== "ENOENT") {
@@ -159,25 +222,27 @@ export class WorldModel {
   }
 
   /**
-   * v0.12.18 (审查 P0): 批量持久化（append-first 原子性）。
-   * 同一操作的**全部**日志记录一次性写入（单次 appendFileSync）——要么全成功、要么全失败。
-   * 失败 → 返回 false 并标记 unhealthy（调用方通过 _appendOrThrow 得到 throw）。
-   * @param {object|object[]} recs 单条或数组
+   * v0.12.19 (审查 P1): 事务化持久化——每条操作包裹 BEGIN + RECORDS + COMMIT 标记。
+   * 写入格式：{txId, kind:"tx_begin"} → {txId, kind:..., ...}×N → {txId, kind:"tx_commit"}。
+   * 所有行在一次 appendFileSync 写入；崩溃时日志尾部未 commit 的事务被视为不完整→重启时丢弃。
+   * @param {object|object[]} recs 单条或数组（数据记录，不含事务标记）
    * @returns {boolean} true = 全部落盘成功
    */
   _persist(recs) {
-    if (!this.logFile) return true; // 内存模式：无持久化目录视为成功
+    if (!this.logFile) return true; // 内存模式
     const arr = Array.isArray(recs) ? recs : [recs];
     if (arr.length === 0) return true;
+    const txId = crypto.randomUUID(); // 每操作唯一事务 ID（崩溃恢复用，不参与状态推导）
+    const logLines = [
+      JSON.stringify({ schemaVersion: 1, kind: "tx_begin", txId }),
+      ...arr.map((r) => JSON.stringify({ schemaVersion: 1, txId, ...r })),
+      JSON.stringify({ schemaVersion: 1, kind: "tx_commit", txId }),
+    ];
     try {
       fs.mkdirSync(path.dirname(this.logFile), { recursive: true });
-      // v0.12.2 ⑧: 每条记录带 schemaVersion（为未来版本迁移做准备）
-      const lines = arr.map((r) => JSON.stringify({ schemaVersion: 1, ...r }) + "\n").join("");
-      fs.appendFileSync(this.logFile, lines, "utf8");
+      fs.appendFileSync(this.logFile, logLines.join("\n") + "\n", "utf8");
       return true;
     } catch (err) {
-      // v0.12.2 ⑨: 持久化失败 → 标记 unhealthy（不再静默吞掉）。
-      // World Model 是权威状态——内存成功磁盘失败 = 重启后世界倒退。
       this.persistentHealthy = false;
       this.persistenceError = err?.message || String(err);
       return false;
@@ -284,7 +349,16 @@ export class WorldModel {
       // v0.12.2 ⑤: 因果链预留——derivedFrom 记录传播来源（A→B→C→D 只算一个独立来源）
       provenanceId: ev.source?.provenanceId || null,
     };
-    const evidenceId = `${observedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const evidenceId = deterministicEvidenceId({
+      subject: ev.subject,
+      predicate: ev.predicate,
+      object: ev.object,
+      source,
+      observedAt,
+      validFrom: ev.validFrom || null,
+      validUntil: ev.validUntil || null,
+      observationId: ev.observationId || null,
+    });
     const claimId = `${ev.subject}|${ev.predicate}|${String(ev.object)}`;
     const ts = Date.now();
 
@@ -320,7 +394,16 @@ export class WorldModel {
     const claimId = rec.claimId || `${rec.subject}|${rec.predicate}|${String(rec.object)}`;
     const existing = this.claims.get(claimId);
     const evidenceItem = {
-      evidenceId: rec.evidenceId || `${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      evidenceId: rec.evidenceId || deterministicEvidenceId({
+        subject: rec.subject,
+        predicate: rec.predicate,
+        object: rec.object,
+        source: rec.source,
+        observedAt: rec.observedAt ?? now,
+        validFrom: rec.validFrom,
+        validUntil: rec.validUntil,
+        observationId: rec.observationId || null,
+      }),
       subject: rec.subject,
       predicate: rec.predicate,
       object: rec.object,

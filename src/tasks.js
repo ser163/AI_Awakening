@@ -830,14 +830,16 @@ export class TaskStore {
   }
 
   /**
-   * v0.12.18 (审查 P1): 单分支全链重放——从 head 沿 previousHash 回溯到 genesis，
+   * v0.12.18/19 (审查 P1): 单分支全链重放——从 head 沿 previousHash 回溯到 genesis，
    * 逐事件执行 shared gates：每个 v2 事件先 checkEventAuthorization（相对父状态），
    * 再 applyEvent（beforeState==curState + derive + afterState）；v1/legacy 直接应用声明状态。
-   * 任一事件资格失败 → {ok:false, reason}（该分支整体不作为 canonical candidate）。
+   * 任一事件资格失败 → {ok:false, category, reason}。
+   *   category="authorization" → 合法签名但无权限（分支无资格竞争 canonical，可安全排除）
+   *   category="semantic"      → 状态机/内容损坏（分支不可信，fail-closed 语义由调用方定）
    * @param {object} task 任务静态字段（policy/publisherFingerprint/assignee...）
    * @param {object} headEv 分支头事件
    * @param {object} byHash eventHash → event 映射（完整性已在调用方验证）
-   * @returns {{ok: boolean, rebuilt?: object, reason?: string}}
+   * @returns {{ok: boolean, rebuilt?: object, category?: string, reason?: string}}
    */
   _replayBranchToState(task, headEv, byHash) {
     // 回溯链（genesis 在前）
@@ -848,7 +850,7 @@ export class TaskStore {
       chain.unshift(byHash[cur]);
       cur = byHash[cur].previousHash || null;
     }
-    if (chain.length === 0) return { ok: false, reason: "empty chain" };
+    if (chain.length === 0) return { ok: false, category: "semantic", reason: "empty chain" };
 
     const rebuilt = { ...task, status: null, assigneeFingerprintActual: "", result: null, claimedAt: null, completedAt: null, cancelledAt: null, lastEventHash: null, forks: [], eventIndex: {}, eventHeight: 0 };
     let curState = { status: null, assigneeFingerprintActual: "", result: null };
@@ -858,7 +860,7 @@ export class TaskStore {
         // v0.12.18 (审查 P1): authorization gate —— live 与 replay 同一语义闭环。
         // 恶意节点用合法私钥签署无权限转移 → 在 replay 上同样被拒。
         const authz = checkEventAuthorization(task, ev);
-        if (!authz.ok) return { ok: false, reason: `authorization rejected: ${ev.eventId} (${authz.reason})` };
+        if (!authz.ok) return { ok: false, category: "authorization", reason: `authorization rejected: ${ev.eventId} (${authz.reason})` };
         if (ev.semanticVersion === 2) {
           // genesis（i===0）beforeState 是空 → currentState 也是空，applyEvent 全字段验证
           curState = applyEvent(curState, ev);
@@ -867,7 +869,7 @@ export class TaskStore {
           curState = { status: ev.afterState.status || curState.status, assigneeFingerprintActual: ev.afterState.assigneeFingerprintActual || curState.assigneeFingerprintActual, result: ev.afterState.result ?? curState.result };
         }
       } catch (err) {
-        return { ok: false, reason: `replay failed: ${ev.eventId} (${err.message})` };
+        return { ok: false, category: "semantic", reason: `replay failed: ${ev.eventId} (${err.message})` };
       }
       rebuilt.status = curState.status; rebuilt.assigneeFingerprintActual = curState.assigneeFingerprintActual; rebuilt.result = curState.result;
       rebuilt.lastEventHash = h; rebuilt.eventHeight++; rebuilt.eventIndex[h] = { eventId: ev.eventId, parentHash: ev.previousHash || null, actor: ev.actor, action: ev.action, ts: ev.ts, height: rebuilt.eventHeight };
@@ -876,26 +878,6 @@ export class TaskStore {
       if (ev.action === "cancel") rebuilt.cancelledAt = ev.ts;
     }
     return { ok: true, rebuilt };
-  }
-
-  /**
-   * v0.12.18 (审查 P1): 分支授权资格检测——沿 previousHash 回溯链中每个 v2 事件
-   * 都须通过 checkEventAuthorization（相对各自父状态）。
-   * @param {object} task 任务静态字段（policy/publisherFingerprint 等）
-   * @param {string} headHash 分支头事件 hash
-   * @param {object} byHash eventHash→event 映射
-   * @returns {boolean} true = 分支上所有 v2 事件均授权合法
-   */
-  _branchAuthorized(task, headHash, byHash) {
-    let cur = headHash;
-    let guard = 0;
-    while (cur && byHash[cur] && guard++ < 10000) {
-      const ev = byHash[cur];
-      const authz = checkEventAuthorization(task, ev);
-      if (!authz.ok) return false;
-      cur = ev.previousHash || null;
-    }
-    return true;
   }
 
   /**
@@ -1176,15 +1158,20 @@ export class TaskStore {
         isMainChain: true,
       }] : []),
     ];
-    // v0.12.18 (审查 P1): fork candidate 必须通过 authorization eligibility——
-    // 分支上任一 v2 事件无权限（合法签名但无资格）→ 该分支不得参与 canonical 竞争。
-    // 与 _tryRebuildFromEvents 的资格 gate 同一语义（相对各自父状态的 checkEventAuthorization）。
+    // v0.12.18/19 (审查 P1): fork candidate 资格检测走**完整 Event Kernel**（_replayBranchToState），
+    // 与 _tryRebuildFromEvents 用同一套验证，杜绝半验证器漂移。
+    //   失败 category=authorization → 合法签名但无权限 → 分支无资格竞争 canonical，直接排除；
+    //   失败 category=semantic（integrity/状态机损坏）→ **不在此静默排除**——日志损坏应 fail-closed，
+    //   留给 canonicalizeTask 重放时 throw（冻结契约：损坏不得被悄悄忽略或降级）。
     if (candidates.length > 1) {
       const byHash = {};
       for (const ev of events) byHash[ev.eventHash || ev.eventId] = ev;
       candidates = candidates.filter((c) => {
         if (c.isMainChain) return true; // 主链已是 canonical（live 授权过），无需重验
-        return this._branchAuthorized(task, c.headEventHash, byHash);
+        const headEv = byHash[c.headEventHash];
+        if (!headEv) return true; // 头事件不在日志中 → 由 canonicalizeTask 重放时暴露（fail-closed）
+        const replay = this._replayBranchToState(task, headEv, byHash);
+        return !(replay.ok === false && replay.category === "authorization");
       });
     }
     if (candidates.length === 0) return null;

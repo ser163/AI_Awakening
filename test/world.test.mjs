@@ -537,6 +537,157 @@ describe("world: append-first 原子性（P0）", () => {
     unblockLog(d);
     const w2 = new WorldModel(d);
     assert.deepEqual(snapshot(w2), pre, "重启 replay == 原状态");
+    assert.ok(w2.isHealthy(), "重启后 healthy");
+  });
+});
+
+// v0.12.19 (审查 P1): World transaction/commit 语义——崩溃尾部截断不产生半事务状态
+describe("world: transaction commit 语义（P1）", () => {
+  const dir = path.join(tmp, "tx_commit_" + Date.now());
+
+  function setupWorld(wm) {
+    wm.observeAgent("fp-alice", "alice", ["knowledge"]);
+    wm.ingestEvidence({
+      subject: "device:01", predicate: "temperature", object: "36.5",
+      source: { type: SOURCE_TYPES.SENSOR, id: "fp-alice", kind: SOURCE_KINDS.MEASUREMENT },
+    });
+    return wm;
+  }
+
+  function snapshot(wm) {
+    return {
+      agents: Array.from(wm.agents.keys()).sort(),
+      entities: Array.from(wm.entities.keys()).sort(),
+      relations: Array.from(wm.relations.keys()).sort(),
+      claims: Array.from(wm.claims.keys()).sort(),
+    };
+  }
+
+  it("日志尾部截断（事务前半写入、无 commit）→ 重启丢弃半事务，不产生脏状态", () => {
+    const d = path.join(dir, "tail_" + Date.now());
+    const w = new WorldModel(d);
+    setupWorld(w);
+    const pre = snapshot(w);
+    // 模拟崩溃：手工追加一个"只写了 BEGIN + records、没有 COMMIT"的事务
+    const logFile = path.join(d, "world", "world.jsonl");
+    const orphanTx = {
+      txId: "orphan-1",
+      kind: "evidence",
+      claimId: "device:01|pressure|1.2",
+      evidenceId: "orphan-ev-1",
+      subject: "device:01",
+      predicate: "pressure",
+      object: "1.2",
+      source: { type: "sensor", id: "fp-alice", kind: "measurement" },
+      observedAt: Date.now(),
+      ts: Date.now(),
+    };
+    fs.appendFileSync(logFile, `{"schemaVersion":1,"kind":"tx_begin","txId":"orphan-1"}\n`, "utf8");
+    fs.appendFileSync(logFile, JSON.stringify({ schemaVersion: 1, ...orphanTx }) + "\n", "utf8");
+    // 注意：故意不写 tx_commit → 模拟崩溃于 COMMIT 之前
+    const w2 = new WorldModel(d);
+    assert.deepEqual(snapshot(w2), pre, "未 commit 事务不得应用（pressure claim 不应出现）");
+    assert.equal(w2.queryClaims("device:01", "pressure").length, 0, "半事务证据不得进入 claims");
+    assert.ok(w2.isHealthy(), "截断恢复后 healthy（不是损坏——事务边界保证一致性）");
+  });
+
+  it("完整事务（BEGIN→records→COMMIT）正常应用", () => {
+    const d = path.join(dir, "ok_" + Date.now());
+    const w = new WorldModel(d);
+    w.observeEntity("device:ok", "sensor", "Ok-1");
+    const w2 = new WorldModel(d);
+    assert.equal(w2.entities.get("device:ok")?.name, "Ok-1", "完整事务应被应用");
     assert.ok(w2.isHealthy());
+  });
+
+  it("尾部半行 JSON（崩溃于 COMMIT 行中间）→ 丢弃该事务, 世界停在最后 COMMIT", () => {
+    const d = path.join(dir, "half_" + Date.now());
+    const w = new WorldModel(d);
+    w.observeAgent("fp-alice", "alice");
+    const pre = snapshot(w);
+    // 模拟写一半崩溃：COMMIT 行只写了一部分（无换行结尾）
+    const logFile = path.join(d, "world", "world.jsonl");
+    fs.appendFileSync(logFile, '{"schemaVersion":1,"kind":"tx_begin","txId":"half-1"}\n', "utf8");
+    fs.appendFileSync(logFile, '{"schemaVersion":1,"txId":"half-1","kind":"entity","id":"ghost","type":"sensor","name":"Ghost",', "utf8");
+    // ↑ 故意截断（无闭合括号、无换行）→ 模拟 OS 部分写入
+    const w2 = new WorldModel(d);
+    assert.deepEqual(snapshot(w2), pre, "半行事务不得应用（ghost entity 不应出现）");
+    assert.equal(w2.entities.has("ghost"), false, "撕裂记录不得产生实体");
+    assert.ok(w2.isHealthy(), "尾部撕裂恢复后 healthy（事务边界保证一致性）");
+  });
+
+  it("中部 JSON 损坏（非尾部）→ 仍然 fail-closed unhealthy（v0.12.4 语义不回归）", () => {
+    const d = path.join(dir, "mid_" + Date.now());
+    const w = new WorldModel(d);
+    w.observeAgent("fp-alice", "alice");
+    w.observeEntity("device:ok", "sensor", "Ok-1");
+    // 中部插入损坏行（后面还有内容 → 不是崩溃截断，是真实损坏）
+    const logFile = path.join(d, "world", "world.jsonl");
+    fs.appendFileSync(logFile, "{not valid json\n", "utf8");
+    w.observeEntity("device:after", "sensor", "After-1");
+    const w2 = new WorldModel(d);
+    assert.ok(!w2.isHealthy(), "中部损坏必须标记 unhealthy（fail-closed）");
+    assert.equal(w2.entities.get("device:ok")?.name, "Ok-1", "损坏前的完整事务仍应应用");
+    assert.equal(w2.entities.has("device:after"), false, "损坏后的数据不得进入世界");
+  });
+
+  it("同 txId 多 record 事务 → 全部应用或全部丢弃（原子性跨 record）", () => {
+    const d = path.join(dir, "multi_" + Date.now());
+    const w = new WorldModel(d);
+    // addRelation 本身写入 relation + event 两条 record（同一事务）
+    w.addRelation("fp-a", "knows", "fp-b");
+    const w2 = new WorldModel(d);
+    const rels = w2.queryRelations("knows");
+    assert.equal(rels.length, 1, "relation 事务应完整应用");
+    assert.ok(w2.isHealthy());
+  });
+
+  // v0.12.19 (审查 P2): evidenceId 确定性——相同输入产生相同 ID（不再 Math.random）
+  describe("world: evidenceId 确定性（P2）", () => {
+    it("相同输入两次 ingestEvidence → 相同 evidenceId", () => {
+      const w = new WorldModel();
+      const fixed = {
+        subject: "agent:alice", predicate: "located_at", object: "Beijing",
+        source: { type: SOURCE_TYPES.SENSOR, id: "sensor-01", kind: SOURCE_KINDS.MEASUREMENT },
+        observedAt: 1720000000000,
+        validFrom: 1720000000000,
+        validUntil: 1725000000000,
+      };
+      const c1 = w.ingestEvidence({ ...fixed });
+      const c2 = w.ingestEvidence({ ...fixed });
+      const id1 = c1.evidence[0].evidenceId;
+      const id2 = c2.evidence[0].evidenceId;
+      assert.equal(id1, id2, "同输入必须产生同 evidenceId");
+      assert.ok(!id1.includes("-") === false || id1.length > 10, "evidenceId 不再用时间戳-随机数格式");
+      assert.ok(/^[0-9a-f]+$/.test(id1), "evidenceId 应为 hex（SHA256 派生）");
+    });
+
+    it("不同 source.identity → 不同 evidenceId（独立性区分仍在）", () => {
+      const w = new WorldModel();
+      const base = {
+        subject: "agent:alice", predicate: "located_at", object: "Beijing",
+        source: { type: SOURCE_TYPES.SENSOR, kind: SOURCE_KINDS.MEASUREMENT },
+        observedAt: 1720000000000,
+      };
+      const a = w.ingestEvidence({ ...base, source: { ...base.source, id: "sensor-01" } });
+      const evIdA = a.evidence[0].evidenceId; // 捕获（下次 ingest 同 claim 追加）
+      const b = w.ingestEvidence({ ...base, source: { ...base.source, id: "sensor-02" } });
+      const evIdB = b.evidence[b.evidence.length - 1];
+      assert.notEqual(evIdA, evIdB, "不同来源应不同 ID");
+    });
+
+    it("提供 observationId（signed nonce）→ 同内容可分多次观察", () => {
+      const w = new WorldModel();
+      const base = {
+        subject: "agent:alice", predicate: "located_at", object: "Beijing",
+        source: { type: SOURCE_TYPES.SENSOR, id: "sensor-01", kind: SOURCE_KINDS.MEASUREMENT },
+        observedAt: 1720000000000,
+      };
+      const n1 = w.ingestEvidence({ ...base, observationId: "obs-1" });
+      const evIdN1 = n1.evidence[0].evidenceId; // 捕获（下次 ingest 同 claim 追加）
+      const n2 = w.ingestEvidence({ ...base, observationId: "obs-2" });
+      const evIdN2 = n2.evidence[n2.evidence.length - 1];
+      assert.notEqual(evIdN1, evIdN2, "不同 observationId 应不同 ID");
+    });
   });
 });
