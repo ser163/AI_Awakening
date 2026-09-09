@@ -209,6 +209,23 @@ export function hashEvent(ev) {
 }
 
 /**
+ * v0.12.15 (审查 P0): Event Integrity 统一 gate——所有入口共用同一个完整性规则。
+ * 原则：V2 事件 = integrity boundary 内 → eventHash 必填且必须自洽；
+ *       V1/legacy/unversioned = 迁移兼容 → 有 hash 则验证，无 hash 不阻塞。
+ * 防止同一条 V2 事件在 live/replay/fork 上拥有不同合法性定义（live==replay 不变量）。
+ * @returns {{ok: boolean, reason?: string}}
+ */
+export function checkEventIntegrity(event) {
+  if (event.semanticVersion === 2 && !event.eventHash) {
+    return { ok: false, reason: "v2 event requires eventHash" };
+  }
+  if (event.eventHash && event.eventHash !== hashEvent(event)) {
+    return { ok: false, reason: "eventHash mismatch (event content tampered)" };
+  }
+  return { ok: true };
+}
+
+/**
  * 计算 Task Definition 的 canonical hash（v0.13.0 审查 P0-②）。
  * 只覆盖静态定义字段（title/description/publisher/capabilities/policy）——
  * 不含 runtime state。Genesis Event 绑定此 hash，防 relay 改写任务定义。
@@ -419,8 +436,11 @@ export function validateTaskEvent(event, action, task, trustedStore, { hasLocalR
   }
 
   // v0.10.1: eventHash 自洽（历史事件被修改 → hash 不匹配 → 断链）
-  if (event.eventHash && event.eventHash !== hashEvent(event)) {
-    return { ok: false, reason: "eventHash mismatch (event content tampered)" };
+  // v0.12.15 (审查 P0): V2 integrity boundary 必须在每个入口统一——
+  //   V2 事件必须有 eventHash，且 eventHash 必须等于 hashEvent(event)
+  const integrity = checkEventIntegrity(event);
+  if (!integrity.ok) {
+    return { ok: false, reason: integrity.reason };
   }
 
   // 3. 状态链连续（真哈希链）
@@ -786,19 +806,12 @@ export class TaskStore {
   _tryRebuildFromEvents(id, task, events) {
     const byHash = {};
     for (const ev of events) byHash[ev.eventHash || ev.eventId] = ev;
-    // v0.12.14 (审查 P0-1): V2 事件缺 eventHash → fail-closed（V2 integrity boundary 内不许逃逸）
+    // v0.12.14/15 (审查 P0): Event Integrity 统一 gate——与 live/fork 同一规则
     for (const ev of events) {
-      if (ev.semanticVersion === 2 && !ev.eventHash) {
+      const integrity = checkEventIntegrity(ev);
+      if (!integrity.ok) {
         this.persistentHealthy = false;
-        this.persistenceError = `event ${ev.eventId} missing eventHash (v2 requires eventHash)`;
-        return false;
-      }
-    }
-    // 1. 全部事件先做 eventHash 自洽验证（主链 + fork 分支都要验，不是只验主链）
-    for (const ev of events) {
-      if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
-        this.persistentHealthy = false;
-        this.persistenceError = `event ${ev.eventId} tampered (hash mismatch)`;
+        this.persistenceError = `event ${ev.eventId} ${integrity.reason}`;
         return false; // 损坏 → 不重建、不写回
       }
     }
@@ -930,6 +943,14 @@ export class TaskStore {
    */
   upsert(task, event = null, { fork = false } = {}) {
     if (event && event.eventId) {
+      // v0.12.15 (审查 P0): Event Log 是权威存储边界——不依赖调用方是否 validate。
+      // V2 事件缺 eventHash / hash 不自洽 → 拒绝写入（与 live/replay/fork 同一 gate）
+      const integrity = checkEventIntegrity(event);
+      if (!integrity.ok) {
+        const err = new Error(`v2 event integrity failed: ${event.eventId} (${integrity.reason})`);
+        err.integrity = true;
+        throw err;
+      }
       // v0.12.9 (审查 P0): eventId/eventHash 一致性约束——内容身份不可被复用篡改。
       //   same eventId + 不同 eventHash → 同一逻辑事件换了内容 = tamper，REJECT。
       //   same eventHash + 不同 eventId → 相同内容重复出现 = duplicate。
@@ -1093,9 +1114,10 @@ export class TaskStore {
       chain.unshift(byHash[cur]); // 逆序（genesis 在前）
       const ev = byHash[cur];
       // v0.12.4 (审查 P1-④): replay 阶段重新验证 eventHash 自洽——
-      // 本地 events 文件被篡改（或旧版本无新字段）时拒绝，而不是照吃。
-      if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
-        throw new Error(`canonicalizeTask: event ${ev.eventId} content tampered (eventHash mismatch)`);
+      // v0.12.15 (审查 P0): 与 live/upsert/_tryRebuildFromEvents 共用同一 integrity gate
+      const integrity = checkEventIntegrity(ev);
+      if (!integrity.ok) {
+        throw new Error(`canonicalizeTask: event ${ev.eventId} ${integrity.reason}`);
       }
       cur = ev.previousHash || null;
     }
@@ -1125,8 +1147,10 @@ export class TaskStore {
     for (let i = 0; i < chain.length; i++) {
       const ev = chain[i];
       // v0.12.4 (审查 P1-④): replay 阶段重新验证 eventHash 自洽
-      if (ev.eventHash && ev.eventHash !== hashEvent(ev)) {
-        throw new Error(`canonicalizeTask: event ${ev.eventId} content tampered (eventHash mismatch)`);
+      // v0.12.15 (审查 P0): 与 live/upsert/_tryRebuildFromEvents 共用同一 integrity gate
+      const integrity = checkEventIntegrity(ev);
+      if (!integrity.ok) {
+        throw new Error(`canonicalizeTask: event ${ev.eventId} ${integrity.reason}`);
       }
       if (i > 0) {
         // 连续性检查：全字段比较（v0.12.6，不再只比 status）

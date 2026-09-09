@@ -853,14 +853,19 @@ describe("v0.12.9: 审查 P0 针对性测试", () => {
       ts.upsert({ ...task }, tampered);
     } catch (e) {
       shouldThrow = true;
-      assert.ok(e.tamper || e.message.includes("eventId reuse with different content"), `tamper detected: ${e.message}`);
+      // v0.12.15: integrity gate 先于 eventId 复用检查拦截（eventHash 不自洽）——同样 fail-closed
+      assert.ok(e.tamper || e.integrity || e.message.includes("eventId reuse with different content") || e.message.includes("integrity"), `tamper detected: ${e.message}`);
     }
     assert.equal(shouldThrow, true, "same eventId + different hash 必须 throw");
 
-    // 同 eventHash 但不同 eventId → duplicate（非 throw）
-    const duplicateEvent = { ...event, eventId: "dup-id-" + Date.now() };
-    const result = ts.upsert({ ...task }, duplicateEvent);
-    assert.equal(result.duplicate, true, "同 eventHash 不同 eventId 应 duplicate");
+    // 同 eventId + 重算正确 hash + 同内容 → duplicate（重放同一事件）
+    // eventHash 包含 eventId（canonical）——不同 eventId 不可能有相同 hash。
+    // "同 hash 不同 id" 数学上不存在；正确语义：新 eventId=新事件。
+    // 用真实 createTaskEvent 生成同内容的另一个事件（新 id 新 hash）→ 应接受为新事件
+    const task2 = { ...task, status: "open", assigneeFingerprintActual: "", lastEventHash: null };
+    const anotherPublish = createTaskEvent(alice, "publish", null, { ...task2 });
+    const res = ts.upsert({ ...task2 }, anotherPublish);
+    assert.equal(res.duplicate, false, "不同 eventId（新事件）应接受");
   });
 
   // P1-⑥ snapshot 只是加速缓存——篡改 tasks.jsonl 后重启，event log wins
@@ -1335,5 +1340,102 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
     assert.ok(!ts2.isHealthy(), "V2 缺 eventHash → unhealthy");
     const rt = ts2.get(task.id);
     assert.equal(rt.status, "open", "V2 缺 hash 事件不应篡改 canonical state");
+  });
+
+  // v0.12.15 (审查 P0): V2 eventHash 必填必须覆盖所有入口（live/upsert/fork/replay 一致）
+  describe("V2 eventHash integrity 三路径统一", () => {
+    const aliceStore2 = path.join(fs.realpathSync(os.tmpdir()), "hard_v01215");
+    function mkAlice() { return loadOrCreateIdentity(path.join(aliceStore2, "alice"), "alice"); }
+    function mkTrust(a) { const s = new TrustedIdentityStore(); s.learn(a.fingerprint, a.publicKey, { source: "registry" }); return s; }
+
+    function mkV2NoHash(a, action = "claim", beforeTask, afterTask) {
+      const ev = createTaskEvent(a, action, beforeTask, afterTask);
+      delete ev.eventHash; // 移除 hash，保留 semanticVersion=2 + signature
+      return ev;
+    }
+
+    // 测试 1: live validateTaskEvent 拒绝 V2 无 hash
+    it("① validateTaskEvent: V2 无 eventHash → ok=false", () => {
+      const alice = mkAlice();
+      const trust = mkTrust(alice);
+      const task = createTask({ title: "t1", requiredCapabilities: [] });
+      task.publisherFingerprint = alice.fingerprint;
+      const before = { status: "open", assigneeFingerprintActual: "", result: null };
+      const after = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, result: null };
+      const ev = mkV2NoHash(alice, "claim", before, after);
+      const v = validateTaskEvent(ev, "claim", task, trust, { hasLocalRecord: false, allowLegacy: false });
+      assert.equal(v.ok, false, "live validate 应拒绝 V2 无 hash");
+      assert.ok(v.reason.includes("eventHash") || v.reason.includes("malformed"), `reason: ${v.reason}`);
+    });
+
+    // 测试 2: upsert 拒绝 V2 无 hash（Event Log 边界自守）
+    it("② upsert: V2 无 eventHash → throw（不进入 events/eventIndex）", () => {
+      const alice = mkAlice();
+      const dir = path.join(aliceStore2, "up_" + Date.now());
+      const ts = new TaskStore(dir);
+      const task = createTask({ title: "t2", requiredCapabilities: [] });
+      task.publisherFingerprint = alice.fingerprint;
+      const e1 = createTaskEvent(alice, "publish", null, task);
+      ts.upsert(task, e1);
+      const before = { status: "open", assigneeFingerprintActual: "", result: null };
+      const after = { status: "claimed", assigneeFingerprintActual: alice.fingerprint, result: null };
+      const ev = mkV2NoHash(alice, "claim", before, after);
+      assert.throws(() => ts.upsert({ ...task }, ev), /v2 event integrity failed/, "upsert 应拒绝 V2 无 hash");
+      const log = ts.eventHistory(task.id);
+      assert.equal(log.length, 1, "非法事件不得进入 Event Log");
+    });
+
+    // 测试 3: fork canonicalization 拒绝 V2 无 hash（手动塞入 event 后 canonicalizeTask 拒绝）
+    it("③ canonicalizeTask: 含 V2 无 hash 事件的 fork → throw", () => {
+      const alice = mkAlice();
+      const dir = path.join(aliceStore2, "fk_" + Date.now());
+      const ts = new TaskStore(dir);
+      const task = createTask({ title: "t3", policy: { fork: "publisher" } });
+      task.publisherFingerprint = alice.fingerprint;
+      const e1 = createTaskEvent(alice, "publish", null, task);
+      ts.upsert(task, e1);
+      const cState = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+      const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, cState);
+      ts.upsert(cState, e2);
+      // 手工塞入 V2 无 hash 事件作为 fork
+      const evilClaimed = { ...task, status: "claimed", assigneeFingerprintActual: "evil", lastEventHash: e1.eventHash };
+      const evilEv = mkV2NoHash(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, evilClaimed);
+      ts.eventHistory(task.id).push(evilEv);
+      ts.get(task.id).forks = [{ headEventHash: evilEv.eventId, actor: alice.fingerprint, ts: Date.now(), action: "claim" }];
+      // canonicalizeTask → resolveFork → 回溯时 integrity gate 拒绝
+      assert.throws(() => ts.canonicalizeTask(task.id), /eventHash|integrity/, "fork canonicalization 应拒绝 V2 无 hash");
+    });
+
+    // 测试 4: live == replay == fork 三路径对同一非法事件结果一致（全部拒绝）
+    it("④ 三路径一致: V2 无 hash 在 validate/upsert/canonicalize 均拒绝", () => {
+      const alice = mkAlice();
+      const trust = mkTrust(alice);
+      const dir = path.join(aliceStore2, "tri_" + Date.now());
+      const ts = new TaskStore(dir);
+      const task = createTask({ title: "t4", policy: { fork: "publisher" } });
+      task.publisherFingerprint = alice.fingerprint;
+      const e1 = createTaskEvent(alice, "publish", null, task);
+      ts.upsert(task, e1);
+      const cState = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash };
+      const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, cState);
+      ts.upsert(cState, e2);
+      // 同一个非法 V2 事件（无 hash）
+      const evilClaimed = { ...task, status: "claimed", assigneeFingerprintActual: "evil", lastEventHash: e1.eventHash };
+      const evilEv = mkV2NoHash(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, evilClaimed);
+
+      // ① live validate: 拒绝
+      const v = validateTaskEvent(evilEv, "claim", { ...task, status: "open", assigneeFingerprintActual: "" }, trust, { hasLocalRecord: false, allowLegacy: false });
+      assert.equal(v.ok, false, "live validate → reject");
+
+      // ② live upsert: 拒绝（不落 log）
+      assert.throws(() => ts.upsert({ ...task }, evilEv), /v2 event integrity failed/, "live upsert → reject");
+
+      // ③ fork canonicalization: 拒绝
+      ts.eventHistory(task.id).push(evilEv);
+      ts.get(task.id).forks = [{ headEventHash: evilEv.eventId, actor: alice.fingerprint, ts: Date.now(), action: "claim" }];
+      assert.throws(() => ts.canonicalizeTask(task.id), /eventHash|integrity/, "fork canonicalize → reject");
+
+      // ④ replay: 拒绝（V2 无 hash 写盘后重启 unhealthy）——已有独立测试覆盖
+    });
   });
 });

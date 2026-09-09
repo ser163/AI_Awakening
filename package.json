@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.14",
-    "description": "硅基协作网络 — DAG 父完整性 + V2 eventHash 必填 fail-closed, 151 tests",
+  "version": "0.12.15",
+    "description": "硅基协作网络 — V2 eventHash 必填统一 gate (live/upsert/fork/replay 三路径一致), 155 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {
