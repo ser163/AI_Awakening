@@ -900,20 +900,26 @@ export function migrateWorldLog(storageDir) {
   if (recs.length === 0) return { ok: true, migrated: 0 };
 
   // Step 2 — 格式判定：出现任何事务标记（tx_begin/tx_commit/txId 字段）→ 文件声明为 transactional。
-  // 必须通过完整结构验证 + eventHash 验证才可短路为 "already transactional"；
-  // 验证失败 → 拒绝（不允许 tx_begin + legacy 行混排的损坏日志绕过迁移）。
+  // 用容错检测（匹配 _load 语义）：容忍尾部未闭合事务作为 crash 残留；
+  // 但拒绝所有其他协议违规（legacy 混排、nested tx、orphan record 等）。
+  // 这与 validateTransactionalLog()（严格，拒绝尾部未闭合）语义分离。（v0.12.25 审查 P1-1）
   const hasTxMarkers = recs.some((r) => r && (r.kind === "tx_begin" || r.kind === "tx_commit" || r.txId));
   if (hasTxMarkers) {
-    const v = validateTransactionalLog(recs);
+    const v = checkTolerantTransactional(recs);
     if (!v.ok) return { ok: false, migrated: 0, reason: `transactional log corrupt: ${v.reason}` };
     return { ok: true, migrated: 0, reason: "already transactional" };
   }
 
-  // Step 3 — legacy 格式：先对每条记录做 schema + semantic validation（全通过才允许转换）。
+  // Step 3 — legacy 格式 schema validation（必填字段 + 类型检查）
   for (let i = 0; i < recs.length; i++) {
     const err = validateLegacyRecord(recs[i]);
     if (err) return { ok: false, migrated: 0, reason: `record at line ${i + 1}: ${err}` };
   }
+
+  // Step 3b — 语义验证：复用 World transition 规则（dry-run replay + 语义完整性检查）。
+  // 不维护第二套 migration 专用语义规则。（v0.12.25 审查 P1-2）
+  const semErr = validateLegacySemantics(recs);
+  if (semErr) return { ok: false, migrated: 0, reason: `semantic validation failed: ${semErr}` };
 
   // Step 4 — 全部验证通过 → 纯函数构造 transactional 输出（此阶段不再失败，尚未触碰磁盘）。
   const outLines = [];
@@ -946,10 +952,11 @@ export function migrateWorldLog(storageDir) {
 }
 
 /**
- * v0.12.24 (审查 P1): transactional 日志完整验证——严格状态机（与 _load 同一套规则）：
- *   tx_begin(txId) → RECORD(txId)×N → tx_commit(txId)
+ * v0.12.25 (审查 P1-1): transactional 日志严格验证——拒绝尾部未闭合事务。
+ * 这是"日志完整性检查"，不是"容错加载"。
+ * 容错加载（容忍尾部 crash 残留）由 WorldModel._load 自身处理。
+ * 严格验证：tx_begin(txId) → RECORD(txId)×N → tx_commit(txId)
  * 所有权威记录必须 eventHash 存在且正确；任何协议违规 → fail。
- * 尾部未闭合事务 = 崩溃残留（与 _load 相同丢弃容忍）。
  * @returns {{ok: boolean, reason?: string}}
  */
 function validateTransactionalLog(recs) {
@@ -964,22 +971,21 @@ function validateTransactionalLog(recs) {
     } else if (r.kind === "tx_commit") {
       if (!pending) return { ok: false, reason: `line ${i + 1}: orphan tx_commit` };
       if (pending.txId !== r.txId) return { ok: false, reason: `line ${i + 1}: tx_commit txId mismatch (${r.txId} vs ${pending.txId})` };
-      // 提交点验证事务内全部权威记录（先验证，通过才视为已提交）
+      // 提交点验证事务内全部权威记录
       for (const rec of pending.records) {
-        if (!AUTHORITATIVE_KINDS.has(rec.kind)) continue; // event 等 telemetry 无 hash
+        if (!AUTHORITATIVE_KINDS.has(rec.kind)) continue;
         const h = worldRecordHash(rec);
         if (!rec.eventHash) return { ok: false, reason: `authoritative ${rec.kind} missing eventHash` };
         if (h !== rec.eventHash) return { ok: false, reason: `${rec.kind} eventHash mismatch (record modified)` };
       }
       pending = null;
     } else {
-      // 数据 record
       if (!pending) return { ok: false, reason: `line ${i + 1}: record ${r.kind} without tx_begin` };
       if (pending.txId !== r.txId) return { ok: false, reason: `line ${i + 1}: record txId mismatch (${r.txId} vs ${pending.txId})` };
       pending.records.push(r);
     }
   }
-  // 尾部未闭合事务 = 崩溃残留（无 COMMIT 整体丢弃，与 _load 相同容忍）
+  if (pending) return { ok: false, reason: `uncommitted transaction ${pending.txId} at end of log (no tx_commit)` };
   return { ok: true };
 }
 
@@ -1044,6 +1050,75 @@ function validateLegacyRecord(rec) {
     }
   }
   if (rec.ts !== undefined && (typeof rec.ts !== "number" || !Number.isFinite(rec.ts))) return "ts must be a finite number";
+  return null;
+}
+
+/**
+ * v0.12.25 (审查 P1-1): 容错 transactional 检测——匹配 _load 的 crash-tolerant 加载语义。
+ * 用于 migrateWorldLog 的 "already transactional" 判定。与 validateTransactionalLog()（严格）
+ * 语义分离：容忍尾部未闭合事务（crash 残留），拒绝所有其他协议违规。
+ * @returns {{ok: boolean, reason?: string}}
+ */
+function checkTolerantTransactional(recs) {
+  let pending = null;
+  for (let i = 0; i < recs.length; i++) {
+    const r = recs[i];
+    if (!r || typeof r !== "object") return { ok: false, reason: `line ${i + 1}: not an object` };
+    if (!r.txId) return { ok: false, reason: `line ${i + 1}: record without txId inside transactional log` };
+    if (r.kind === "tx_begin") {
+      if (pending) return { ok: false, reason: `line ${i + 1}: nested tx_begin while tx ${pending.txId} open` };
+      pending = { txId: r.txId, records: [] };
+    } else if (r.kind === "tx_commit") {
+      if (!pending) return { ok: false, reason: `line ${i + 1}: orphan tx_commit` };
+      if (pending.txId !== r.txId) return { ok: false, reason: `line ${i + 1}: tx_commit txId mismatch` };
+      for (const rec of pending.records) {
+        if (!AUTHORITATIVE_KINDS.has(rec.kind)) continue;
+        const h = worldRecordHash(rec);
+        if (!rec.eventHash) return { ok: false, reason: `authoritative ${rec.kind} missing eventHash` };
+        if (h !== rec.eventHash) return { ok: false, reason: `${rec.kind} eventHash mismatch` };
+      }
+      pending = null;
+    } else {
+      if (!pending) return { ok: false, reason: `line ${i + 1}: record ${r.kind} without tx_begin` };
+      if (pending.txId !== r.txId) return { ok: false, reason: `line ${i + 1}: record txId mismatch` };
+      pending.records.push(r);
+    }
+  }
+  // 容忍尾部未闭合事务（与 _load 一致：crash 残留丢弃）
+  return { ok: true };
+}
+
+/**
+ * v0.12.25 (审查 P1-2): legacy 记录语义完整性验证——复用 WorldModel._replay 作为 transition
+ * validator（不维护第二套 migration 专用语义规则）。对每条记录做 dry-run replay 并检查：
+ * - claim_retracted / evidence_retracted 必须引用已存在的 claim（与正常 API retractEvidence 对齐）
+ * - relation forward-reference 允许（World 允许先有关系后创实体）
+ * @param {object[]} recs legacy 记录数组
+ * @returns {string|null} 错误消息或 null（合法）
+ */
+function validateLegacySemantics(recs) {
+  const w = new WorldModel(); // 内存模式（无 logFile），不落盘
+  for (let i = 0; i < recs.length; i++) {
+    const rec = recs[i];
+    // 仅必要检查：retraction 必须引用已有 claim（正常 API retractEvidence 无 claim → return false，不写盘）
+    if (rec.kind === "claim_retracted") {
+      if (!w.claims.has(rec.id)) {
+        return `claim_retracted at position ${i}: claim "${rec.id}" does not exist in world`;
+      }
+    }
+    if (rec.kind === "evidence_retracted") {
+      const c = w.claims.get(rec.claimId);
+      if (!c) {
+        return `evidence_retracted at position ${i}: claim "${rec.claimId}" does not exist in world`;
+      }
+      if (rec.evidenceId) {
+        const found = c.evidence.some((e) => e.evidenceId === rec.evidenceId);
+        if (!found) return `evidence_retracted at position ${i}: evidence "${rec.evidenceId}" not found in claim "${rec.claimId}"`;
+      }
+    }
+    // 用 WorldModel._replay 作为 transition 规则（幂等 upsert）
+    w._replay(rec);
+  }
   return null;
 }
 
