@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.12",
-    "description": "硅基协作网络 — Event Sourcing Integrity (共享 applyEvent 管道/forks 纯推导/日志损坏止于健康), 144 tests",
+  "version": "0.12.13",
+    "description": "硅基协作网络 — 事务性加载/fork leaf 语义/forkRule fail-closed, 147 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

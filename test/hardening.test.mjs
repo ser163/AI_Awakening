@@ -1158,4 +1158,91 @@ describe("v0.12.11: INVARIANT 1-4 冻结前验证", () => {
     const forkHashes = (rt.forks || []).map(f => f.headEventHash);
     assert.ok(forkHashes.includes(e2b.eventHash), "bob 分支应作为 derived fork 记录");
   });
+
+  // 🧪 1. Corrupted Event Log — JSON 损坏行导致 fail-closed, 不产生 partial 状态
+  it("日志损坏（JSON 行损毁）→ unhealthy, 不加载任何 event", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, "corrupt_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "corrupt_test", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash, claimedAt: Date.now() };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    ts.upsert(claimed, e2);
+    const ts1Status = ts.get(task.id).status;
+    // 往 events.jsonl 插入损坏行
+    const evFile = path.join(dir, "tasks", "events.jsonl");
+    fs.appendFileSync(evFile, "{not valid json\n", "utf8");
+    // 重启 → 解析失败 → 不加载任何事件
+    const ts2 = new TaskStore(dir);
+    assert.ok(!ts2.isHealthy(), "日志损坏标记 unhealthy");
+    // events 应为空（事务性加载：全部失败 = 不加载任何行）
+    const log = ts2.eventHistory(task.id);
+    assert.equal(log.length, 0, "日志损坏时事务性加载应导致 0 事件被加载");
+    // snapshot 应保留（不写 partial）
+    const rt = ts2.get(task.id);
+    assert.equal(rt.status, ts1Status, "日志损坏不应覆盖 snapshot");
+  });
+
+  // 🧪 2. Multi-Level Fork — A→B→D→E 分支 vs A→C canonical, fork head 应为 E
+  it("多级 fork: deriveForkView 返回 branch leaf (E) 而非中间节点 (B)", () => {
+    const alice = makeAlice();
+    const bob = loadOrCreateIdentity(path.join(aliceStore, "bob_mlf"), "bob");
+    makeStore(alice);
+    const dir = path.join(aliceStore, "mlf_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "mlf", policy: { fork: "publisher" } });
+    task.publisherFingerprint = alice.fingerprint;
+    // A: publish by alice
+    const eA = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, eA);
+    // B: claim by bob (fork from A)
+    const bState = { ...task, status: "claimed", assigneeFingerprintActual: bob.fingerprint, lastEventHash: eA.eventHash };
+    const eB = createTaskEvent(bob, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, bState);
+    ts.upsert(ts.get(task.id), eB, { fork: true });
+    // D: complete on B
+    const dState = { ...bState, status: "completed", result: "d-result", completedAt: Date.now(), lastEventHash: eB.eventHash };
+    const eD = createTaskEvent(bob, "complete", { status: "claimed", assigneeFingerprintActual: bob.fingerprint, result: null }, dState);
+    ts.upsert(ts.get(task.id), eD, { fork: true });
+    // E: another event on D (cancel, extending branch)
+    const eState = { ...dState, status: "cancelled", assigneeFingerprintActual: "", result: null, cancelledAt: Date.now(), lastEventHash: eD.eventHash };
+    const eE = createTaskEvent(bob, "cancel", { status: "completed", assigneeFingerprintActual: bob.fingerprint, result: "d-result" }, eState);
+    ts.upsert(ts.get(task.id), eE, { fork: true });
+    // C: claim by alice (canonical — publisher wins)
+    const cState = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: eA.eventHash };
+    const eC = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, cState);
+    ts.upsert(cState, eC); // canonical
+    // 重启后 verify derived forks
+    const ts2 = new TaskStore(dir);
+    const rt = ts2.get(task.id);
+    const forkHashes = (rt.forks || []).map(f => f.headEventHash);
+    // 多级分支 head = leaf（E），不是 branch root（B）
+    assert.ok(forkHashes.includes(eE.eventHash), `分支 head 应为 E(${eE.eventHash.slice(0,8)}), got ${forkHashes.join(",")}`);
+    assert.ok(!forkHashes.includes(eB.eventHash), "B 不应是独立 fork head（B 是分支内部节点）");
+    assert.equal(rt.lastEventHash, eC.eventHash, "canonical head 应为 C(alice claim)");
+  });
+
+  // 🧪 3. Unknown forkRule — reconcile/recovery 必须 fail-closed
+  it("unknown forkRule → reconcile fail-closed (unhealthy, 不写回)", () => {
+    const alice = makeAlice();
+    const dir = path.join(aliceStore, "unkfr_" + Date.now());
+    const ts = new TaskStore(dir);
+    const task = createTask({ title: "ukf", requiredCapabilities: [] });
+    task.publisherFingerprint = alice.fingerprint;
+    task.policy = { fork: "unknown_rule" }; // 未知规则
+    const e1 = createTaskEvent(alice, "publish", null, task);
+    ts.upsert(task, e1);
+    const claimed = { ...task, status: "claimed", assigneeFingerprintActual: alice.fingerprint, lastEventHash: e1.eventHash, claimedAt: Date.now() };
+    const e2 = createTaskEvent(alice, "claim", { status: "open", assigneeFingerprintActual: "", result: null }, claimed);
+    ts.upsert(claimed, e2);
+    const ts1Status = ts.get(task.id).status;
+    // 重启 → reconcile 应因 unknown forkRule 失败
+    const ts2 = new TaskStore(dir);
+    assert.ok(!ts2.isHealthy(), "unknown forkRule → unhealthy");
+    assert.equal(ts2.get(task.id)?.status, ts1Status, "old snapshot preserved");
+    // resolveFork 在有 fork 时也会 fail-closed（已知 KNOWN_FORK_RULES 白名单已在 resolveFork 内）
+    // 当前 task 无 fork → resolveFork 返回 null（不抛异常）
+  });
 });

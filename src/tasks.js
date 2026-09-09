@@ -250,13 +250,21 @@ export function deriveForkView(eventIndex, canonicalHead) {
   let guard = 0;
   while (cur && guard++ < 10000) { mainSet.add(cur); cur = eventIndex[cur]?.parentHash || null; }
   if (mainSet.size === 0) return [];
-  // 分支头：不在主链上，但其 parent 在主链上
-  const forks = [];
+  // 建立 children 映射（parentHash → [childHash]）
+  const children = {};
   for (const [h, meta] of Object.entries(eventIndex)) {
-    if (mainSet.has(h)) continue;
-    if (meta.parentHash && mainSet.has(meta.parentHash)) {
-      forks.push({ headEventHash: h, actor: meta.actor, ts: meta.ts, action: meta.action });
+    if (meta.parentHash) {
+      if (!children[meta.parentHash]) children[meta.parentHash] = [];
+      children[meta.parentHash].push(h);
     }
+  }
+  // 分支头 = 非 canonical 的 leaf 节点（没有孩子的分支末端节点）
+  const forks = [];
+  for (const [h] of Object.entries(eventIndex)) {
+    if (mainSet.has(h)) continue;
+    if ((children[h] || []).length > 0) continue; // 还有孩子 → 非 leaf
+    const meta = eventIndex[h];
+    forks.push({ headEventHash: h, actor: meta?.actor || "", ts: meta?.ts || 0, action: meta?.action || "" });
   }
   return forks;
 }
@@ -712,26 +720,42 @@ export class TaskStore {
         this.tasks.set(t.id, t);
       }
     } catch { /* 首次运行 */ }
-    try {
-      if (this._eventFile) {
+    // v0.12.12 (审查 P0): 事务性加载——先全部解析到临时数组，任何一行失败
+    // 就标记 unhealthy 且不修改内存事件状态，避免 partial event log 被 reconcile。
+    if (this._eventFile) {
+      const parsedEvents = [];  // {taskId, ev}
+      const seenEvents = new Set();
+      const eventHashById = new Map();
+      const seenEventHashes = new Set();
+      try {
         const text = fs.readFileSync(this._eventFile, "utf8");
         for (const line of text.trim().split("\n").filter(Boolean)) {
           const ev = JSON.parse(line);
           if (ev.eventId) {
-            this._seenEvents.add(ev.eventId);
-            if (ev.eventHash) this._eventHashById.set(ev.eventId, ev.eventHash);
+            seenEvents.add(ev.eventId);
+            if (ev.eventHash) eventHashById.set(ev.eventId, ev.eventHash);
           }
-          if (ev.eventHash) this._seenEventHashes.add(ev.eventHash);
-          if (ev.taskId) {
-            if (!this.events.has(ev.taskId)) this.events.set(ev.taskId, []);
-            this.events.get(ev.taskId).push(ev);
-          }
+          if (ev.eventHash) seenEventHashes.add(ev.eventHash);
+          if (ev.taskId) parsedEvents.push({ taskId: ev.taskId, ev });
+        }
+      } catch (e) {
+        // ENOENT = 首次运行（无日志）→ 正常空加载；其他错误 = 日志损坏 → fail-closed
+        if (e?.code !== "ENOENT") {
+          this.persistentHealthy = false;
+          this.persistenceError = `event log corrupt: ${e.message}`;
+          this._reconcileFromEvents();
+          return;
         }
       }
-    } catch { /* 首次运行 */ }
-    // v0.13.0 (审查 P1-⑥/⑦): event log 验证 + 重建权威 runtime state（snapshot 仅为加速缓存）。
-    //   P1-⑥: snapshot.lastEventHash 与 event log 尾部一致性——log wins。
-    //   P1-⑦: forks 为 derived view（从 events 重算，不信任持久化 snapshot.forks）。
+      // 全部解析成功 → 事务性提交
+      this._seenEvents = seenEvents;
+      this._eventHashById = eventHashById;
+      this._seenEventHashes = seenEventHashes;
+      for (const { taskId, ev } of parsedEvents) {
+        if (!this.events.has(taskId)) this.events.set(taskId, []);
+        this.events.get(taskId).push(ev);
+      }
+    }
     this._reconcileFromEvents();
   }
 
@@ -769,7 +793,13 @@ export class TaskStore {
     if (heads.length === 0) return false;
 
     // 3. canonical head 只由 forkRule 决策（snapshot.lastEventHash 不参与！）
+    // v0.12.12 (审查 P1): forkRule 必须 fail-closed——未知规则直接拒绝，不 fallback 到 newest
     const forkRule = (task.policy && task.policy.fork) || "publisher";
+    if (!KNOWN_FORK_RULES.has(forkRule)) {
+      this.persistentHealthy = false;
+      this.persistenceError = `task ${id}: unsupported fork rule "${forkRule}" (fail-closed: refuse canonicalization)`;
+      return false;
+    }
     const sorted = heads.slice().sort((a, b) => {
       if (forkRule === "publisher") {
         const aIsPub = a.actor === task.publisherFingerprint ? 1 : 0;
