@@ -953,6 +953,34 @@ describe("world: applyWorldTransition 纯函数 & 确定性", () => {
     assert.equal(ev.validFrom, 0, "validFrom=0 不丢失");
     assert.equal(ev.validUntil, 0, "validUntil=0 不丢失");
   });
+
+  it("source 缺失 → 默认值；source falsy 子字段不丢失（?? 而非 ||）", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    // source 缺失 → 默认 AGENT source
+    const s1 = applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:a", predicate: "p", object: "x", ts: 5,
+    });
+    const ev1 = s1.claims.get("agent:a|p|x").evidence[0];
+    assert.equal(ev1.source.type, SOURCE_TYPES.AGENT, "缺失 source 用默认类型");
+    // source.id 显式空串 → 不丢失
+    const s2 = applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:b", predicate: "p", object: "x", ts: 6,
+      source: { type: SOURCE_TYPES.SENSOR, id: "", kind: SOURCE_KINDS.MEASUREMENT },
+    });
+    const ev2 = s2.claims.get("agent:b|p|x").evidence[0];
+    assert.equal(ev2.source.id, "", "id='' 不回退默认");
+  });
+
+  it("source 存在但非法 → throw（validation fail）", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    assert.throws(() => applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:c", predicate: "p", object: "x", ts: 7, source: "not-an-object",
+    }), /source must be a plain object/);
+    assert.throws(() => applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:c", predicate: "p", object: "x", ts: 8,
+      source: { type: 123, id: "s1" },
+    }), /source.type must be a string/);
+  });
 });
 
 // v0.12.23 (审查 P1/P2): eventHash 完整性——任意权威字段修改→hash 变化→fail-closed

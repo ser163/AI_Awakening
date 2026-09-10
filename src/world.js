@@ -52,8 +52,8 @@ function deterministicEvidenceId({ subject, predicate, object, source, observedA
     subject,
     predicate,
     object: String(object),
-    srcIdentity: source?.identity || source?.id || "",
-    srcEventId: source?.eventId || null,
+    srcIdentity: source?.identity ?? source?.id ?? "",
+    srcEventId: source?.eventId ?? null,
     observedAt: observedAt ?? null,
     validFrom: validFrom ?? null,
     validUntil: validUntil ?? null,
@@ -404,16 +404,7 @@ export class WorldModel {
       throw new Error("evidence requires subject and predicate");
     }
     const observedAt = ev.observedAt ?? Date.now();
-    const source = {
-      type: ev.source?.type || SOURCE_TYPES.AGENT,
-      id: ev.source?.id || "",
-      // v0.12.2 ⑤: 稳定主体 ID（独立性依据）——与 id（会话级）分开
-      identity: ev.source?.identity || ev.source?.id || "",
-      kind: ev.source?.kind || SOURCE_KINDS.ASSERTION,
-      eventId: ev.source?.eventId || null,
-      // v0.12.2 ⑤: 因果链预留——derivedFrom 记录传播来源（A→B→C→D 只算一个独立来源）
-      provenanceId: ev.source?.provenanceId || null,
-    };
+    const source = normalizeSource(ev.source);
     const evidenceId = deterministicEvidenceId({
       subject: ev.subject,
       predicate: ev.predicate,
@@ -587,7 +578,7 @@ export class WorldModel {
       // source.identity = 稳定主体 ID（如 sensor:temperature:01）
       // source.id       = 会话/事件 ID（可去重但不可靠）
       // evidenceId      = 个体证据（无 identity/id 时不合并，每证据独立）
-      const srcKey = ev.source?.identity || ev.source?.id || ev.evidenceId;
+      const srcKey = ev.source?.identity ?? ev.source?.id ?? ev.evidenceId;
       if (seenSources.has(srcKey)) continue;
       seenSources.add(srcKey);
 
@@ -886,6 +877,34 @@ function initWorldState() {
   return { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
 }
 
+/** source 缺失时默认值 */
+const DEFAULT_SOURCE = { type: SOURCE_TYPES.AGENT, id: "", identity: "", kind: SOURCE_KINDS.ASSERTION, eventId: null, provenanceId: null };
+
+/**
+ * v0.12.29 (审查 P2): source 规范化——统一 ?? 取代 ||，存在但非法 → throw。
+ * @param {object|undefined|null} src 原始 source（可能为 undefined/null）
+ * @returns {object} 标准化 source 对象
+ * @throws {Error} 若 source 存在但类型/子字段非法
+ */
+function normalizeSource(src) {
+  if (src === undefined || src === null) return { ...DEFAULT_SOURCE };
+  if (typeof src !== "object" || Array.isArray(src)) throw new Error("source must be a plain object");
+  if (src.type !== undefined && typeof src.type !== "string") throw new Error("source.type must be a string");
+  if (src.id !== undefined && typeof src.id !== "string") throw new Error("source.id must be a string");
+  if (src.identity !== undefined && typeof src.identity !== "string") throw new Error("source.identity must be a string");
+  if (src.kind !== undefined && typeof src.kind !== "string") throw new Error("source.kind must be a string");
+  if (src.eventId !== undefined && src.eventId !== null && typeof src.eventId !== "string") throw new Error("source.eventId must be a string or null");
+  if (src.provenanceId !== undefined && src.provenanceId !== null && typeof src.provenanceId !== "string") throw new Error("source.provenanceId must be a string or null");
+  return {
+    type: src.type ?? DEFAULT_SOURCE.type,
+    id: src.id ?? "",
+    identity: src.identity ?? src.id ?? "",
+    kind: src.kind ?? DEFAULT_SOURCE.kind,
+    eventId: src.eventId ?? null,
+    provenanceId: src.provenanceId ?? null,
+  };
+}
+
 /**
  * v0.12.27 (审查 P1): evidence → claim 的纯转换（clone-on-write）。
  * 被 applyWorldTransition()（重放/迁移）与 WorldModel._addEvidenceToClaim()（实时写入）共用。
@@ -910,7 +929,7 @@ function addEvidenceToClaims(claims, rec, now) {
     subject: rec.subject,
     predicate: rec.predicate,
     object: rec.object,
-    source: rec.source || { type: "unknown", id: "", kind: SOURCE_KINDS.ASSERTION },
+    source: normalizeSource(rec.source),
     observedAt: rec.observedAt ?? now,
     validFrom: rec.validFrom ?? null,   // v0.12.0: 三维时间
     validUntil: rec.validUntil ?? null,
@@ -1100,6 +1119,12 @@ function validateLegacyRecord(rec) {
       if (rec.predicate === undefined || rec.predicate === null || rec.predicate === "") return "predicate required";
       if (rec.object === undefined) return "object required";
       if (rec.evidenceId !== undefined && rec.evidenceId !== null && typeof rec.evidenceId !== "string") return "evidenceId must be a string";
+      if (rec.source !== undefined && rec.source !== null) {
+        if (typeof rec.source !== "object" || Array.isArray(rec.source)) return "source must be an object";
+        if (rec.source.type !== undefined && typeof rec.source.type !== "string") return "source.type must be a string";
+        if (rec.source.id !== undefined && typeof rec.source.id !== "string") return "source.id must be a string";
+        if (rec.source.kind !== undefined && typeof rec.source.kind !== "string") return "source.kind must be a string";
+      }
       break;
     }
     case "claim_retracted": {
@@ -1198,7 +1223,11 @@ function validateLegacySemantics(recs) {
       }
     }
     // 与重放完全相同的状态转换规则（幂等追加合并）
-    state = applyWorldTransition(state, rec);
+    try {
+      state = applyWorldTransition(state, rec);
+    } catch (err) {
+      return `record at position ${i}: transition failed — ${err.message}`;
+    }
   }
   return null;
 }
