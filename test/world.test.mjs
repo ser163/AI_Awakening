@@ -8,7 +8,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { WorldModel, SOURCE_TYPES, SOURCE_KINDS, migrateWorldLog, applyWorldTransition } from "../src/world.js";
+import { WorldModel, SOURCE_TYPES, SOURCE_KINDS, migrateWorldLog, applyWorldTransition, sourceWeight } from "../src/world.js";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
@@ -1040,6 +1040,51 @@ describe("world: applyWorldTransition 纯函数 & 确定性", () => {
       kind: "evidence", subject: "agent:e", predicate: "p", object: "x", ts: 13,
       source: { type: SOURCE_TYPES.SELF, id: "x", kind: "forged-claim" },
     }), /invalid source.kind "forged-claim"/);
+  });
+
+  it("UNKNOWN source 权重最低（低于所有合法来源）", () => {
+    const unknownW = sourceWeight({ type: SOURCE_TYPES.UNKNOWN });
+    const agentW = sourceWeight({ type: SOURCE_TYPES.AGENT });
+    const sensorW = sourceWeight({ type: SOURCE_TYPES.SENSOR });
+    const selfW = sourceWeight({ type: SOURCE_TYPES.SELF });
+    assert.ok(unknownW < agentW, "UNKNOWN < AGENT");
+    assert.ok(unknownW < sensorW, "UNKNOWN < SENSOR");
+    assert.ok(unknownW < selfW, "UNKNOWN < SELF");
+    assert.ok(unknownW >= 0.05, "UNKNOWN value clamped at min weight");
+  });
+
+  it("agent:A ≠ sensor:A（evidenceId 绑定 source.type/kind）", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    const base = { kind: "evidence", subject: "agent:id", predicate: "p", object: "x", ts: 1 };
+    const agent = applyWorldTransition(s0, {
+      ...base, source: { type: SOURCE_TYPES.AGENT, id: "A", kind: SOURCE_KINDS.ASSERTION },
+    });
+    const sensor = applyWorldTransition(s0, {
+      ...base, source: { type: SOURCE_TYPES.SENSOR, id: "A", kind: SOURCE_KINDS.MEASUREMENT },
+    });
+    const cid = "agent:id|p|x";
+    const eidAgent = agent.claims.get(cid).evidence[0].evidenceId;
+    const eidSensor = sensor.claims.get(cid).evidence[0].evidenceId;
+    assert.notEqual(eidAgent, eidSensor, "agent:A ≠ sensor:A");
+  });
+
+  it("evidenceId 非法格式/空/非确定性 → throw（不静默替换）", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    const base = { kind: "evidence", subject: "agent:ev", predicate: "p", object: "x", ts: 14 };
+    // evidenceId="" → throw（不被当作缺失静默计算新 ID）
+    assert.throws(() => applyWorldTransition(s0, {
+      ...base, evidenceId: "", source: { type: SOURCE_TYPES.SELF, id: "me" },
+    }), /invalid evidenceId/);
+    // evidenceId="abc"（非 24-hex）→ throw
+    assert.throws(() => applyWorldTransition(s0, {
+      ...base, evidenceId: "abc", source: { type: SOURCE_TYPES.SELF, id: "me" },
+    }), /invalid evidenceId/);
+    // evidenceId 格式正确（24 hex 但非确定性内容）→ 接受（旧日志兼容）
+    const ok = applyWorldTransition(s0, {
+      ...base, ts: 15, evidenceId: "a".repeat(24), source: { type: SOURCE_TYPES.SELF, id: "me" },
+    });
+    const cid = "agent:ev|p|x";
+    assert.equal(ok.claims.get(cid).evidence[0].evidenceId, "a".repeat(24), "格式正确就接受（旧日志兼容）");
   });
 });
 

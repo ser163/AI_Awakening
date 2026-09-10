@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.31",
-      "description": "硅基协作网络 — claimAt ?? 修复合法0 + normalizeSource enum验证 + 真正plain object检查, 202 tests",
+  "version": "0.12.32",
+      "description": "硅基协作网络 — source.type/kind 绑定 evidenceId + UNKNOWN weight=0 + evidenceId 格式验证, 205 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

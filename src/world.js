@@ -52,6 +52,10 @@ function deterministicEvidenceId({ subject, predicate, object, source, observedA
     subject,
     predicate,
     object: String(object),
+    // v0.12.32 (审查 P1): source.type/kind 属于 Evidence 身份的一部分——
+    // agent:A ≠ sensor:A ≠ self:A，assertion ≠ observation 必须产生不同 ID
+    srcType: source?.type ?? SOURCE_TYPES.UNKNOWN,
+    srcKind: source?.kind ?? SOURCE_KINDS.ASSERTION,
     srcIdentity: source?.identity ?? source?.id ?? "",
     srcEventId: source?.eventId ?? null,
     observedAt: observedAt ?? null,
@@ -926,8 +930,16 @@ function normalizeSource(src) {
 function addEvidenceToClaims(claims, rec, now) {
   const claimId = rec.claimId || `${rec.subject}|${rec.predicate}|${String(rec.object)}`;
   const existing = claims.get(claimId);
-  const evidenceItem = {
-    evidenceId: rec.evidenceId || deterministicEvidenceId({
+  // v0.12.32 (审查 P1): evidenceId 是 Evidence 身份——权威日志中出现的 ID 必须满足
+  // 确定性格式（24-hex）。非法/空 ID 不静默替换为重新计算值（那会掩盖篡改）。
+  let evidenceId;
+  if (rec.evidenceId !== undefined && rec.evidenceId !== null) {
+    if (typeof rec.evidenceId !== "string" || !/^[0-9a-f]{24}$/.test(rec.evidenceId)) {
+      throw new Error(`invalid evidenceId "${rec.evidenceId}" (must be 24-hex deterministic ID)`);
+    }
+    evidenceId = rec.evidenceId;
+  } else {
+    evidenceId = deterministicEvidenceId({
       subject: rec.subject,
       predicate: rec.predicate,
       object: rec.object,
@@ -936,7 +948,10 @@ function addEvidenceToClaims(claims, rec, now) {
       validFrom: rec.validFrom,
       validUntil: rec.validUntil,
       observationId: rec.observationId ?? null,
-    }),
+    });
+  }
+  const evidenceItem = {
+    evidenceId,
     subject: rec.subject,
     predicate: rec.predicate,
     object: rec.object,
@@ -1129,7 +1144,9 @@ function validateLegacyRecord(rec) {
       if (rec.subject === undefined || rec.subject === null || rec.subject === "") return "subject required";
       if (rec.predicate === undefined || rec.predicate === null || rec.predicate === "") return "predicate required";
       if (rec.object === undefined) return "object required";
-      if (rec.evidenceId !== undefined && rec.evidenceId !== null && typeof rec.evidenceId !== "string") return "evidenceId must be a string";
+      if (rec.evidenceId !== undefined && rec.evidenceId !== null) {
+        if (typeof rec.evidenceId !== "string" || !/^[0-9a-f]{24}$/.test(rec.evidenceId)) return `invalid evidenceId "${rec.evidenceId}" (must be 24-hex)`;
+      }
       if (rec.source !== undefined && rec.source !== null) {
         try { normalizeSource(rec.source); } catch (err) { return err.message; }
       }
@@ -1251,6 +1268,7 @@ function validateLegacySemantics(recs) {
  */
 export function sourceWeight(source) {
   const base = {
+    [SOURCE_TYPES.UNKNOWN]: 0,     // 来源未知 → 零信任
     [SOURCE_TYPES.AGENT]: 0.8,
     [SOURCE_TYPES.SELF]: 1.0,
     [SOURCE_TYPES.REGISTRY]: 0.7,
