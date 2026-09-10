@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.29",
-      "description": "硅基协作网络 — source 规范化 normalizeSource(?? + 显式验证) 取代 ||, 198 tests",
+  "version": "0.12.30",
+      "description": "硅基协作网络 — source UNKNOWN(不伪装agent) + normalizeSource 唯一source validator + evidenceId ||→??, 200 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {

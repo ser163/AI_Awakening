@@ -956,12 +956,19 @@ describe("world: applyWorldTransition 纯函数 & 确定性", () => {
 
   it("source 缺失 → 默认值；source falsy 子字段不丢失（?? 而非 ||）", () => {
     const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
-    // source 缺失 → 默认 AGENT source
+    // source 缺失 → 默认 UNKNOWN（不伪装 agent）
     const s1 = applyWorldTransition(s0, {
       kind: "evidence", subject: "agent:a", predicate: "p", object: "x", ts: 5,
     });
     const ev1 = s1.claims.get("agent:a|p|x").evidence[0];
-    assert.equal(ev1.source.type, SOURCE_TYPES.AGENT, "缺失 source 用默认类型");
+    assert.equal(ev1.source.type, SOURCE_TYPES.UNKNOWN, "缺失 source=UNKNOWN≠agent");
+    assert.notEqual(ev1.source.type, SOURCE_TYPES.AGENT, "missing source != agent source");
+    // source=null → 同样 UNKNOWN，不是 agent
+    const sNull = applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:null", predicate: "p", object: "x", ts: 5,
+      source: null,
+    });
+    assert.equal(sNull.claims.get("agent:null|p|x").evidence[0].source.type, SOURCE_TYPES.UNKNOWN, "null source=UNKNOWN≠agent");
     // source.id 显式空串 → 不丢失
     const s2 = applyWorldTransition(s0, {
       kind: "evidence", subject: "agent:b", predicate: "p", object: "x", ts: 6,
@@ -969,6 +976,29 @@ describe("world: applyWorldTransition 纯函数 & 确定性", () => {
     });
     const ev2 = s2.claims.get("agent:b|p|x").evidence[0];
     assert.equal(ev2.source.id, "", "id='' 不回退默认");
+  });
+
+  it("0 与 null 生成不同 evidenceId（validFrom=0 合法）", () => {
+    const base = { subject: "agent:det", predicate: "test", object: "id" };
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    const rec0 = { kind: "evidence", ...base, ts: 1, validFrom: 0, source: { type: SOURCE_TYPES.SELF, id: "me" } };
+    const recNull = { kind: "evidence", ...base, ts: 2, source: { type: SOURCE_TYPES.SELF, id: "me" } };
+    const s1 = applyWorldTransition(s0, rec0);
+    const s2 = applyWorldTransition(s0, recNull);
+    const cid = `${base.subject}|${base.predicate}|${base.object}`;
+    const evId0 = s1.claims.get(cid).evidence[0].evidenceId;
+    const evIdNull = s2.claims.get(cid).evidence[0].evidenceId;
+    assert.notEqual(evId0, evIdNull, "validFrom=0 与 null 不同 evidenceId");
+  });
+
+  it("non-plain source (Date/Map) → throw", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    assert.throws(() => applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:d", predicate: "p", object: "x", ts: 9, source: new Date(),
+    }), /plain object/);
+    assert.throws(() => applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:d", predicate: "p", object: "x", ts: 10, source: new Map(),
+    }), /plain object/);
   });
 
   it("source 存在但非法 → throw（validation fail）", () => {

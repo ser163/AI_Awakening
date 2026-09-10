@@ -62,12 +62,13 @@ function deterministicEvidenceId({ subject, predicate, object, source, observedA
   return crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 24);
 }
 export const SOURCE_TYPES = {
-  AGENT: "agent",       // 另一节点断言
-  SELF: "self",         // 本节点自身
-  REGISTRY: "registry", // 注册表（引导信息）
-  SENSOR: "sensor",     // 传感器/环境观察
-  MEMORY: "memory",     // 从记忆重放
-  NETWORK: "network",   // 网络拓扑观察
+  UNKNOWN: "unknown",    // 来源未知/未提供（不得伪装成 agent）
+  AGENT: "agent",        // 另一节点断言
+  SELF: "self",          // 本节点自身
+  REGISTRY: "registry",  // 注册表（引导信息）
+  SENSOR: "sensor",      // 传感器/环境观察
+  MEMORY: "memory",      // 从记忆重放
+  NETWORK: "network",    // 网络拓扑观察
 };
 
 /** 权威记录类型：参与状态推导的 kind，不含 tx/event 标记 */
@@ -411,9 +412,9 @@ export class WorldModel {
       object: ev.object,
       source,
       observedAt,
-      validFrom: ev.validFrom || null,
-      validUntil: ev.validUntil || null,
-      observationId: ev.observationId || null,
+      validFrom: ev.validFrom ?? null,
+      validUntil: ev.validUntil ?? null,
+      observationId: ev.observationId ?? null,
     });
     const claimId = `${ev.subject}|${ev.predicate}|${String(ev.object)}`;
     const ts = Date.now();
@@ -877,8 +878,8 @@ function initWorldState() {
   return { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
 }
 
-/** source 缺失时默认值 */
-const DEFAULT_SOURCE = { type: SOURCE_TYPES.AGENT, id: "", identity: "", kind: SOURCE_KINDS.ASSERTION, eventId: null, provenanceId: null };
+/** source 缺失时默认值——type 为 UNKNOWN，绝不伪装成 agent（provenance 语义） */
+const DEFAULT_SOURCE = { type: SOURCE_TYPES.UNKNOWN, id: "", identity: "", kind: SOURCE_KINDS.ASSERTION, eventId: null, provenanceId: null };
 
 /**
  * v0.12.29 (审查 P2): source 规范化——统一 ?? 取代 ||，存在但非法 → throw。
@@ -888,7 +889,10 @@ const DEFAULT_SOURCE = { type: SOURCE_TYPES.AGENT, id: "", identity: "", kind: S
  */
 function normalizeSource(src) {
   if (src === undefined || src === null) return { ...DEFAULT_SOURCE };
+  // 真正 plain object 检查——排除 Date/Map/proto 污染
   if (typeof src !== "object" || Array.isArray(src)) throw new Error("source must be a plain object");
+  const proto = Object.getPrototypeOf(src);
+  if (proto !== Object.prototype && proto !== null) throw new Error("source must be a plain object (non-standard prototype detected)");
   if (src.type !== undefined && typeof src.type !== "string") throw new Error("source.type must be a string");
   if (src.id !== undefined && typeof src.id !== "string") throw new Error("source.id must be a string");
   if (src.identity !== undefined && typeof src.identity !== "string") throw new Error("source.identity must be a string");
@@ -1120,10 +1124,7 @@ function validateLegacyRecord(rec) {
       if (rec.object === undefined) return "object required";
       if (rec.evidenceId !== undefined && rec.evidenceId !== null && typeof rec.evidenceId !== "string") return "evidenceId must be a string";
       if (rec.source !== undefined && rec.source !== null) {
-        if (typeof rec.source !== "object" || Array.isArray(rec.source)) return "source must be an object";
-        if (rec.source.type !== undefined && typeof rec.source.type !== "string") return "source.type must be a string";
-        if (rec.source.id !== undefined && typeof rec.source.id !== "string") return "source.id must be a string";
-        if (rec.source.kind !== undefined && typeof rec.source.kind !== "string") return "source.kind must be a string";
+        try { normalizeSource(rec.source); } catch (err) { return err.message; }
       }
       break;
     }
