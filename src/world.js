@@ -58,6 +58,7 @@ function deterministicEvidenceId({ subject, predicate, object, source, observedA
     srcKind: source?.kind ?? SOURCE_KINDS.ASSERTION,
     srcIdentity: source?.identity ?? source?.id ?? "",
     srcEventId: source?.eventId ?? null,
+    srcProvenanceId: source?.provenanceId ?? null,   // v0.12.33 (P2): provenance 链属于 Evidence 身份
     observedAt: observedAt ?? null,
     validFrom: validFrom ?? null,
     validUntil: validUntil ?? null,
@@ -437,6 +438,7 @@ export class WorldModel {
         observedAt,
         validFrom: ev.validFrom ?? null,   // v0.12.0: 时间三维分开
         validUntil: ev.validUntil ?? null,
+        observationId: ev.observationId ?? null,   // v0.12.33: observationId 参与确定性 ID，必须持久化
         ts,
       },
       { kind: "event", data: { kind: "evidence_ingested", claimId, subject: ev.subject, predicate: ev.predicate, object: ev.object, ts }, ts },
@@ -444,7 +446,7 @@ export class WorldModel {
 
     // 持久化成功 → 更新内存
     this._addEvidenceToClaim(
-      { claimId, evidenceId, subject: ev.subject, predicate: ev.predicate, object: ev.object, source, observedAt, validFrom: ev.validFrom ?? null, validUntil: ev.validUntil ?? null },
+      { claimId, evidenceId, subject: ev.subject, predicate: ev.predicate, object: ev.object, source, observedAt, validFrom: ev.validFrom ?? null, validUntil: ev.validUntil ?? null, observationId: ev.observationId ?? null },
       ts
     );
     this._pushEvent({ kind: "evidence_ingested", claimId, subject: ev.subject, predicate: ev.predicate, object: ev.object, ts });
@@ -930,25 +932,27 @@ function normalizeSource(src) {
 function addEvidenceToClaims(claims, rec, now) {
   const claimId = rec.claimId || `${rec.subject}|${rec.predicate}|${String(rec.object)}`;
   const existing = claims.get(claimId);
-  // v0.12.32 (审查 P1): evidenceId 是 Evidence 身份——权威日志中出现的 ID 必须满足
-  // 确定性格式（24-hex）。非法/空 ID 不静默替换为重新计算值（那会掩盖篡改）。
+  // v0.12.33 (审查 P1): evidenceId 必须满足确定性身份——不是任意 24-hex。
+  // 记录提供的 evidenceId（若存在）必须等于 deterministicEvidenceId 的重算结果。
+  // 不保留 "格式正确就接受" 的兼容规则：旧日志应通过迁移显式更新 ID。
   let evidenceId;
+  const computedId = deterministicEvidenceId({
+    subject: rec.subject,
+    predicate: rec.predicate,
+    object: rec.object,
+    source: rec.source,
+    observedAt: rec.observedAt ?? now,
+    validFrom: rec.validFrom,
+    validUntil: rec.validUntil,
+    observationId: rec.observationId ?? null,
+  });
   if (rec.evidenceId !== undefined && rec.evidenceId !== null) {
-    if (typeof rec.evidenceId !== "string" || !/^[0-9a-f]{24}$/.test(rec.evidenceId)) {
-      throw new Error(`invalid evidenceId "${rec.evidenceId}" (must be 24-hex deterministic ID)`);
+    if (typeof rec.evidenceId !== "string" || rec.evidenceId !== computedId) {
+      throw new Error(`evidenceId mismatch: got "${rec.evidenceId}", expected deterministic "${computedId}"`);
     }
     evidenceId = rec.evidenceId;
   } else {
-    evidenceId = deterministicEvidenceId({
-      subject: rec.subject,
-      predicate: rec.predicate,
-      object: rec.object,
-      source: rec.source,
-      observedAt: rec.observedAt ?? now,
-      validFrom: rec.validFrom,
-      validUntil: rec.validUntil,
-      observationId: rec.observationId ?? null,
-    });
+    evidenceId = computedId;
   }
   const evidenceItem = {
     evidenceId,
@@ -959,6 +963,7 @@ function addEvidenceToClaims(claims, rec, now) {
     observedAt: rec.observedAt ?? now,
     validFrom: rec.validFrom ?? null,   // v0.12.0: 三维时间
     validUntil: rec.validUntil ?? null,
+    observationId: rec.observationId ?? null,   // v0.12.33: 与确定性 ID 输入一致
   };
   if (existing) {
     const evidence = [...existing.evidence, evidenceItem];
@@ -983,6 +988,35 @@ function addEvidenceToClaims(claims, rec, now) {
       evidence: [evidenceItem],
     });
   }
+}
+
+/**
+ * v0.12.33 (审查 P1): legacy evidenceId 确定性重映射——重算旧公式 evidenceId
+ * 为当前 deterministicEvidenceId()，并同步重映射 evidence_retracted 引用。
+ */
+function remapEvidenceIds(recs) {
+  const oldToNew = new Map();
+  for (const rec of recs) {
+    if (rec.kind !== "evidence") continue;
+    try {
+      const newId = deterministicEvidenceId({
+        subject: rec.subject, predicate: rec.predicate, object: rec.object,
+        source: rec.source, observedAt: rec.observedAt ?? (rec.ts || 0),
+        validFrom: rec.validFrom, validUntil: rec.validUntil, observationId: rec.observationId ?? null,
+      });
+      const oldId = rec.evidenceId;
+      rec.evidenceId = newId;
+      if (oldId && newId !== oldId) oldToNew.set(oldId, newId);
+    } catch (err) {
+      return { ok: false, reason: `evidence remap: ${err.message}` };
+    }
+  }
+  for (const rec of recs) {
+    if (rec.kind !== "evidence_retracted" || !rec.evidenceId) continue;
+    const mapped = oldToNew.get(rec.evidenceId);
+    if (mapped) rec.evidenceId = mapped;
+  }
+  return { ok: true };
 }
 
 /**
@@ -1037,7 +1071,13 @@ export function migrateWorldLog(storageDir) {
     if (err) return { ok: false, migrated: 0, reason: `record at line ${i + 1}: ${err}` };
   }
 
-  // Step 3b — 语义验证：复用 World transition 规则（dry-run replay + 语义完整性检查）。
+  // Step 3b — evidenceId 确定性重映射（v0.12.33 P1）：legacy 记录的 evidenceId 由旧公式
+  // 计算，不满足当前 deterministic identity。迁移时必须显式重算，而不是让
+  // 非确定性 ID 进入权威状态（replay 时 addEvidenceToClaims 会严格校验并 throw）。
+  const idRemap = remapEvidenceIds(recs);
+  if (!idRemap.ok) return { ok: false, migrated: 0, reason: `evidenceId remap failed: ${idRemap.reason}` };
+
+  // Step 3c — 语义验证：复用 World transition 规则（dry-run replay + 语义完整性检查）。
   // 不维护第二套 migration 专用语义规则。（v0.12.25 审查 P1-2）
   const semErr = validateLegacySemantics(recs);
   if (semErr) return { ok: false, migrated: 0, reason: `semantic validation failed: ${semErr}` };
@@ -1267,20 +1307,24 @@ function validateLegacySemantics(recs) {
  * - relay: 0.3（转述，不可靠——打折）
  */
 export function sourceWeight(source) {
-  const base = {
-    [SOURCE_TYPES.UNKNOWN]: 0,     // 来源未知 → 零信任
+  const BASE_SOURCE_WEIGHT = {
+    [SOURCE_TYPES.UNKNOWN]: 0,
     [SOURCE_TYPES.AGENT]: 0.8,
     [SOURCE_TYPES.SELF]: 1.0,
     [SOURCE_TYPES.REGISTRY]: 0.7,
     [SOURCE_TYPES.SENSOR]: 0.95,
     [SOURCE_TYPES.MEMORY]: 0.6,
     [SOURCE_TYPES.NETWORK]: 0.5,
-  }[source?.type] ?? 0.4;
-  const kindBonus = {
+  };
+  const SOURCE_KIND_BONUS = {
     [SOURCE_KINDS.ASSERTION]: 0,
     [SOURCE_KINDS.OBSERVATION]: 0.1,
     [SOURCE_KINDS.RELAY]: -0.5,
     [SOURCE_KINDS.MEASUREMENT]: 0.15,
-  }[source?.kind] ?? 0;
+  };
+  const base = BASE_SOURCE_WEIGHT[source?.type];
+  if (base === undefined) throw new Error(`invalid source.type "${source?.type}"`);
+  const kindBonus = SOURCE_KIND_BONUS[source?.kind];
+  if (kindBonus === undefined) throw new Error(`invalid source.kind "${source?.kind}"`);
   return Math.max(0.05, Math.min(1, base + kindBonus));
 }

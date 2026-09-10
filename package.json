@@ -1,7 +1,7 @@
 {
   "name": "ai-awakening",
-  "version": "0.12.32",
-      "description": "硅基协作网络 — source.type/kind 绑定 evidenceId + UNKNOWN weight=0 + evidenceId 格式验证, 205 tests",
+  "version": "0.12.33",
+      "description": "硅基协作网络 — evidenceId 确定性完整验证 + sourceWeight throw + provenanceId 绑定 hash, 206 tests",
   "type": "module",
   "main": "index.js",
   "scripts": {
