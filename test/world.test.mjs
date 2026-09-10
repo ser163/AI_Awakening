@@ -251,6 +251,21 @@ describe("world: 时间有效性", () => {
     assert.equal(w.claimAt("agent:alice", "located_at", june - 1000), null);
   });
 
+  it("claimAt 尊重 validFrom=0 / validUntil=0（0 是合法时间，不退化）", () => {
+    const w = new WorldModel();
+    w.ingestEvidence({
+      subject: "agent:zero", predicate: "epoch_test", object: "hits-0",
+      source: { type: SOURCE_TYPES.SELF, id: "me", kind: SOURCE_KINDS.OBSERVATION },
+      observedAt: 100, validFrom: 0, validUntil: 0,  // 仅在 t=0 有效
+    });
+    // validFrom=0：claimAt(0) 必须命中
+    const at0 = w.claimAt("agent:zero", "epoch_test", 0);
+    assert.ok(at0, "claimAt(0) 应命中 validFrom=0 的 evidence");
+    assert.equal(at0.object, "hits-0");
+    // validUntil=0：claimAt(1) 必须不命中（0 不是 Infinity）
+    assert.equal(w.claimAt("agent:zero", "epoch_test", 1), null, "validUntil=0 → claimAt(1) 不命中");
+  });
+
   it("claimAt 按信念选冠军，不再按证据数量（sensor×2.0 应赢 relay×0.6 刷量）", () => {
     const w = new WorldModel();
     const now = Date.now();
@@ -991,13 +1006,16 @@ describe("world: applyWorldTransition 纯函数 & 确定性", () => {
     assert.notEqual(evId0, evIdNull, "validFrom=0 与 null 不同 evidenceId");
   });
 
-  it("non-plain source (Date/Map) → throw", () => {
+  it("non-plain source (Date/Map/Object.create(null)) → throw", () => {
     const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
     assert.throws(() => applyWorldTransition(s0, {
       kind: "evidence", subject: "agent:d", predicate: "p", object: "x", ts: 9, source: new Date(),
     }), /plain object/);
     assert.throws(() => applyWorldTransition(s0, {
       kind: "evidence", subject: "agent:d", predicate: "p", object: "x", ts: 10, source: new Map(),
+    }), /plain object/);
+    assert.throws(() => applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:d", predicate: "p", object: "x", ts: 11, source: Object.create(null),
     }), /plain object/);
   });
 
@@ -1010,6 +1028,18 @@ describe("world: applyWorldTransition 纯函数 & 确定性", () => {
       kind: "evidence", subject: "agent:c", predicate: "p", object: "x", ts: 8,
       source: { type: 123, id: "s1" },
     }), /source.type must be a string/);
+  });
+
+  it("source.type / source.kind 必须是合法枚举（拒绝未知字符串）", () => {
+    const s0 = { entities: new Map(), agents: new Map(), claims: new Map(), relations: new Map(), events: [] };
+    assert.throws(() => applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:e", predicate: "p", object: "x", ts: 12,
+      source: { type: "forged-admin", id: "x" },
+    }), /invalid source.type "forged-admin"/);
+    assert.throws(() => applyWorldTransition(s0, {
+      kind: "evidence", subject: "agent:e", predicate: "p", object: "x", ts: 13,
+      source: { type: SOURCE_TYPES.SELF, id: "x", kind: "forged-claim" },
+    }), /invalid source.kind "forged-claim"/);
   });
 });
 

@@ -468,8 +468,8 @@ export class WorldModel {
     for (const c of this.claims.values()) {
       if (c.subject !== subject || c.predicate !== predicate) continue;
       const active = c.evidence.filter((ev) => {
-        const from = ev.validFrom || ev.observedAt || 0;
-        const until = ev.validUntil || Infinity;
+        const from = ev.validFrom ?? ev.observedAt ?? 0;
+        const until = ev.validUntil ?? Infinity;
         return from <= atMs && atMs <= until;
       });
       if (active.length > 0) {
@@ -880,6 +880,8 @@ function initWorldState() {
 
 /** source 缺失时默认值——type 为 UNKNOWN，绝不伪装成 agent（provenance 语义） */
 const DEFAULT_SOURCE = { type: SOURCE_TYPES.UNKNOWN, id: "", identity: "", kind: SOURCE_KINDS.ASSERTION, eventId: null, provenanceId: null };
+const VALID_SOURCE_TYPES = new Set(Object.values(SOURCE_TYPES));
+const VALID_SOURCE_KINDS = new Set(Object.values(SOURCE_KINDS));
 
 /**
  * v0.12.29 (审查 P2): source 规范化——统一 ?? 取代 ||，存在但非法 → throw。
@@ -889,14 +891,19 @@ const DEFAULT_SOURCE = { type: SOURCE_TYPES.UNKNOWN, id: "", identity: "", kind:
  */
 function normalizeSource(src) {
   if (src === undefined || src === null) return { ...DEFAULT_SOURCE };
-  // 真正 plain object 检查——排除 Date/Map/proto 污染
+  // 真正 plain object 检查——排除 Date/Map/Array/Object.create(null)
   if (typeof src !== "object" || Array.isArray(src)) throw new Error("source must be a plain object");
-  const proto = Object.getPrototypeOf(src);
-  if (proto !== Object.prototype && proto !== null) throw new Error("source must be a plain object (non-standard prototype detected)");
-  if (src.type !== undefined && typeof src.type !== "string") throw new Error("source.type must be a string");
+  if (Object.getPrototypeOf(src) !== Object.prototype) throw new Error("source must be a plain object (non-standard or null prototype)");
+  if (src.type !== undefined) {
+    if (typeof src.type !== "string") throw new Error("source.type must be a string");
+    if (!VALID_SOURCE_TYPES.has(src.type)) throw new Error(`invalid source.type "${src.type}"`);
+  }
   if (src.id !== undefined && typeof src.id !== "string") throw new Error("source.id must be a string");
   if (src.identity !== undefined && typeof src.identity !== "string") throw new Error("source.identity must be a string");
-  if (src.kind !== undefined && typeof src.kind !== "string") throw new Error("source.kind must be a string");
+  if (src.kind !== undefined) {
+    if (typeof src.kind !== "string") throw new Error("source.kind must be a string");
+    if (!VALID_SOURCE_KINDS.has(src.kind)) throw new Error(`invalid source.kind "${src.kind}"`);
+  }
   if (src.eventId !== undefined && src.eventId !== null && typeof src.eventId !== "string") throw new Error("source.eventId must be a string or null");
   if (src.provenanceId !== undefined && src.provenanceId !== null && typeof src.provenanceId !== "string") throw new Error("source.provenanceId must be a string or null");
   return {
